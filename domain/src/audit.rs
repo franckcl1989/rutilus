@@ -4,7 +4,7 @@ use time::OffsetDateTime;
 
 use crate::{
     AuditEventId, AuditOperationId, CredentialId, DeploymentPosture, EndpointAddress, EndpointId,
-    PrincipalId,
+    OperationSource, PrincipalId,
 };
 
 macro_rules! stable_audit_codes {
@@ -62,6 +62,57 @@ stable_audit_codes! {
         System => "system",
         LocalOperator => "local-operator",
         User => "user",
+    }
+}
+
+/// The §16.3 actor and origin of one persisted operation execution, derived
+/// from the posture that runs the executor and the operation's own source.
+///
+/// The operation record names where a write was submitted from
+/// ([`OperationSource`], §13.1); the audit context must name the accountable
+/// actor and the execution origin (§16.3 "谁 / 从哪发起"). The mapping is the
+/// minimal honest projection of the source onto the audit vocabulary (audit
+/// follow-up V5A-3):
+///
+/// - a Standalone-posture execution is the local operator's work, whatever
+///   the source claims (the Standalone console submits only `Standalone`
+///   work, and the local operator is the console's accountable actor);
+/// - a Site-posture execution of a Center-dispatched offer names the
+///   center's dispatch automation as the actor — the site accepted an offer
+///   the center issued (§15.6), so the accountable "who" is the center's
+///   automated dispatch — while the origin stays the site that performed
+///   the execution;
+/// - a Site-posture execution of the site console's own write names the
+///   local operator at the site. The submitting principal is not persisted
+///   on the operation record in this iteration, so the operator-level
+///   attribution is the closest honest actor the execution-time context can
+///   carry — a `User` actor would require the principal identity, which the
+///   execution boundary cannot recover.
+///
+/// `base_actor` is the posture's own actor (the local operator for both
+/// Edge postures); the function returns the full §16.3 pair so the executor
+/// and monitor never decide attribution policy themselves.
+#[must_use]
+pub fn execution_attribution(
+    base_actor: AuditActor,
+    base_origin: DeploymentPosture,
+    source: OperationSource,
+) -> (AuditActor, DeploymentPosture) {
+    match (base_origin, source) {
+        // A center-dispatched offer accepted at the site (§15.6): the
+        // center's dispatch automation is the accountable actor, and the
+        // execution origin is the site that accepted the offer.
+        (DeploymentPosture::Site, OperationSource::Center) => (AuditActor::System, base_origin),
+        // Everything else stays under the posture's own base attribution:
+        // the Standalone posture executes only its own console's writes,
+        // the site console's own writes name the local operator at the
+        // site, and the center posture runs no operation executor in this
+        // iteration (the base answer is the defensive one for a future
+        // path).
+        (
+            DeploymentPosture::Standalone | DeploymentPosture::Site | DeploymentPosture::Center,
+            _,
+        ) => (base_actor, base_origin),
     }
 }
 
@@ -1751,6 +1802,69 @@ mod tests {
             Err(AuditEventError::InvalidSequence)
         );
         Ok(())
+    }
+
+    #[test]
+    fn execution_attribution_maps_posture_and_source_to_the_accountable_actor() {
+        // The Standalone posture names the local operator from the
+        // Standalone origin, whatever the source claims — the Standalone
+        // console submits only Standalone work, and the local operator is
+        // its accountable actor.
+        for source in [
+            OperationSource::Standalone,
+            OperationSource::Site,
+            OperationSource::Center,
+        ] {
+            assert_eq!(
+                execution_attribution(
+                    AuditActor::LocalOperator,
+                    DeploymentPosture::Standalone,
+                    source,
+                ),
+                (AuditActor::LocalOperator, DeploymentPosture::Standalone),
+                "{source} at the Standalone posture must stay local-operator work"
+            );
+        }
+        // A center-dispatched offer executed at the site (§15.6) names the
+        // center's dispatch automation as the actor with the site as the
+        // execution origin.
+        assert_eq!(
+            execution_attribution(
+                AuditActor::LocalOperator,
+                DeploymentPosture::Site,
+                OperationSource::Center,
+            ),
+            (AuditActor::System, DeploymentPosture::Site)
+        );
+        // The site console's own write names the local operator at the site.
+        assert_eq!(
+            execution_attribution(
+                AuditActor::LocalOperator,
+                DeploymentPosture::Site,
+                OperationSource::Site,
+            ),
+            (AuditActor::LocalOperator, DeploymentPosture::Site)
+        );
+        // A Standalone-source operation at the site posture is a foreign
+        // submission; the defensive answer stays the site's own operator.
+        assert_eq!(
+            execution_attribution(
+                AuditActor::LocalOperator,
+                DeploymentPosture::Site,
+                OperationSource::Standalone,
+            ),
+            (AuditActor::LocalOperator, DeploymentPosture::Site)
+        );
+        // The Center posture runs no executor in this iteration; the base
+        // attribution is the defensive answer.
+        assert_eq!(
+            execution_attribution(
+                AuditActor::System,
+                DeploymentPosture::Center,
+                OperationSource::Center,
+            ),
+            (AuditActor::System, DeploymentPosture::Center)
+        );
     }
 
     #[test]

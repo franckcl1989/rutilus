@@ -29,7 +29,10 @@
 //!   gate (W3S-1); a successful change keeps its reserved slots (V4R-2),
 //!   so even a credential holder cycling changes stays within the window,
 //!   while the sign-in surface refunds a successful verification (S3-3)
-//!   and only counts failures.
+//!   and only counts failures. The first-run claim surface carries the
+//!   same budgets keyed on the fixed bootstrap principal and the
+//!   presenting address (V5C-2), so a flood of claims cannot starve the
+//!   derivation gate before the one-time code is even looked up.
 //! - The sign-in, sign-out, bootstrap-claim, password-change, `me`, and
 //!   administration handlers.
 //!
@@ -998,6 +1001,14 @@ pub(crate) struct AuthState {
     /// success included (V4R-2) — unlike the sign-in surface's S3-3
     /// refund.
     password_change_limiter: LoginRateLimiter,
+    /// The first-run claim rate limiter (V5C-2): the same budgets as the
+    /// sign-in surface, applied to the Public bootstrap claim — a
+    /// sessionless endpoint that runs one Argon2id derivation per attempt
+    /// — keyed on the fixed bootstrap principal and the presenting
+    /// address. A flood of claims is capped at the window budget before
+    /// the one-time code is even looked up, and a successful claim refunds
+    /// its slots (S3-3) like the sign-in surface.
+    bootstrap_limiter: LoginRateLimiter,
 }
 
 impl AuthState {
@@ -1006,6 +1017,7 @@ impl AuthState {
             policy,
             rate_limiter: LoginRateLimiter::new(),
             password_change_limiter: LoginRateLimiter::new(),
+            bootstrap_limiter: LoginRateLimiter::new(),
         }
     }
 
@@ -1792,13 +1804,32 @@ where
         record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     }
-    if let Some(authenticator) = state
+    // The second-factor decision is an authentication input: when the
+    // listing cannot be read, the password alone must never issue a
+    // session — the sign-in fails closed (V5C-1) instead of falling back
+    // to password-only.
+    let authenticators = match state
         .services
         .list_totp_authenticators(principal.id())
         .await
-        .ok()
+    {
+        Ok(list) => list,
+        Err(error) => {
+            // The classification mirrors the sibling derivation-failure
+            // mapping (W3S-1): the exhausted-capacity refusal answers 503
+            // with no audit — the 503 is the record, like the derivation
+            // surfaces. Every other failure is an authentication that
+            // could not be completed: refused and recorded exactly like
+            // the wrong-code branch below.
+            if state.services.is_derivation_gate_busy(&error) {
+                return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            record_login_failure(&state, Some(principal.id()), now).await;
+            return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
+        }
+    };
+    if let Some(authenticator) = authenticators
         .into_iter()
-        .flatten()
         .find(|authenticator| authenticator.state() == rutilus_domain::TotpState::Active)
     {
         let Some(code) = request.totp_code() else {
@@ -1904,11 +1935,18 @@ where
 /// The handler is the declarative claim flow — code lookup, optional TOTP
 /// enrollment, credential and session creation, audit, gate arming — so the
 /// line count is inherent to the steps it coordinates.
+///
+/// The claim is a Public sessionless surface running one Argon2id
+/// derivation per attempt, so it carries the sign-in budgets keyed on the
+/// fixed bootstrap principal and the presenting address (V5C-2): a flood of
+/// claims is capped at the window budget, refusals write no audit (B2), and
+/// a successful claim refunds its slots (S3-3).
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn bootstrap_complete<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     uri: OriginalUri,
     headers: HeaderMap,
+    connect_info: MaybeClientAddr,
     Json(request): Json<BootstrapCompleteRequest>,
 ) -> Response
 where
@@ -1927,6 +1965,32 @@ where
         return json_error(
             StatusCode::BAD_REQUEST,
             "the TOTP secret and its activation code must travel together".to_owned(),
+        );
+    }
+    let ip = request_ip(&connect_info);
+    let rate_now = Instant::now();
+    // V5C-2: the claim is a Public sessionless surface that runs one
+    // Argon2id derivation per attempt, so it carries the same §16.2
+    // budgets as the sign-in surface — keyed on the fixed bootstrap
+    // principal and the presenting address (the one-shot claim has no
+    // username to key on; every attempt from one address shares the
+    // 5-per-window username budget, and the per-address budget bounds the
+    // distributed case). The reservation is the record (S3-3), consumed
+    // before any store access or derivation; a success refunds below, and
+    // every failure keeps its slots, so a flood of claims is capped at
+    // the window budget before the one-time code is even looked up.
+    if !state
+        .auth
+        .bootstrap_limiter
+        .reserve(BOOTSTRAP_PRINCIPAL_NAME, &ip, rate_now)
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 is the record, exactly like the sign-in surface — so a
+        // flood of refused claims never grows the audit table nor
+        // serializes behind the persistence write gate.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many bootstrap attempts; try again later".to_owned(),
         );
     }
     let Ok(admin_name) = PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME) else {
@@ -2031,6 +2095,13 @@ where
     {
         return json_error(StatusCode::UNAUTHORIZED, "bootstrap failed".to_owned());
     }
+    // The claim succeeded: release the reserved budget slots (S3-3) — the
+    // one-shot code is consumed, so the refund is the closing bookkeeping
+    // of the sign-in-equivalent surface.
+    state
+        .auth
+        .bootstrap_limiter
+        .refund(BOOTSTRAP_PRINCIPAL_NAME, &ip);
     record_login_success(&state, principal.id(), now).await;
     if authenticator.is_some() {
         record_management_event(
@@ -2078,6 +2149,12 @@ where
 /// The handler is the declarative change flow — budget, lookup,
 /// verification, derivation, persistence, revocation, audit — so the line
 /// count is inherent to the steps it coordinates.
+///
+/// The 401 branches — the missing credential and the wrong current
+/// password — record the failed change like the sign-in surface's failures
+/// (V5C-4): the same started + failed pair and the same failure class. The
+/// B2 exemption covers only the limiter's 429, which writes nothing; an
+/// attempt that ran through its budget reservation is always accounted.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn change_password<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
@@ -2130,6 +2207,27 @@ where
         .ok()
         .flatten()
     else {
+        // V5C-4: this 401 is an authentication outcome — the change could
+        // not establish the presented current password — and is recorded
+        // like the sign-in surface's failures. The B2 exemption (a
+        // rate-limit refusal writes no audit) does not apply here: the
+        // request ran through its budget reservation and is a real
+        // attempt.
+        record_outcome(
+            &state,
+            context.actor(),
+            context.actor_principal_id(),
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            false,
+            Some((
+                AuditFailure::AuthenticationFailed,
+                AuditFailureVerification::Rejected,
+            )),
+            None,
+            now,
+        )
+        .await;
         return json_error(
             StatusCode::UNAUTHORIZED,
             "password change failed".to_owned(),
@@ -2142,6 +2240,24 @@ where
         .verify_password_async(credential.hash(), request.current_password())
         .await
     {
+        // V5C-4: the wrong current password is a failed change — recorded
+        // with the same started + failed pair and failure class as the
+        // sign-in surface, never exempted like a rate-limit refusal (B2).
+        record_outcome(
+            &state,
+            context.actor(),
+            context.actor_principal_id(),
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            false,
+            Some((
+                AuditFailure::AuthenticationFailed,
+                AuditFailureVerification::Rejected,
+            )),
+            None,
+            now,
+        )
+        .await;
         return json_error(
             StatusCode::UNAUTHORIZED,
             "password change failed".to_owned(),
@@ -4350,6 +4466,12 @@ mod tests {
     }
 
     /// The in-memory state behind the worker-test services bundle.
+    ///
+    /// The verdict flags — the verification and revocation verdicts, the
+    /// derivation-gate signal, and the V5C-1 listing-failure flag — are the
+    /// double's per-test knobs: the flag set is the coverage, so the bools
+    /// are deliberate.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(Default)]
     struct WorkerTestInner {
         principal: Option<Principal>,
@@ -4369,6 +4491,12 @@ mod tests {
         /// Whether the derivation-gate refusal signal reports busy (the
         /// W3S-1 response-mapping tests flip it).
         derivation_gate_busy: bool,
+        /// Whether the TOTP authenticator listing boundary fails (the
+        /// V5C-1 fail-closed tests flip it).
+        totp_listing_error: bool,
+        /// The authenticators the listing boundary returns (the V5C-1
+        /// tests seed an active one).
+        totp_authenticators: Vec<TotpAuthenticator>,
         /// How often each boundary ran, and the thread that ran it — the
         /// §7.8 signal: the test's own thread is the runtime's only worker,
         /// while the blocking pool runs the derivation on a dedicated
@@ -4588,7 +4716,15 @@ mod tests {
             &self,
             _principal_id: PrincipalId,
         ) -> BoundaryFuture<'_, Result<Vec<TotpAuthenticator>, Self::Error>> {
-            Box::pin(async { Ok(Vec::new()) })
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                if guard.totp_listing_error {
+                    Err(WorkerTestError)
+                } else {
+                    Ok(guard.totp_authenticators.clone())
+                }
+            })
         }
         fn record_totp_step(
             &self,
@@ -4956,6 +5092,274 @@ mod tests {
         assert_eq!(
             inner.hash_sync_calls, 0,
             "the bootstrap path must never call the synchronous boundary"
+        );
+        Ok(())
+    }
+
+    // ---- V5C-1 TOTP listing fail-closed ----------------------------------
+
+    #[tokio::test]
+    async fn login_fails_closed_when_the_totp_listing_boundary_fails() -> Result<(), Box<dyn Error>>
+    {
+        // V5C-1: the authenticator listing is an authentication input —
+        // when the boundary fails, the sign-in must not fall back to
+        // password-only (fail-open) and issue a session. The failure is
+        // refused exactly like the wrong-code branch: 401, the failed
+        // login audit pair, and no session cookie.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+            inner.totp_listing_error = true;
+        }
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/login",
+                axum::routing::post(login::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(worker_test_state(services.clone()));
+
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !refused.headers().contains_key(SET_COOKIE),
+            "a failed listing must never issue a session cookie"
+        );
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.audit_events.len(),
+            2,
+            "the refusal records the started + failed login pair"
+        );
+        assert_eq!(
+            inner.audit_events[1].outcome().failure(),
+            Some(AuditFailure::AuthenticationFailed)
+        );
+        assert_eq!(
+            inner.audit_events[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        assert_eq!(inner.audit_events[1].context().action(), AuditAction::Login);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_totp_listing_failure_answers_503_when_the_gate_is_busy()
+    -> Result<(), Box<dyn Error>> {
+        // V5C-1 classification: a runtime that reports the exhausted
+        // derivation capacity through the shared error type gets the 503
+        // the sibling derivation surfaces use — and the refusal writes no
+        // audit, because the 503 is the record (the W3S-1 surfaces' rule).
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+            inner.totp_listing_error = true;
+            inner.derivation_gate_busy = true;
+        }
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/login",
+                axum::routing::post(login::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(worker_test_state(services.clone()));
+
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert!(
+            inner.audit_events.is_empty(),
+            "the exhausted-capacity refusal writes no audit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_with_an_active_authenticator_requires_its_code() -> Result<(), Box<dyn Error>> {
+        // The fail-open context of V5C-1: when the listing succeeds and
+        // names an active authenticator, the password alone is never
+        // enough — the missing code is refused like the wrong-code branch,
+        // so the fail-closed listing failure is not the only gate.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+            let principal = inner
+                .principal
+                .as_ref()
+                .ok_or("the worker-test principal must be seeded")?;
+            let now = OffsetDateTime::UNIX_EPOCH;
+            inner.totp_authenticators = vec![TotpAuthenticator::try_from_parts(
+                rutilus_domain::TotpAuthenticatorId::generate(),
+                principal.id(),
+                &[0x42; TOTP_SECRET_LENGTH],
+                rutilus_domain::TotpState::Active,
+                now,
+                Some(now),
+                None,
+            )?];
+        }
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/login",
+                axum::routing::post(login::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(worker_test_state(services.clone()));
+
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.audit_events.len(),
+            2,
+            "the missing-code refusal records the started + failed pair"
+        );
+        Ok(())
+    }
+
+    // ---- V5C-2 bootstrap claim budget ------------------------------------
+
+    #[tokio::test]
+    async fn bootstrap_claim_is_rate_limited_without_audit_amplification()
+    -> Result<(), Box<dyn Error>> {
+        // V5C-2: the claim is a Public sessionless surface running one
+        // Argon2id derivation per attempt, so it carries the sign-in
+        // budgets — keyed on the fixed bootstrap principal and the
+        // presenting address. Every failure keeps its reservation; once
+        // the budget is exhausted the claim answers 429, and the refusal
+        // writes no audit (B2) — the 429 is the record, so a flood of
+        // refused claims never grows the audit table.
+        let services = WorkerTestServices::seeded()?;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/bootstrap",
+                axum::routing::post(bootstrap_complete::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(worker_test_state(services.clone()));
+        let body = r#"{"code": "wrong-code", "password": "a brand new password"}"#;
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/bootstrap")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = router
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.audit_events.len(),
+            USERNAME_FAILURE_LIMIT * 2,
+            "each refused claim records its started + failed pair, and the 429 adds nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_bootstrap_claim_refunds_its_budget_slots() -> Result<(), Box<dyn Error>> {
+        // V5C-2 accounting: a successful claim refunds its reservation
+        // (S3-3), so the operator's one legitimate claim does not carry a
+        // slot into the window — failures after it exhaust exactly their
+        // own budget.
+        let services = WorkerTestServices::seeded()?;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/bootstrap",
+                axum::routing::post(bootstrap_complete::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(worker_test_state(services.clone()));
+        let claimed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "one-time-code", "password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(claimed.status(), StatusCode::OK);
+
+        let body = r#"{"code": "wrong-code", "password": "a brand new password"}"#;
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/bootstrap")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = router
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(
+            limited.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the refunded success must not consume budget — failures still exhaust at the limit"
         );
         Ok(())
     }
@@ -5339,6 +5743,130 @@ mod tests {
             inner.audit_events[1].context().target_principal_id(),
             None,
             "a self change names no target distinct from its actor"
+        );
+        Ok(())
+    }
+
+    // ---- V5C-4 change-password 401 audit ---------------------------------
+
+    // The test walks the wrong-password branch and the missing-credential
+    // branch as two self-contained halves, so the line count is the
+    // coverage.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn password_change_401_branches_record_the_failure() -> Result<(), Box<dyn Error>> {
+        // V5C-4: the 401 branches of the self password-change path record
+        // the failure like the sign-in surface — the same started + failed
+        // pair, the same AuthenticationFailed/Rejected class, the
+        // ChangePassword action. The B2 exemption (a rate-limit refusal
+        // writes no audit) covers only the limiter's 429: these requests
+        // ran through their budget reservation and are real attempts.
+        let services = WorkerTestServices::seeded()?;
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(principal_id)))
+            .with_state(worker_test_state(services.clone()));
+
+        // The wrong current password answers 401 and records the failed
+        // change.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"current_password": "wrong password", "new_password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            assert_eq!(inner.audit_events.len(), 2);
+            assert_eq!(
+                inner.audit_events[1].outcome().failure(),
+                Some(AuditFailure::AuthenticationFailed)
+            );
+            assert_eq!(
+                inner.audit_events[1].outcome().verification(),
+                Some(AuditVerification::Rejected)
+            );
+            assert_eq!(
+                inner.audit_events[1].context().action(),
+                AuditAction::ChangePassword
+            );
+            assert_eq!(
+                inner.audit_events[1].context().actor_principal_id(),
+                Some(principal_id)
+            );
+        }
+
+        // The missing-credential branch records the same shape.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.credential = None;
+        }
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(principal_id)))
+            .with_state(worker_test_state(services.clone()));
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(inner.audit_events.len(), 2);
+        assert_eq!(
+            inner.audit_events[1].outcome().failure(),
+            Some(AuditFailure::AuthenticationFailed)
+        );
+        assert_eq!(
+            inner.audit_events[1].context().actor_principal_id(),
+            Some(principal_id)
         );
         Ok(())
     }

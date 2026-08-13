@@ -11,7 +11,7 @@ use rutilus_domain::{
 };
 use rutilus_entity::audit_event;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
 };
 use thiserror::Error;
@@ -92,6 +92,49 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|source| corrupt(operation_id, source))?;
         validate_stored_trail(&events).map_err(|source| corrupt(operation_id, source))?;
+        Ok(events)
+    }
+
+    /// Lists the newest persisted events across every operation, newest
+    /// first, bounded by `limit` (audit follow-up V5A-2: the production read
+    /// surface of persisted audit history).
+    ///
+    /// The console's audit query reads a bounded in-memory tail that is
+    /// warmed from this listing at startup, so a restart never hides the
+    /// persisted history. Each row is revalidated through the same typed
+    /// mapping as the per-operation trail read: a corrupt stored row fails
+    /// the whole listing with [`AuditRepositoryError::Corrupt`] instead of
+    /// being silently dropped — the same fail-closed presentation the
+    /// per-operation read-back gives, so the console can never mistake a
+    /// damaged history for a healthy one. Trail-level validation (sequence
+    /// contiguity) is deliberately not applied across operations: the rows
+    /// belong to different append-only trails whose contiguity is enforced
+    /// at append time and on the per-operation read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditRepositoryError::Database`] when the query fails, or
+    /// [`AuditRepositoryError::Corrupt`] when any stored row violates the
+    /// typed audit model.
+    pub async fn list_recent_audit_events(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<AuditEvent>, AuditRepositoryError> {
+        let models = audit_event::Entity::find()
+            .order_by_desc(audit_event::Column::OccurredAt)
+            .order_by_desc(audit_event::Column::EventSequence)
+            .limit(limit)
+            .all(&self.database)
+            .await
+            .map_err(AuditRepositoryError::Database)?;
+        let mut events = Vec::with_capacity(models.len());
+        for model in &models {
+            let operation_id = AuditOperationId::from_uuid(model.operation_id);
+            match map_stored_event(model) {
+                Ok(event) => events.push(event),
+                Err(source) => return Err(corrupt(operation_id, source)),
+            }
+        }
         Ok(events)
     }
 }
@@ -662,6 +705,94 @@ mod tests {
                 ..
             })
         ));
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_recent_events_newest_first_across_operations() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        // Two independent operations interleave by wall-clock time; the
+        // listing must span them, newest first.
+        let first = enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+        let second = enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+        let first_started = AuditEvent::started(first.clone(), now);
+        let second_started = AuditEvent::started(second.clone(), now + Duration::SECOND);
+        let first_succeeded = AuditEvent::succeeded(
+            first,
+            AuditSequence::FIRST.next()?,
+            now + Duration::seconds(2),
+        )?;
+        store.append_audit_event(&first_started).await?;
+        store.append_audit_event(&second_started).await?;
+        store.append_audit_event(&first_succeeded).await?;
+
+        assert_eq!(
+            store.list_recent_audit_events(10).await?,
+            [first_succeeded, second_started, first_started],
+            "the listing must span operations, newest first"
+        );
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_event_listing_is_bounded_by_limit() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        for index in 0..3_u8 {
+            let context =
+                enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+            let started = AuditEvent::started(context, now + Duration::seconds(i64::from(index)));
+            store.append_audit_event(&started).await?;
+        }
+
+        let bounded = store.list_recent_audit_events(2).await?;
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(
+            bounded[0].occurred_at(),
+            now + Duration::seconds(2),
+            "the newest event is first"
+        );
+        assert_eq!(store.list_recent_audit_events(0).await?.len(), 0);
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_row_fails_the_recent_event_listing_like_the_trail_read()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let context = enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+        let started = AuditEvent::started(context, OffsetDateTime::now_utc());
+        store.append_audit_event(&started).await?;
+        let mut stored = audit_event::Entity::find_by_id(started.id().into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("inserted audit event is missing")?
+            .into_active_model();
+        stored.target_endpoint_address =
+            Set(Some(String::from("https://operator:password@192.0.2.90")));
+        stored.update(&store.database).await?;
+
+        let result = store.list_recent_audit_events(10).await;
+        assert!(matches!(
+            &result,
+            Err(AuditRepositoryError::Corrupt {
+                source: StoredAuditEventError::InvalidEndpointAddress(_),
+                ..
+            })
+        ));
+        let rendered = format!("{result:?}");
+        assert!(!rendered.contains("operator"));
+        assert!(!rendered.contains("password"));
         store.close().await?;
         drop(directory);
         Ok(())

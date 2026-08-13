@@ -80,7 +80,7 @@ use std::{error::Error, fmt};
 use rutilus_domain::{
     AuditActor, AuditEvent, AuditFailure, AuditFailureVerification, AuditOperationContext,
     AuditRedfishOperation, AuditSequence, DeploymentPosture, EndpointId, Operation, OperationEvent,
-    OperationId, OperationState, RedfishCommand,
+    OperationId, OperationSource, OperationState, RedfishCommand, execution_attribution,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskError, RemoteTaskState,
@@ -364,7 +364,7 @@ where
             // The operation claims to wait on a Task the product has no row
             // for: the reference is lost, the outcome cannot be proven.
             return self
-                .resolve_unknown(&engine, operation_id, endpoint_id, now)
+                .resolve_unknown(&engine, operation_id, endpoint_id, operation.source(), now)
                 .await;
         };
 
@@ -376,7 +376,7 @@ where
             // The BMC no longer tracks the Task: the outcome cannot be
             // proven and the Task is never re-created (§13.5, §13.6).
             Ok(None) => {
-                self.resolve_unknown(&engine, operation_id, endpoint_id, now)
+                self.resolve_unknown(&engine, operation_id, endpoint_id, operation.source(), now)
                     .await
             }
             Ok(Some(observation)) => {
@@ -430,7 +430,13 @@ where
             // product may decide on (design section 7.6): the outcome cannot
             // be proven.
             return self
-                .resolve_unknown(engine, operation.id(), task.endpoint_id(), now)
+                .resolve_unknown(
+                    engine,
+                    operation.id(),
+                    task.endpoint_id(),
+                    operation.source(),
+                    now,
+                )
                 .await;
         };
         let updated = Self::updated_row(task, observation, state, now).map_err(|source| {
@@ -461,7 +467,14 @@ where
             )
             .await?;
             return self
-                .verify_target(engine, operation_id, endpoint_id, &command, now)
+                .verify_target(
+                    engine,
+                    operation_id,
+                    endpoint_id,
+                    &command,
+                    operation.source(),
+                    now,
+                )
                 .await;
         }
         // `Exception`, `Killed`, and `Cancelled` are terminal states the
@@ -473,6 +486,7 @@ where
             .await?;
         self.record_failure(
             endpoint_id,
+            operation.source(),
             AuditFailure::RedfishDiscoveryFailed,
             AuditFailureVerification::Rejected,
             now,
@@ -536,6 +550,7 @@ where
         operation_id: OperationId,
         endpoint_id: EndpointId,
         command: &RedfishCommand,
+        source: OperationSource,
         now: OffsetDateTime,
     ) -> Result<TaskPoll, TaskMonitorErrorOf<Store, Reader, Audit>> {
         match self.reader.verify(endpoint_id, command).await {
@@ -548,7 +563,7 @@ where
                         now,
                     )
                     .await?;
-                self.record_success(endpoint_id, now).await?;
+                self.record_success(endpoint_id, source, now).await?;
                 Ok(TaskPoll::Terminal(final_operation))
             }
             Ok(VerificationVerdict::Mismatched) => {
@@ -560,6 +575,7 @@ where
                     .await?;
                 self.record_failure(
                     endpoint_id,
+                    source,
                     AuditFailure::CoreResourceReadFailed,
                     AuditFailureVerification::Rejected,
                     now,
@@ -567,7 +583,7 @@ where
                 .await?;
                 Ok(TaskPoll::Terminal(final_operation))
             }
-            Err(source) => {
+            Err(verifier_error) => {
                 // §13.5: a failed re-read proves nothing about the write, so
                 // the outcome cannot be confirmed and the operation is
                 // recorded Unknown; the error escapes with its source chain.
@@ -575,12 +591,13 @@ where
                     .await?;
                 self.record_failure(
                     endpoint_id,
+                    source,
                     AuditFailure::CoreResourceReadFailed,
                     AuditFailureVerification::Inconclusive,
                     now,
                 )
                 .await?;
-                Err(TaskMonitorError::Verifier(source))
+                Err(TaskMonitorError::Verifier(verifier_error))
             }
         }
     }
@@ -598,6 +615,7 @@ where
         engine: &OperationEngine<&Store>,
         operation_id: OperationId,
         endpoint_id: EndpointId,
+        source: OperationSource,
         now: OffsetDateTime,
     ) -> Result<TaskPoll, TaskMonitorErrorOf<Store, Reader, Audit>> {
         let final_operation = self
@@ -605,6 +623,7 @@ where
             .await?;
         self.record_failure(
             endpoint_id,
+            source,
             AuditFailure::RedfishDiscoveryFailed,
             AuditFailureVerification::Inconclusive,
             now,
@@ -684,11 +703,12 @@ where
     async fn record_failure(
         &self,
         endpoint_id: EndpointId,
+        source: OperationSource,
         failure: AuditFailure,
         verification: AuditFailureVerification,
         occurred_at: OffsetDateTime,
     ) -> Result<(), TaskMonitorErrorOf<Store, Reader, Audit>> {
-        let context = self.audit_context(endpoint_id)?;
+        let context = self.audit_context(endpoint_id, source)?;
         let failed = AuditEvent::failed(
             context,
             Self::terminal_sequence()?,
@@ -719,9 +739,10 @@ where
     async fn record_success(
         &self,
         endpoint_id: EndpointId,
+        source: OperationSource,
         occurred_at: OffsetDateTime,
     ) -> Result<(), TaskMonitorErrorOf<Store, Reader, Audit>> {
-        let context = self.audit_context(endpoint_id)?;
+        let context = self.audit_context(endpoint_id, source)?;
         let succeeded = AuditEvent::succeeded(context, Self::terminal_sequence()?, occurred_at)
             .map_err(|source| TaskMonitorError::Audit {
                 stage: MonitorAuditStage::Terminal,
@@ -750,6 +771,13 @@ where
     /// the endpoint, actor, and origin until an audit-read boundary lands
     /// (see the module doc).
     ///
+    /// The actor and origin of the terminal fact are resolved from the
+    /// operation's persisted source through [`execution_attribution`] (audit
+    /// follow-up V5A-3), exactly like the executor's start fact: a
+    /// center-dispatched operation names the center's automation with the
+    /// site origin, and the site console's own write names the local
+    /// operator at the site.
+    ///
     /// # Errors
     ///
     /// Returns [`TaskMonitorError::Audit`] with the terminal stage when the
@@ -757,12 +785,14 @@ where
     fn audit_context(
         &self,
         endpoint_id: EndpointId,
+        source: OperationSource,
     ) -> Result<AuditOperationContext, TaskMonitorErrorOf<Store, Reader, Audit>> {
+        let (actor, origin) = execution_attribution(self.actor, self.origin, source);
         operation_audit_context(
             endpoint_id,
             AuditRedfishOperation::PollRemoteTask,
-            self.actor,
-            self.origin,
+            actor,
+            origin,
         )
         .map_err(|source| TaskMonitorError::Audit {
             stage: MonitorAuditStage::Terminal,
@@ -1653,6 +1683,56 @@ mod tests {
             Some(AuditVerification::Rejected),
             "the BMC's Task record is a provable failure (§13.5)"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn center_dispatched_tasks_attribute_the_center_automation_with_the_site_origin()
+    -> Result<(), Box<dyn Error>> {
+        // V5A-3: the monitor resolves the terminal fact's actor and origin
+        // from the operation's persisted source, exactly like the executor's
+        // start fact — a center-dispatched offer names the center's dispatch
+        // automation with the site as the execution origin.
+        let endpoint_id = EndpointId::generate();
+        let operation = Operation::try_from_parts(
+            OperationId::generate(),
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            one_command(),
+            OperationState::WaitingRemote,
+            created_at(),
+            created_at() + Duration::SECOND,
+        )?;
+        let store = FakeStore::new();
+        store.insert_operation(operation.clone())?;
+        store.insert_remote_task(task_row(
+            operation.id(),
+            endpoint_id,
+            "/redfish/v1/TaskService/Tasks/1",
+        )?)?;
+        // The disappeared Task: an outcome the product cannot prove (§13.5).
+        let reader = FakeReader::new(vec![Ok(None)], Vec::new());
+        let audit = MockAudit::succeed();
+        // The site runtime's own construction: the local operator as the
+        // posture's base actor.
+        let monitor = TaskMonitor::new(
+            &store,
+            &reader,
+            &audit,
+            AuditActor::LocalOperator,
+            DeploymentPosture::Site,
+        );
+
+        let poll = monitor.poll(operation.id(), first_poll_at()).await?;
+
+        let TaskPoll::Terminal(unknown) = poll else {
+            return Err(std::io::Error::other("a disappeared Task must resolve").into());
+        };
+        assert_eq!(unknown.state(), OperationState::Unknown);
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].context().actor(), AuditActor::System);
+        assert_eq!(events[0].context().origin(), DeploymentPosture::Site);
         Ok(())
     }
 

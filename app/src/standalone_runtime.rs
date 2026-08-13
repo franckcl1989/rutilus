@@ -7,7 +7,8 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroU64,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -81,8 +82,41 @@ use crate::{
 };
 
 /// Defensive upper bound for the in-memory recent-audit tail served by the
-/// Standalone console until persistence exposes a bounded listing query.
+/// Standalone console; the tail is warmed from the store's bounded listing
+/// at startup (audit follow-up V5A-2).
 const AUDIT_TAIL_EVENTS: usize = 1024;
+
+/// The bounded audit compensation queue (V5A-4): every event whose durable
+/// append failed is queued here and retried by the background compensation
+/// drain, so a transient store failure can never leave an operation's audit
+/// trail permanently dangling after its terminal state was persisted. The
+/// queue is purely in-memory: events still queued at process exit (crash or
+/// shutdown) are lost, so the guarantee holds only for the process lifetime.
+/// A durable outbox for the compensation queue is deferred to a later
+/// iteration.
+const AUDIT_COMPENSATION_EVENTS: usize = 256;
+
+/// How often the compensation drain retries the queued audit appends.
+const AUDIT_COMPENSATION_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The process-wide bounded audit compensation queue.
+///
+/// The queue is a process-global like the endpoint write gates
+/// ([`crate::scheduler::ENDPOINT_WRITE_GATES`]): one process owns one store
+/// and one audit trail, so the compensation state has no per-instance home —
+/// the `StandaloneState` struct is assembled by three postures whose
+/// literals would each need a new field.
+static AUDIT_COMPENSATION: OnceLock<Mutex<VecDeque<AuditEvent>>> = OnceLock::new();
+
+/// Whether the startup tail warm-up found corrupt persisted history (V5A-2).
+///
+/// A corrupt row is presented truthfully: the console audit query reports
+/// the failure instead of silently serving a partial view, and the warm-up
+/// error is logged with the corrupt operation's identity. The flag is a
+/// process-global for the same reason as the compensation queue; it survives
+/// a poisoned tail lock (it is a plain atomic, not a mutex), so a broken
+/// tail cache never hides the warm-up verdict.
+static AUDIT_TAIL_WARM_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The application-side cap on concurrent Argon2id derivations (P4-12).
 ///
@@ -394,22 +428,27 @@ impl AuditEventWriter for StandaloneState {
 
     /// Persists the immutable fact first, then mirrors it into the bounded
     /// in-memory tail served by the console audit query.
+    ///
+    /// A failed durable append is not left silently dangling (V5A-4): the
+    /// event is queued for the background compensation drain before the
+    /// error escapes, so a transient store failure is retried instead of
+    /// permanently losing the terminal fact of an already-terminal
+    /// operation. A failed tail mirror is the persistence fork of V5A-6: the
+    /// event is durably stored and the query falls back to the store when
+    /// the tail cache is broken, so the mirror failure is warned about
+    /// rather than reported as a lost append.
     fn append_audit_event<'a>(
         &'a self,
         event: &'a AuditEvent,
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
-            <SqliteStore as AuditEventWriter>::append_audit_event(&self.store, event)
-                .await
-                .map_err(StandaloneAuditWriteError::Store)?;
-            let mut tail = self
-                .audit_tail
-                .lock()
-                .map_err(|_| StandaloneAuditWriteError::Tail(StandaloneAuditTailError))?;
-            if tail.len() == AUDIT_TAIL_EVENTS {
-                tail.pop_front();
+            if let Err(source) =
+                <SqliteStore as AuditEventWriter>::append_audit_event(&self.store, event).await
+            {
+                enqueue_audit_compensation(event, &source);
+                return Err(StandaloneAuditWriteError::Store(source));
             }
-            tail.push_back(event.clone());
+            self.mirror_audit_event_to_tail(event);
             Ok(())
         })
     }
@@ -423,13 +462,184 @@ impl AuditEventQuery for StandaloneState {
         limit: NonZeroU64,
     ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
         Box::pin(async move {
-            let tail = self
-                .audit_tail
-                .lock()
-                .map_err(|_| StandaloneAuditTailError)?;
-            let take = usize::try_from(limit.get()).map_err(|_| StandaloneAuditTailError)?;
-            Ok(tail.iter().rev().take(take).cloned().collect())
+            if AUDIT_TAIL_WARM_FAILED.load(Ordering::Relaxed) {
+                // The warm-up found corrupt persisted history: the console
+                // must see the failure, never a partial view that hides it
+                // (V5A-2 — the same fail-closed contract as the store's own
+                // corrupt-trail read).
+                return Err(StandaloneAuditTailError);
+            }
+            // The tail-lock guard must not live across the fallback await
+            // below, so the tail read is completed and the guard dropped
+            // before any await.
+            if let Ok(tail) = self.audit_tail.lock() {
+                let take = usize::try_from(limit.get()).map_err(|_| StandaloneAuditTailError)?;
+                return Ok(tail.iter().rev().take(take).cloned().collect());
+            }
+            // V5A-6: the in-memory tail cache is broken (a poisoned lock —
+            // `std::sync::Mutex` poisoning is permanent, so a mirror retry
+            // could never succeed). The persisted store remains the truth,
+            // and the query falls back to it so the console never silently
+            // loses events to the fork.
+            tracing::warn!(
+                "the in-memory audit tail is unavailable; serving the audit query from the \
+                 persisted store"
+            );
+            self.store
+                .list_recent_audit_events(limit.get())
+                .await
+                .map_err(|_| StandaloneAuditTailError)
         })
+    }
+}
+
+impl StandaloneState {
+    /// Warms the bounded in-memory audit tail from the store's newest
+    /// persisted events (V5A-2), so the console's audit query sees the
+    /// pre-restart history instead of an empty page.
+    ///
+    /// The warm-up revalidates every stored row through the same typed
+    /// read-back as the per-operation trail read: a corrupt persisted row
+    /// marks the tail failed — the console query reports the failure
+    /// ([`AuditEventQuery`]) and the corruption is logged with its operation
+    /// identity — instead of silently serving a partial view.
+    async fn warm_audit_tail(&self) {
+        match self
+            .store
+            .list_recent_audit_events(AUDIT_TAIL_EVENTS as u64)
+            .await
+        {
+            Ok(events) => {
+                let Ok(mut tail) = self.audit_tail.lock() else {
+                    // A poisoned tail at startup is the V5A-6 broken-cache
+                    // case; the query falls back to the store.
+                    tracing::warn!(
+                        "the in-memory audit tail is unavailable at startup; the audit query \
+                         will serve from the persisted store"
+                    );
+                    return;
+                };
+                // The listing is newest-first; the tail keeps oldest→newest
+                // so the query's reverse iteration serves the newest first.
+                for event in events.into_iter().rev() {
+                    tail.push_back(event);
+                }
+            }
+            Err(error) => {
+                AUDIT_TAIL_WARM_FAILED.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    "the audit tail could not be warmed from persisted history; the console \
+                     audit query will report the failure: {error}"
+                );
+            }
+        }
+    }
+
+    /// Mirrors one durably appended event into the bounded in-memory tail.
+    ///
+    /// A mirror failure is warned about, never fatal: the event is already
+    /// persisted, and the console query falls back to the store while the
+    /// tail cache is broken (V5A-6).
+    fn mirror_audit_event_to_tail(&self, event: &AuditEvent) {
+        match self.audit_tail.lock() {
+            Ok(mut tail) => {
+                if tail.len() == AUDIT_TAIL_EVENTS {
+                    tail.pop_front();
+                }
+                tail.push_back(event.clone());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "an audit event is persisted but could not be mirrored into the in-memory \
+                     tail; the console audit query will serve from the persisted store"
+                );
+            }
+        }
+    }
+
+    /// Persists one event and mirrors it into the tail — the shared write
+    /// path of the append boundary and the compensation drain.
+    async fn persist_and_mirror_audit_event(
+        &self,
+        event: &AuditEvent,
+    ) -> Result<(), StandaloneAuditWriteError> {
+        <SqliteStore as AuditEventWriter>::append_audit_event(&self.store, event)
+            .await
+            .map_err(StandaloneAuditWriteError::Store)?;
+        self.mirror_audit_event_to_tail(event);
+        Ok(())
+    }
+
+    /// Retries one queued audit append (V5A-4): a successful retry persists
+    /// and mirrors the event; a failed one is requeued — bounded by
+    /// [`AUDIT_COMPENSATION_EVENTS`] — and warned about, so the compensation
+    /// keeps trying while the store is unavailable and never grows without
+    /// bound.
+    async fn drain_audit_compensation(&self) {
+        let event = {
+            let Ok(mut queue) = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+            else {
+                tracing::error!("the audit compensation queue is unavailable");
+                return;
+            };
+            queue.pop_front()
+        };
+        let Some(event) = event else {
+            return;
+        };
+        match self.persist_and_mirror_audit_event(&event).await {
+            Ok(()) => {}
+            Err(source) => {
+                tracing::warn!(
+                    "the audit compensation retry failed; the event stays queued: {source}"
+                );
+                if let Ok(mut queue) = AUDIT_COMPENSATION
+                    .get_or_init(|| Mutex::new(VecDeque::new()))
+                    .lock()
+                {
+                    if queue.len() == AUDIT_COMPENSATION_EVENTS {
+                        queue.pop_front();
+                    }
+                    queue.push_back(event);
+                }
+            }
+        }
+    }
+}
+
+/// Queues one failed audit append for the compensation drain (V5A-4),
+/// bounded by [`AUDIT_COMPENSATION_EVENTS`] with the oldest entry dropped.
+fn enqueue_audit_compensation(event: &AuditEvent, source: &AuditRepositoryError) {
+    let Ok(mut queue) = AUDIT_COMPENSATION
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    else {
+        tracing::error!(
+            "the audit compensation queue is unavailable; the event will not be retried"
+        );
+        return;
+    };
+    if queue.len() == AUDIT_COMPENSATION_EVENTS {
+        queue.pop_front();
+    }
+    queue.push_back(event.clone());
+    tracing::warn!(
+        "the audit append failed ({source}); the event is queued for the compensation drain"
+    );
+}
+
+/// Runs the audit compensation drain until the stop watch fires: every
+/// [`AUDIT_COMPENSATION_DRAIN_INTERVAL`] one queued event whose durable
+/// append failed is retried (V5A-4).
+async fn run_audit_compensation_drain(mut stop: scheduler::StopWatch, state: Arc<StandaloneState>) {
+    let mut interval = tokio::time::interval(AUDIT_COMPENSATION_DRAIN_INTERVAL);
+    loop {
+        tokio::select! {
+            () = stop.stopped() => return,
+            _ = interval.tick() => state.drain_audit_compensation().await,
+        }
     }
 }
 
@@ -1436,12 +1646,14 @@ impl event_listener::EndpointLister for StandaloneEndpointLister {
 }
 
 /// A controlled failure while durably appending one audit fact.
+///
+/// The tail mirror is deliberately not part of the vocabulary: a failed
+/// mirror is warned about and the event stays durably stored (V5A-6), so
+/// the append boundary's error is exactly "the persisted append failed".
 #[derive(Debug, Error)]
 pub enum StandaloneAuditWriteError {
     #[error("failed to append the audit event: {0}")]
     Store(#[source] AuditRepositoryError),
-    #[error("failed to record the in-memory audit tail: {0}")]
-    Tail(#[source] StandaloneAuditTailError),
 }
 
 /// The in-memory recent-audit tail cannot be read or bounded.
@@ -1529,16 +1741,21 @@ impl StandaloneInstance {
             SqliteStore::open_with_command_key(paths.database_path(), Arc::clone(&master_key))
                 .await
                 .map_err(StandaloneInstanceError::OpenStore)?;
-        Ok(Self {
-            state: Arc::new(StandaloneState {
-                store,
-                master_key,
-                _runtime_lock: runtime_lock,
-                audit_tail: Arc::new(Mutex::new(VecDeque::new())),
-                registry: Arc::new(CenterSessionRegistry::new()),
-                center_issuer: Mutex::new(None),
-            }),
-        })
+        let state = Arc::new(StandaloneState {
+            store,
+            master_key,
+            _runtime_lock: runtime_lock,
+            audit_tail: Arc::new(Mutex::new(VecDeque::new())),
+            registry: Arc::new(CenterSessionRegistry::new()),
+            center_issuer: Mutex::new(None),
+        });
+        // V5A-2: the console's audit query reads the bounded in-memory tail,
+        // so the tail is warmed from the store's newest persisted events at
+        // startup — a restart never hides the persisted history. A corrupt
+        // persisted row marks the tail failed instead of being silently
+        // skipped.
+        state.warm_audit_tail().await;
+        Ok(Self { state })
     }
 
     #[must_use]
@@ -1881,6 +2098,8 @@ pub async fn run_initialized_standalone(
             Arc::clone(&instance.state),
             gateway,
             options.telemetry_retention(),
+            DeploymentPosture::Standalone,
+            AuditActor::LocalOperator,
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
                     options,
@@ -1928,6 +2147,14 @@ pub async fn run_initialized_standalone(
 /// with — the runtime's configured policy from the run options, so both
 /// postures honor the operator's `--telemetry-retention-days` value.
 ///
+/// `posture` and `actor` are the §16.3 base attribution of the posture's
+/// operation executions (audit follow-up V5A-3): the Standalone runtime
+/// passes the local operator from the Standalone origin, and the Site
+/// runtime passes the local operator from the Site origin. The executor and
+/// monitor refine the base attribution per operation from the operation's
+/// persisted source — a center-dispatched offer executed at the site names
+/// the center's automation with the site origin.
+///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when signal registration or HTTP serving
@@ -1938,6 +2165,8 @@ pub(crate) async fn run_background_services<Server, Stop>(
     services: Arc<StandaloneState>,
     gateway: Arc<RedfishGateway>,
     retention: TelemetryRetention,
+    posture: DeploymentPosture,
+    actor: AuditActor,
     make_server: impl FnOnce(AuthPolicy, scheduler::StopWatch, oneshot::Receiver<()>) -> Server,
     stop: Stop,
 ) -> Result<(), StandaloneRunError>
@@ -1946,14 +2175,16 @@ where
     Stop: Future<Output = io::Result<()>> + Send,
 {
     // One stop signal stops the scheduler, the event listeners, the
-    // telemetry sampler, and the server in order; each task owns its own
-    // Arc clones of the authenticated state and the gateway, so it is
-    // `'static` and spawnable.
+    // telemetry sampler, the audit compensation drain, and the server in
+    // order; each task owns its own Arc clones of the authenticated state
+    // and the gateway, so it is `'static` and spawnable.
     let (stop_signal, stop_watch) = scheduler::StopSignal::new();
     let mut scheduler = tokio::spawn(run_operation_scheduler(
         stop_watch.clone(),
         Arc::clone(&services),
         Arc::clone(&gateway),
+        posture,
+        actor,
     ));
     // §14.4: one EventService listener per enrolled endpoint, reconciled
     // against the enrolled set every LISTENER_RECONCILE_INTERVAL — the
@@ -1972,6 +2203,13 @@ where
         stop_watch.clone(),
         Arc::clone(&services),
         retention,
+    ));
+    // V5A-4: the audit compensation drain retries the queued failed audit
+    // appends on its own cadence, so a transient store failure never leaves
+    // a terminal audit fact permanently missing.
+    let mut compensation = tokio::spawn(run_audit_compensation_drain(
+        stop_watch.clone(),
+        Arc::clone(&services),
     ));
     // The §16.2 first-run lifecycle: while an unconsumed bootstrap code
     // exists the console serves only the claim surface (the bootstrap
@@ -2009,6 +2247,7 @@ where
             drain_scheduler(&mut scheduler).await;
             drain_listeners(&mut listeners).await;
             drain_sampler(&mut sampler).await;
+            drain_compensation(&mut compensation).await;
             let _ = scheduler_done_sender.send(());
             result.map_err(StandaloneRunError::Serve)
         }
@@ -2019,9 +2258,12 @@ where
             drain_scheduler(&mut scheduler).await;
             // The listeners drain next; each in-flight event finishes.
             drain_listeners(&mut listeners).await;
-            // The telemetry sampler drains last; its in-flight sweep
+            // The telemetry sampler drains next; its in-flight sweep
             // finishes.
             drain_sampler(&mut sampler).await;
+            // The audit compensation drain stops last; its in-flight retry
+            // finishes.
+            drain_compensation(&mut compensation).await;
             let _ = scheduler_done_sender.send(());
             // The server's shutdown future resolves now; await its drain.
             server.await.map_err(StandaloneRunError::Serve)
@@ -2225,6 +2467,8 @@ async fn run_operation_scheduler(
     stop: scheduler::StopWatch,
     state: Arc<StandaloneState>,
     gateway: Arc<RedfishGateway>,
+    posture: DeploymentPosture,
+    actor: AuditActor,
 ) {
     // One gateway clone serves both the executor (dispatch + verification)
     // and the monitor (Task reads + verification); every boundary resolves
@@ -2238,6 +2482,11 @@ async fn run_operation_scheduler(
     // Update command needs, beside the operation, capability, and remote-task
     // roles it delegates to `SqliteStore` — while the command executor keeps
     // the raw `SqliteStore` for its endpoint lookups.
+    //
+    // `posture` and `actor` are the §16.3 base attribution (V5A-3): the
+    // executor and monitor refine it per operation from the operation's
+    // persisted source, so a center-dispatched operation executed at the
+    // site audits under the center's automation with the site origin.
     let command_executor =
         RedfishCommandExecutor::new(gateway.as_ref().clone(), &state.store, state.as_ref());
     let executor = OperationExecutor::new(
@@ -2245,15 +2494,15 @@ async fn run_operation_scheduler(
         &command_executor,
         state.as_ref(),
         SystemClock,
-        AuditActor::LocalOperator,
-        DeploymentPosture::Standalone,
+        actor,
+        posture,
     );
     let monitor = TaskMonitor::new(
         &state.store,
         &command_executor,
         state.as_ref(),
-        AuditActor::LocalOperator,
-        DeploymentPosture::Standalone,
+        actor,
+        posture,
     );
     let engine = OperationEngine::new(&state.store);
     scheduler::run(
@@ -2265,6 +2514,20 @@ async fn run_operation_scheduler(
         SystemClock,
     )
     .await;
+}
+
+/// Waits for the audit compensation drain task and reports an unexpected
+/// failure.
+///
+/// The drain never returns an error — it exits only on the stop signal — so
+/// a `JoinError` means the task panicked or was cancelled, a programming
+/// defect worth surfacing but not a blocker for the `SQLite` close that
+/// follows.
+#[instrument(skip_all)]
+async fn drain_compensation(compensation: &mut tokio::task::JoinHandle<()>) {
+    if let Err(join_error) = compensation.await {
+        tracing::error!("The audit compensation drain failed: {join_error}");
+    }
 }
 
 /// Waits for the scheduling-loop task and reports an unexpected failure.
@@ -2395,7 +2658,9 @@ mod tests {
         RedfishDiscovery, TlsIdentityObservation, TlsIdentityProbe,
     };
     use rutilus_domain::{
-        ARGON2ID_HASH_LENGTH, ARGON2ID_SALT_LENGTH, CredentialUsername, EndpointAddress, TlsTrust,
+        ARGON2ID_HASH_LENGTH, ARGON2ID_SALT_LENGTH, AuditAction, AuditOperationContext,
+        AuditOperationId, AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget,
+        CredentialUsername, EndpointAddress, ProductPermission, TlsTrust,
     };
     use secrecy::SecretString;
     use tokio::{
@@ -2404,6 +2669,47 @@ mod tests {
     };
 
     use super::*;
+
+    /// The audit tests share the process-wide compensation queue and the
+    /// warm-up flag exactly like the production runtime does, so they
+    /// serialize through this lock (the same discipline as the derivation
+    /// gate's `GATE_TEST_LOCK`).
+    static AUDIT_GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The tests share the process-wide audit compensation queue and the
+    /// warm-up flag exactly like the production runtime does, so each test
+    /// resets them before it runs.
+    fn reset_audit_globals() {
+        if let Ok(mut queue) = AUDIT_COMPENSATION
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+        {
+            queue.clear();
+        }
+        AUDIT_TAIL_WARM_FAILED.store(false, Ordering::Relaxed);
+    }
+
+    /// One legal audit context for the tests: a CSV import by the local
+    /// operator, the vocabulary shape every runtime audit helper can append.
+    fn import_context() -> Result<AuditOperationContext, Box<dyn Error>> {
+        Ok(AuditOperationContext::try_new(
+            AuditOperationId::generate(),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuditTarget::Product,
+            AuditParameterSummary::csv_endpoint_import(1)?,
+            ProductPermission::ManageEndpoints,
+            AuditAction::ImportEndpoints,
+            AuditRedfishOperation::None,
+        )?)
+    }
+
+    /// The audit query limit of the audit tests: larger than the event
+    /// counts the tests assert, so the bounded query never truncates them.
+    fn audit_query_limit() -> Result<NonZeroU64, Box<dyn Error>> {
+        NonZeroU64::new(10)
+            .ok_or_else(|| std::io::Error::other("ten is a valid audit query limit").into())
+    }
 
     /// The derivation-gate tests share the process-wide
     /// [`PASSWORD_DERIVATION_SLOTS`] and [`PASSWORD_DERIVATION_QUEUE`]
@@ -3199,6 +3505,246 @@ mod tests {
             StandaloneInstance::open(&corrupt_database_paths, &unlock).await,
             Err(StandaloneInstanceError::OpenStore(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_backfills_the_audit_tail_from_persisted_history() -> Result<(), Box<dyn Error>>
+    {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-2: the console audit query reads the bounded in-memory tail,
+        // so the tail is warmed from the store's newest persisted events at
+        // startup — a restart never hides the history.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+
+        // Session one records one complete audited operation.
+        let now = OffsetDateTime::now_utc();
+        let context = import_context()?;
+        let started = AuditEvent::started(context.clone(), now);
+        let succeeded = AuditEvent::succeeded(
+            context,
+            AuditSequence::FIRST.next()?,
+            now + Duration::from_secs(1),
+        )?;
+        let first = StandaloneInstance::open(&paths, &passphrase).await?;
+        first.state().append_audit_event(&started).await?;
+        first.state().append_audit_event(&succeeded).await?;
+        first.close().await?;
+
+        // The "restart": a fresh instance over the same store warms its tail
+        // from the persisted history, and the console query sees both events
+        // newest first.
+        let second = StandaloneInstance::open(&paths, &passphrase).await?;
+        let events =
+            AuditEventQuery::list_recent_events(&*second.state(), audit_query_limit()?).await?;
+        assert_eq!(events, [succeeded, started]);
+        second.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_warm_up_marks_the_tail_and_the_query_reports_it() -> Result<(), Box<dyn Error>>
+    {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-2: corrupt persisted history must be presented truthfully —
+        // the console query reports the failure instead of serving a partial
+        // view that hides the corruption. (The corruption itself cannot be
+        // written through the store's own validated surface, so the test
+        // arms the warm-up's fail-closed verdict directly.)
+        reset_audit_globals();
+        AUDIT_TAIL_WARM_FAILED.store(true, Ordering::Relaxed);
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        assert!(matches!(
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await,
+            Err(StandaloneAuditTailError)
+        ));
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    // The poison task's panic is the point of the test: it is the only way
+    // the mirror can fail, and it happens on a spawned thread, never on the
+    // test's own path.
+    #[allow(clippy::panic)]
+    async fn a_broken_tail_mirror_never_loses_the_persisted_event() -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-6: a poisoned tail lock — the only mirror failure mode — is
+        // warned about, the append still reports success (the event is
+        // durably stored), and the console query falls back to the persisted
+        // store, so the fork never silently hides an event.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        // Poison the tail lock: a task panics while holding the guard, the
+        // only way the mirror can fail.
+        let state = Arc::clone(&instance.state);
+        let poisoned = std::thread::spawn(move || {
+            if let Ok(guard) = state.audit_tail.lock() {
+                let _guard = guard;
+                panic!("poison the audit tail for the mirror-failure test");
+            }
+        });
+        assert!(
+            poisoned.join().is_err(),
+            "the poison task must panic while holding the tail lock"
+        );
+
+        let context = import_context()?;
+        let started = AuditEvent::started(context, OffsetDateTime::now_utc());
+        instance.state().append_audit_event(&started).await?;
+        let events =
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?;
+        assert_eq!(
+            events,
+            [started],
+            "the persisted event stays queryable through the store fallback"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_append_is_queued_for_the_compensation_drain() -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-4: a failed durable append is not left silently dangling — the
+        // event is queued for the compensation drain, and a retry that still
+        // fails keeps it queued instead of losing it.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        // A terminal event without its start fails the append validation —
+        // the durable append is refused and the event is queued.
+        let context = import_context()?;
+        let terminal = AuditEvent::succeeded(
+            context,
+            AuditSequence::FIRST.next()?,
+            OffsetDateTime::now_utc(),
+        )?;
+        assert!(matches!(
+            instance.state().append_audit_event(&terminal).await,
+            Err(StandaloneAuditWriteError::Store(
+                AuditRepositoryError::MissingStart { .. }
+            ))
+        ));
+        {
+            let queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0], terminal);
+        }
+
+        // The drain retries against the store; the append still cannot
+        // succeed, so the event stays queued for a later retry.
+        instance.state().drain_audit_compensation().await;
+        {
+            let queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0], terminal);
+        }
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_compensation_drain_persists_and_mirrors_a_queued_event()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-4: a queued event whose append previously failed is retried by
+        // the drain and lands in both the persisted trail and the console
+        // read surface once the store can take it again.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        let context = import_context()?;
+        let started = AuditEvent::started(context.clone(), OffsetDateTime::now_utc());
+        {
+            let mut queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            queue.push_back(started.clone());
+        }
+        instance.state().drain_audit_compensation().await;
+
+        let events =
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], started);
+        assert_eq!(
+            instance
+                .state()
+                .store
+                .find_audit_operation(context.operation_id())
+                .await?,
+            [started]
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_compensation_queue_is_bounded() -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // V5A-4: the compensation queue drops its oldest entry instead of
+        // growing without bound.
+        reset_audit_globals();
+        let now = OffsetDateTime::now_utc();
+        let source = AuditRepositoryError::MissingStart {
+            operation_id: AuditOperationId::generate(),
+            actual: AuditSequence::try_new(2)?,
+        };
+        let mut events = Vec::with_capacity(AUDIT_COMPENSATION_EVENTS + 1);
+        for _ in 0..=AUDIT_COMPENSATION_EVENTS {
+            let event = AuditEvent::started(import_context()?, now);
+            enqueue_audit_compensation(&event, &source);
+            events.push(event);
+        }
+        let queue = AUDIT_COMPENSATION
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+        assert_eq!(queue.len(), AUDIT_COMPENSATION_EVENTS);
+        assert_eq!(
+            queue[0].id(),
+            events[1].id(),
+            "the oldest queued entry must be dropped"
+        );
+        assert_eq!(
+            queue[AUDIT_COMPENSATION_EVENTS - 1].id(),
+            events[AUDIT_COMPENSATION_EVENTS].id()
+        );
         Ok(())
     }
 }

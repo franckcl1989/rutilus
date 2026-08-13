@@ -9,9 +9,12 @@
 //! one-time code is re-derived with HMAC-SHA1 from the counter step nearest
 //! the current time (RFC 6238's 30-second period, 6 digits, a one-step
 //! window on each side), compared without short-circuiting, and replayed
-//! codes are refused by tracking the last used step. The secret never leaves
-//! this type in plaintext: it is held in a `SecretBox`, and `Debug` renders
-//! only redaction.
+//! codes are refused by tracking the last used step — a code accepted from
+//! the future window is recorded at its own step, so the same digits are
+//! refused when the clock reaches that step (the transient lockout
+//! documented at [`verify_totp_code`], V5C-5). The secret never leaves this
+//! type in plaintext: it is held in a `SecretBox`, and `Debug` renders only
+//! redaction.
 //!
 //! The algorithm is self-contained here (the HMAC-SHA1 primitives are the
 //! same audited digest generation the product already resolves for `SQLx`),
@@ -205,6 +208,11 @@ impl TotpAuthenticator {
     /// layer's conditional update, which refuses to move the recorded step
     /// backwards even under racing sign-ins.
     ///
+    /// A code accepted from the future window is consumed for its own step
+    /// (see [`verify_totp_code`]): when the clock reaches that step the same
+    /// code is refused as replayed — a transient lockout of at most one
+    /// step, the documented cost of the future-window acceptance (V5C-5).
+    ///
     /// # Errors
     ///
     /// Returns [`TotpAuthenticatorError::NotActive`] when the authenticator
@@ -386,6 +394,18 @@ fn hotp(secret: &[u8], step: u64) -> Result<u32, TotpAuthenticatorError> {
 /// aggregate and the security crate's sign-in surface: the code must match a
 /// step inside the one-step window and must advance past `last_used_step`
 /// (anti-replay). The matched step is returned so the caller can persist it.
+///
+/// A code accepted from the *future* window — the step ahead of the current
+/// one — is recorded as used at its own step, because that step is what the
+/// anti-replay floor must remember for the one-time property to hold. The
+/// consequence is documented, not papered over (V5C-5): when the clock
+/// reaches that step, the same digits are refused as replayed, so a device
+/// whose clock runs ahead of the server is locked out of the code it is
+/// showing for at most one step. That transient lockout is the honest cost
+/// of accepting future-window codes — the alternative (recording the code
+/// as used only at the current step) would let the same code authenticate
+/// repeatedly until its own step arrived, which is exactly the replay the
+/// floor exists to refuse.
 ///
 /// # Errors
 ///
@@ -573,6 +593,38 @@ mod tests {
             authenticator.record_step(0),
             Err(TotpAuthenticatorError::Replayed)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn future_window_acceptance_consumes_the_code_for_its_own_step() -> Result<(), Box<dyn Error>> {
+        // V5C-5: a code accepted from the future window is recorded at its
+        // own step — that is the floor the one-time property needs, so the
+        // same code never authenticates twice. The documented consequence:
+        // when the clock reaches the code's own step, the same digits are
+        // refused as replayed — a transient lockout of at most one step for
+        // a device whose clock runs ahead — and the next fresh code opens
+        // again.
+        let mut authenticator = provisioning(step_at(0)?);
+        // Step 1's code presented while step 0 is current (the future
+        // window) is accepted — here through activation, which runs the
+        // same verification core — and recorded at its own step.
+        authenticator.activate("287082", step_at(0)?)?;
+        assert_eq!(authenticator.last_used_step(), Some(1));
+        // When step 1 arrives, the same code is the step's own code — and
+        // is refused as used: the transient lockout, never a second
+        // authentication.
+        assert!(matches!(
+            authenticator.verify("287082", step_at(30)?),
+            Err(TotpAuthenticatorError::Replayed)
+        ));
+        // The code behind the recorded step is refused too...
+        assert!(matches!(
+            authenticator.verify("755224", step_at(30)?),
+            Err(TotpAuthenticatorError::Replayed)
+        ));
+        // ...and the next fresh code verifies once its step is current.
+        assert_eq!(authenticator.verify("359152", step_at(60)?)?, 2);
         Ok(())
     }
 

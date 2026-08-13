@@ -737,13 +737,15 @@ where
     }
 }
 
-/// The §15.6 offer facts of one outbox row, rebuilt for the retry scan.
+/// The §15.6 offer facts of one outbox row, rebuilt for the retry scan and
+/// the reply-site fallback.
 ///
-/// The tracking operation record does not persist the offer target or the
-/// offer expiry, so the retry scan rebuilds them from the durable offer
-/// envelopes exactly like the center's tracking view does.
+/// The tracking operation record does not persist the offer target, the
+/// offer expiry, or the addressed site, so the rebuilds take them from the
+/// durable offer envelopes exactly like the center's tracking view does.
 struct OfferFact {
     operation_id: OperationId,
+    site_id: Option<InstanceId>,
     target: String,
     expires_at: OffsetDateTime,
     entry_id: OutboxEntryId,
@@ -753,7 +755,9 @@ struct OfferFact {
 /// The §15.6 offer facts of one outbox entry: `Some(facts)` for an offer
 /// row, `None` for every other row. An offer whose expiry cannot be parsed
 /// reports the epoch — an unreadable TTL is treated as past (fail closed,
-/// like the flush that retires such rows).
+/// like the flush that retires such rows) — and an offer whose addressed
+/// site cannot be parsed reports `None` for the site (the V5E-1 reply
+/// fallback then fails closed on that row).
 fn offer_facts(entry: &OutboxEntry) -> Option<OfferFact> {
     let envelope: Envelope = serde_json::from_str(entry.payload_json()).ok()?;
     let EnvelopeMessage::OperationOffer(offer) = envelope.message? else {
@@ -762,6 +766,7 @@ fn offer_facts(entry: &OutboxEntry) -> Option<OfferFact> {
     let operation_id = offer.operation_id.parse().ok()?;
     Some(OfferFact {
         operation_id,
+        site_id: offer.site_id.parse().ok(),
         target: offer.target,
         expires_at: OffsetDateTime::from_unix_timestamp(offer.expires_at_unix)
             .unwrap_or(OffsetDateTime::UNIX_EPOCH),
@@ -845,7 +850,14 @@ pub trait CenterReplyConsumer: Send + Sync {
 /// Every reply is processed on arrival — the recorded operation's state
 /// machine is the idempotency point, so a re-delivered reply is absorbed —
 /// and the reply envelope is logged into the site's inbox row under the
-/// operation id as the durable receipt.
+/// operation id as the durable receipt. The addressed site of a reply is
+/// verified before any credit (a reply routed through another site's
+/// connection must never advance a foreign operation): the endpoint's
+/// projection first, and the operation's durable offer facts when the
+/// projection is gone (V5E-1), so a terminal reply still credits after the
+/// endpoint was deleted. `Store` is therefore also the center-outbox
+/// boundary: the store that persists the §15.6 offers (the same
+/// `&SqliteStore` the runtime hands the tracking).
 pub struct CenterOperationTracking<Store, Inbox> {
     store: Store,
     inbox: Inbox,
@@ -860,10 +872,11 @@ impl<Store, Inbox> CenterOperationTracking<Store, Inbox> {
 
 /// A controlled failure of one reply-tracking step.
 #[derive(Debug, Error)]
-pub enum CenterOperationTrackingError<OperationError, ProjectionError, InboxError>
+pub enum CenterOperationTrackingError<OperationError, ProjectionError, OutboxError, InboxError>
 where
     OperationError: Error + 'static,
     ProjectionError: Error + 'static,
+    OutboxError: Error + 'static,
     InboxError: Error + 'static,
 {
     /// The operation store failed; carries its own error.
@@ -873,6 +886,10 @@ where
     /// carries its own error.
     #[error("the projection repository failed: {0}")]
     Projection(#[source] ProjectionError),
+    /// The center outbox failed while rebuilding the reply's offer facts;
+    /// carries its own error.
+    #[error("the center outbox failed: {0}")]
+    Outbox(#[source] OutboxError),
     /// The durable inbox failed; carries its own error.
     #[error("the center inbox failed: {0}")]
     Inbox(#[source] InboxError),
@@ -885,12 +902,13 @@ where
 type TrackingErrorOf<Store, Inbox> = CenterOperationTrackingError<
     <Store as OperationStore>::Error,
     <Store as CenterProjectionRepository>::Error,
+    <Store as CenterOutbox>::Error,
     <Inbox as CenterInbox>::Error,
 >;
 
 impl<Store, Inbox> CenterReplyConsumer for CenterOperationTracking<Store, Inbox>
 where
-    Store: OperationStore + CenterProjectionRepository,
+    Store: OperationStore + CenterProjectionRepository + CenterOutbox,
     Inbox: CenterInbox,
 {
     type Error = TrackingErrorOf<Store, Inbox>;
@@ -931,8 +949,10 @@ where
             // a reply routed through another site's connection would
             // otherwise advance a foreign operation. The offer's site is
             // the endpoint's site in the center projection (§15.5) — the
-            // reverse lookup from the tracking record.
-            let expected_site = self.offer_site(&operation).await?;
+            // reverse lookup from the tracking record — and, when the
+            // projection no longer exists, the operation's recorded offer
+            // facts (V5E-1).
+            let expected_site = self.offer_site(&operation, site).await?;
             if expected_site != Some(site) {
                 tracing::warn!(
                     "site {site}: refusing a reply for operation {operation_id} addressed to \
@@ -940,7 +960,17 @@ where
                 );
                 // The refusal is recorded, not absorbed: the receipt row
                 // names the replying site, and its phase stays untouched —
-                // the center never credits the reply.
+                // the center never credits the reply. The frame is still
+                // acknowledged: the receipt is the durable evidence of what
+                // the site said, and re-delivering the frame would wedge
+                // the connection and every later frame of the site's report
+                // on an anomaly the receipt already records (the same
+                // at-least-once cost judgment as the projection's absorbed
+                // frames). After the V5E-1 fallback this path fires only
+                // when the operation's offer facts are gone from the outbox
+                // history too — a manual DB change or a restore that
+                // predates the offer — which the receipt trail and the warn
+                // name for the operator.
                 self.record_reply(site, envelope, operation_id, now).await?;
                 return Ok(());
             }
@@ -985,16 +1015,31 @@ where
 
 impl<Store, Inbox> CenterOperationTracking<Store, Inbox>
 where
-    Store: OperationStore + CenterProjectionRepository,
+    Store: OperationStore + CenterProjectionRepository + CenterOutbox,
     Inbox: CenterInbox,
 {
     /// The site an operation's offer was addressed to: the endpoint's site
-    /// in the center projection (§15.5). `None` when the endpoint is no
-    /// longer projected — the reply's site is then unverifiable and the
-    /// reply is refused (fail closed).
+    /// in the center projection (§15.5), and — when the projection is gone —
+    /// the operation's recorded offer facts (V5E-1).
+    ///
+    /// The projection is the primary source; `None` when the endpoint is no
+    /// longer projected — the endpoint was deleted by the site after the
+    /// operation ran, or the center was restored from a database that
+    /// predates the projection. The reply is then verified against the
+    /// operation's durable offer facts instead of being refused: the
+    /// center's outbox holds exactly the §15.6 offers, so the replying
+    /// site's own history carries the offer the center addressed to it, and
+    /// the offer envelope records the addressed site. A legitimate reply
+    /// always comes from the site whose queue holds the offer, so the
+    /// fallback restores the credit for the very replies the deleted
+    /// projection would have stranded; a reply from any other site finds no
+    /// offer in its queue and stays refused. `None` — the reply is refused
+    /// (fail closed) — only when the projection AND the offer facts are
+    /// both missing.
     async fn offer_site(
         &self,
         operation: &Operation,
+        site: InstanceId,
     ) -> Result<Option<InstanceId>, TrackingErrorOf<Store, Inbox>> {
         let Some(endpoint_id) = operation
             .targets()
@@ -1003,12 +1048,44 @@ where
         else {
             return Ok(None);
         };
-        Ok(self
+        if let Some(projection) = self
             .store
             .find_endpoint_projection(endpoint_id)
             .await
             .map_err(CenterOperationTrackingError::Projection)?
-            .and_then(|projection| projection.site_id()))
+        {
+            return Ok(projection.site_id());
+        }
+        self.offer_site_from_offer_facts(operation.id(), site).await
+    }
+
+    /// The expected site of one operation rebuilt from its recorded §15.6
+    /// offer facts (V5E-1): the replying site's durable outbox history holds
+    /// the offer the center addressed to it, and the offer envelope records
+    /// the addressed site.
+    ///
+    /// The read is the full offer history of the replying site — the same
+    /// unbounded read the dispatch retry's fall-through uses — but it runs
+    /// only on the fallback path, when the endpoint's projection is gone,
+    /// so the decryption surface stays off the hot path. The offer's
+    /// recorded site is the expected site; a row whose envelope's site
+    /// disagrees with the queue it lives in (a manual DB change) is
+    /// returned as-is, and the caller's site comparison refuses it.
+    async fn offer_site_from_offer_facts(
+        &self,
+        operation_id: OperationId,
+        site: InstanceId,
+    ) -> Result<Option<InstanceId>, TrackingErrorOf<Store, Inbox>> {
+        let entries = self
+            .store
+            .list_offers(site)
+            .await
+            .map_err(CenterOperationTrackingError::Outbox)?;
+        Ok(entries
+            .iter()
+            .filter_map(offer_facts)
+            .find(|fact| fact.operation_id == operation_id)
+            .and_then(|fact| fact.site_id))
     }
 
     /// Persists the reply envelope as the operation's inbox receipt — the
@@ -3285,6 +3362,213 @@ mod tests {
                 .state(),
             OperationState::Running
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_terminal_reply_still_credits_after_the_endpoint_projection_is_deleted()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-1: the site completes the operation, and the endpoint's
+        // projection is then deleted (the §21 endpoint-level delete the
+        // site reports after the work is done). The terminal reply arrives
+        // with the projection gone — the projection lookup alone would
+        // refuse it and leave the operation non-terminal forever — so the
+        // expected site is rebuilt from the operation's recorded offer
+        // facts: the replying site's durable outbox history holds the offer
+        // the center addressed to it, and the reply credits normally.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Chassis/1")));
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+
+        let failed = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        // The succeeded report heals the same way from a record that missed
+        // the acceptance: the offer facts carry the credit. The second
+        // dispatch is a different §17.5 key (another target), so it is its
+        // own operation.
+        let succeeded = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Chassis/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_ne!(succeeded.operation_id(), failed.operation_id());
+        // The endpoint projection goes away before the site's terminal
+        // reports arrive.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = None;
+        complete_reply(
+            &tracking,
+            site,
+            failed.operation_id(),
+            "failed",
+            now + Duration::seconds(2),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(failed.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Failed,
+            "a terminal reply must still credit after the endpoint's projection is deleted"
+        );
+
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationCompleted(OperationCompleted {
+                        operation_id: succeeded.operation_id().to_string(),
+                        succeeded: true,
+                        summary: String::from("reset verified"),
+                    })),
+                },
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(succeeded.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Succeeded
+        );
+        // Both credits were logged as durable receipts.
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 2);
+        assert!(
+            receipts
+                .iter()
+                .all(|entry| entry.operation_id() == failed.operation_id()
+                    || entry.operation_id() == succeeded.operation_id())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_foreign_site_reply_is_refused_after_the_endpoint_projection_is_deleted()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-1: the offer-facts fallback must not weaken the site check —
+        // a reply routed through another site's connection is still refused
+        // when the projection is gone, because the foreign site's own outbox
+        // history does not carry the operation's offer.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let other_site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = None;
+        accept_reply(
+            &tracking,
+            other_site,
+            dispatched.operation_id(),
+            now + Duration::SECOND,
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(dispatched.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Queued,
+            "the foreign site's reply must stay refused with the projection gone"
+        );
+        // The refusal is recorded truthfully, naming the replying site.
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].instance_id(), other_site);
+        assert_eq!(receipts[0].state(), InboxEntryState::Received);
+
+        // The addressed site's own reply still credits through the fallback.
+        accept_reply(
+            &tracking,
+            site,
+            dispatched.operation_id(),
+            now + Duration::seconds(2),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(dispatched.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Running
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_recorded_but_never_credited_when_the_offer_history_is_gone_too()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-1: when the projection AND the operation's offer facts are
+        // both missing — the outbox rows a manual DB change or a restore
+        // that predates the offer removed — the reply is unverifiable and
+        // refused (fail closed): the receipt is recorded durably with the
+        // replying site, the phase stays untouched, and the frame is
+        // consumed so the site's connection never wedges on the anomaly.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = None;
+        *state.entries.lock().map_err(|_| MockStoreError)? = Vec::new();
+        accept_reply(
+            &tracking,
+            site,
+            dispatched.operation_id(),
+            now + Duration::SECOND,
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(dispatched.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Queued,
+            "an unverifiable reply is never credited"
+        );
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].instance_id(), site);
+        assert_eq!(receipts[0].state(), InboxEntryState::Received);
         Ok(())
     }
 

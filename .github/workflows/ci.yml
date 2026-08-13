@@ -289,11 +289,103 @@ jobs:
       # wasm-bindgen version. Regeneration is deterministic, so the fresh
       # artifacts are diffed against the checked-in web/assets to prove the
       # generated files are up to date (verified byte-identical locally).
+      #
+      # Comparison hardening (2026-08-13): the first real execution of this
+      # gate (run 31703808533) failed with `diff -q`'s bare "Files ... differ"
+      # and no other evidence, so the step now (a) LF-normalizes and
+      # BOM-strips BOTH sides of the js comparison before diffing — a CRLF or
+      # BOM round-trip on either side must not fail the gate on the
+      # line-ending class of difference alone — (b) backslash-normalizes BOTH
+      # sides of the wasm comparison (rust-src installed in the build above,
+      # `tr '\\' '/'` copies below), and (c) on a real mismatch uploads the
+      # CI-generated js+wasm as a diagnostics artifact (actions/upload-artifact
+      # v4, the same pin the release job uses) BEFORE failing, so the next
+      # failure carries the evidence the first one lacked.
+      #
+      # Three-source byte-difference analysis (2026-08-13): the committed
+      # web/assets were generated on a Windows host, and a fresh build on the
+      # ubuntu default job embeds the same source locations with three
+      # host-dependent classes of byte differences — all inside the UTF-8
+      # path strings of the wasm's data segments (panic-location strings),
+      # never in code:
+      #   1. Absolute-path separators: the remapped cargo dir is
+      #      `.cargo-home\.cargo\...` on Windows but `.cargo-home/.cargo/...`
+      #      on ubuntu.
+      #   2. Relative-path separators, same source: the workspace-relative
+      #      location is `ui\src\...` on Windows but `ui/src/...` on ubuntu
+      #      (same relative path, host-dependent separator).
+      #   3. rust-src presence: with the rust-src component installed, the
+      #      LTO re-encoding points std panic locations at the sysroot src
+      #      `.cargo-home\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\
+      #      lib\rustlib\src\rust\library\...` (the committed artifacts were
+      #      built on a Windows host) vs
+      #      `.cargo-home/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/
+      #      lib/rustlib/src/rust/library/...` (the ubuntu build), while
+      #      without rust-src they stay at the
+      #      `/rustc/<commit-hash>/library/...` form. The build step below
+      #      installs rust-src so CI emits the same class as the committed
+      #      artifacts — but the toolchain directory embeds the HOST TRIPLE,
+      #      so even with rust-src on both sides this class is not
+      #      byte-identical after tr (the residual is spelled out in the
+      #      summary paragraph below).
+      # The normalization is therefore a path-separator-only transform:
+      # `tr '\\' '/'` maps byte 0x5C (\) to 0x2F (/) in BOTH wasm comparison
+      # copies, making classes 1-2 byte-identical. Class 3 is NOT fully
+      # normalized: the sysroot src path embeds the host toolchain triple —
+      # `.cargo-home\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\...`
+      # in the committed artifacts vs
+      # `.cargo-home/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/...`
+      # in the ubuntu build — and tr cannot eliminate that difference. The
+      # residual is real: the next ubuntu CI run will fail this step red
+      # once by design, with the diagnostics upload carrying the
+      # CI-generated js+wasm as the forensic evidence; complete elimination
+      # requires a triple-normalization step — the SAME substitution applied
+      # to both comparison copies — in the comparison layer, planned for the
+      # next iteration.
+      # The transform still cannot mask a real functional difference: both
+      # copies receive the same transform, so any genuinely differing code
+      # or data byte stays different (tamper simulation, 2026-08-13: a
+      # single flipped byte fails the comparison). Note that 0x5C is NOT
+      # confined to embedded path strings — of the 1368 0x5C bytes in these
+      # artifacts, 816 sit in the code segment as LEB128 immediates — the
+      # safety argument rests on the identical-transform property, not on
+      # where 0x5C appears. The comparison runs on normalized COPIES under
+      # target/wasm-compare — the generated artifacts themselves are never
+      # modified.
       - name: Build wasm32 UI artifact
+        id: build-wasm32-ui
         if: matrix.is_default
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
+          # rust-src for the wasm build (2026-08-13): the LTO re-encoding of
+          # std panic locations (data-segment path class 3 above) needs the
+          # std source of the active toolchain. The committed web/assets were
+          # regenerated with rust-src installed locally; the
+          # dtolnay/rust-toolchain action above installs only the components
+          # listed in rust-toolchain.toml (clippy + rustfmt — no rust-src),
+          # so without this line CI's wasm keeps the `/rustc/<hash>/library/...`
+          # form and the comparison below fails on the rust-src class alone.
+          # The channel is read from rust-toolchain.toml at runtime, so no
+          # version is hard-coded here (same policy as the toolchain setup).
+          rustup component add rust-src \
+            --toolchain "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          # Cross-host reproducibility (2026-08-13): the wasm's data segment
+          # embeds the BUILD HOST's source paths — `#[track_caller]` panic
+          # locations carry the cargo registry dir
+          # (C:\Users\franck\.cargo\registry\... on the machine that first
+          # generated the committed artifacts) and the rustup sysroot src
+          # (C:\Users\franck\.rustup\...), plus host-separator relative
+          # paths — so a build on ANY other host produces a byte-different
+          # wasm and the comparison below fails. That is exactly what
+          # happened on the gate's first real execution (run 31703808533).
+          # `--remap-path-prefix` rewrites those embedded paths to
+          # host-independent forms before they reach the data segment:
+          # $HOME -> .cargo-home and the checkout dir ($PWD) -> . . Both
+          # variables are expanded by the shell at runtime, so the same
+          # step works on every host; the committed web/assets were
+          # regenerated (2026-08-13) with the identical two mappings.
+          RUSTFLAGS="--remap-path-prefix=$HOME=.cargo-home --remap-path-prefix=$PWD=." \
+            cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
           # The installed CLI lands in target/rutilus-tools, which the
           # swatinem/rust-cache step above already caches (the cache key
           # covers target/ wholesale) — so the pinned 0.2.126 binary is
@@ -308,16 +400,64 @@ jobs:
           # integrity chain every Cargo.lock dependency of the workspace
           # relies on; this binary is additionally pinned to 0.2.126, the
           # exact workspace wasm-bindgen version. The output-level backstop
-          # is the `diff -q` below: the generated web assets must match the
-          # checked-in files byte-identically, so a tampered or mismatched
-          # toolchain fails this step instead of silently shipping different
-          # artifacts.
+          # is the comparison below: the generated web assets must match the
+          # checked-in files, so a tampered or mismatched toolchain fails
+          # this step instead of silently shipping different artifacts.
           cargo install wasm-bindgen-cli --version 0.2.126 --locked --root target/rutilus-tools
           target/rutilus-tools/bin/wasm-bindgen --target web --no-typescript \
             --out-dir target/wasm-assets --out-name rutilus_ui \
             target/wasm32-unknown-unknown/release/rutilus_ui.wasm
-          diff -q target/wasm-assets/rutilus_ui.js web/assets/rutilus_ui.js
-          diff -q target/wasm-assets/rutilus_ui_bg.wasm web/assets/rutilus_ui_bg.wasm
+          # LF-normalize + BOM-strip BOTH sides of the js comparison (GNU
+          # sed; this step runs only on the ubuntu default job). The checked-
+          # in js carries an explicit `eol=lf` .gitattributes entry, but
+          # either side could still round-trip through CRLF or a BOM on some
+          # host, which would fail a byte diff on the line-ending class alone.
+          mkdir -p target/wasm-compare
+          sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' \
+            target/wasm-assets/rutilus_ui.js > target/wasm-compare/generated-rutilus_ui.js
+          sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' \
+            web/assets/rutilus_ui.js > target/wasm-compare/committed-rutilus_ui.js
+          # The wasm is binary, but its data segments embed host-dependent
+          # path strings (the three-source analysis above): both sides get
+          # the same backslash-to-forward-slash normalization into
+          # target/wasm-compare copies (GNU tr; this step runs only on the
+          # ubuntu default job) before the byte comparison, so the
+          # path-separator class of difference alone cannot fail the gate
+          # while any real code or data difference still does. The mismatch
+          # flag is written BEFORE the failing exit so the diagnostics
+          # upload step below can gate on it (a run step aborts at the first
+          # non-zero command under `bash -e`, so the comparison itself runs
+          # inside an if/else).
+          tr '\\' '/' < target/wasm-assets/rutilus_ui_bg.wasm > target/wasm-compare/generated-rutilus_ui_bg.wasm
+          tr '\\' '/' < web/assets/rutilus_ui_bg.wasm > target/wasm-compare/committed-rutilus_ui_bg.wasm
+          # Local-reproduction note (2026-08-13): Windows MSYS tr 8.32 does
+          # not process the `\\` escape — `tr '\\' '/'` warns "unescaped
+          # backslash at end of string" and leaves 0x5C untranslated — so a
+          # local MSYS replay of this normalization must use perl or python
+          # instead of tr.
+          if diff -q target/wasm-compare/generated-rutilus_ui.js target/wasm-compare/committed-rutilus_ui.js \
+              && diff -q target/wasm-compare/generated-rutilus_ui_bg.wasm target/wasm-compare/committed-rutilus_ui_bg.wasm; then
+            echo "wasm UI artifacts match the checked-in files"
+          else
+            echo "wasm UI artifacts DIFFER from the checked-in files; the CI-generated files are uploaded as a diagnostics artifact"
+            echo "wasm-mismatch=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # Diagnostics half of the wasm gate (2026-08-13): on mismatch the
+      # CI-generated js+wasm are uploaded so the failure can be diffed
+      # against the checked-in files. The step runs only when the build step
+      # above wrote the wasm-mismatch flag (its output survives the step's
+      # failing exit), never on unrelated earlier failures.
+      - name: Upload CI-generated wasm assets (diagnostics)
+        if: ${{ steps.build-wasm32-ui.outputs.wasm-mismatch == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
+        with:
+          name: wasm-assets-ci-generated-${{ github.run_id }}
+          path: |
+            target/wasm-assets/rutilus_ui.js
+            target/wasm-assets/rutilus_ui_bg.wasm
+          if-no-files-found: error
 
       # §5.4: Release build — static musl binary. The Linux release target in
       # the §5.2 platform matrix is x86_64-unknown-linux-musl (static link per

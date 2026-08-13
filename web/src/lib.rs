@@ -23,12 +23,13 @@ use rutilus_api::{
     BatchSummaryResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
     CapabilityEntryResponse, CapabilityStateResponse, CenterBindingRegisterRequest,
     CenterBindingRegisterResponse, CenterBindingRevokeRequest, CenterBindingStateResponse,
-    CenterEndpointViewListResponse, CenterEndpointViewResponse, CenterOperationListResponse,
-    CenterOperationResponse, CenterOperationSubmitRequest, CenterOperationSubmitResponse,
-    CenterSiteResponse, CenterSitesResponse, ConfirmEndpointTrustRequest,
-    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
-    CoreResourceResponse, CoreResourceSourceResponse, CreateArtifactRequest,
-    CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
+    CenterEndpointViewListResponse, CenterEndpointViewResponse,
+    CenterOperationDispatchRefusalResponse, CenterOperationListResponse,
+    CenterOperationRefusalCode, CenterOperationResponse, CenterOperationSubmitRequest,
+    CenterOperationSubmitResponse, CenterSiteResponse, CenterSitesResponse,
+    ConfirmEndpointTrustRequest, CoreResourceCommonResponse, CoreResourceCountsResponse,
+    CoreResourceDetailsResponse, CoreResourceResponse, CoreResourceSourceResponse,
+    CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
     CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
     EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
     EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
@@ -76,15 +77,15 @@ use rutilus_application::{
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
     AuditFailureVerification, AuditOperationContext, AuditOperationId, AuditParameterSummary,
-    AuditRedfishOperation, AuditSequence, AuditTarget, BatchOperation, BatchOperationId,
-    BatchOperationState, BatchOutcomeCounts, CapabilityClassification, CapabilityState,
-    CenterBindingId, CenterBindingState, CertificateFingerprintParseError, Credential,
-    CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointDisplayName, EndpointId, Event, FailureKind, Group, GroupId, GroupName, InstanceId,
-    Operation, OperationId, OperationSource, OperationState, OperationTarget, PrincipalId,
-    ProductPermission, RedfishCommand, ResourceFeature, ResourceId, ResourceODataId,
-    ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
-    TlsTrust, UiLocation,
+    AuditRedfishOperation, AuditSequence, AuditTarget, AuditTlsTrust, BatchOperation,
+    BatchOperationId, BatchOperationState, BatchOutcomeCounts, CapabilityClassification,
+    CapabilityState, CenterBindingId, CenterBindingState, CertificateFingerprintParseError,
+    Credential, CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint,
+    EndpointAddress, EndpointDisplayName, EndpointId, Event, FailureKind, Group, GroupId,
+    GroupName, InstanceId, Operation, OperationId, OperationSource, OperationState,
+    OperationTarget, PrincipalId, ProductPermission, RedfishCommand, ResourceFeature, ResourceId,
+    ResourceODataId, ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample, TelemetrySeries,
+    TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use time::OffsetDateTime;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -383,7 +384,10 @@ impl CenterEndpointView {
 /// The offer facts the operation record does not persist — the target, the
 /// actor context, and the offer expiry — come from the durable §15.6 offer
 /// envelope, so they are `None` for an operation whose offer is not on
-/// record.
+/// record. The §13.7 failure classification (V5E-4, W3C-3) is `None` until
+/// the center view construction reads it from the classified operation
+/// record; the view carries it through [`Self::with_failure_kind`] so the
+/// wire projection can render it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CenterOperationView {
     operation_id: OperationId,
@@ -393,6 +397,7 @@ pub struct CenterOperationView {
     target: Option<String>,
     state: OperationState,
     actor: Option<String>,
+    failure_kind: Option<FailureKind>,
     ttl_expires_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
 }
@@ -419,9 +424,26 @@ impl CenterOperationView {
             target,
             state,
             actor,
+            failure_kind: None,
             ttl_expires_at,
             created_at,
         }
+    }
+
+    /// Attaches the tracking record's §13.7 failure classification (V5E-4,
+    /// W3C-3); the constructor keeps its signature so the center runtime's
+    /// view assembly needs no change for the additive field.
+    #[must_use]
+    pub const fn with_failure_kind(mut self, failure_kind: Option<FailureKind>) -> Self {
+        self.failure_kind = failure_kind;
+        self
+    }
+
+    /// The §13.7 failure classification of the tracking record, when the
+    /// view construction attached one.
+    #[must_use]
+    pub const fn failure_kind(&self) -> Option<FailureKind> {
+        self.failure_kind
     }
 
     #[must_use]
@@ -1812,8 +1834,9 @@ where
             "trust expectation is invalid".to_owned(),
         );
     };
+    let trust = audit_trust_of(&expectation);
     let establishment = EndpointTrustEstablishment::new(state.gateway.as_ref(), &state.clock);
-    let Ok(challenge) = establishment.begin(address).await else {
+    let Ok(challenge) = establishment.begin(address.clone()).await else {
         return json_error(
             StatusCode::BAD_GATEWAY,
             "TLS identity observation failed".to_owned(),
@@ -1821,7 +1844,27 @@ where
     };
     let target = match establishment.complete_with_expectation(challenge, expectation) {
         Ok(target) => target,
-        Err(source) => return trust_rejected_response(source),
+        Err(source) => {
+            // V5A-7: the TLS fingerprint refusal is a verdict of the write
+            // path — the audit records it under the enrollment shape with
+            // the `tls-trust-failed` failure code before the 400 returns.
+            record_web_failure(
+                &state,
+                &context,
+                AuditTarget::EndpointAddress(address),
+                AuditParameterSummary::EndpointEnrollment {
+                    credential_id: CredentialId::from_uuid(request.credential_id()),
+                    trust,
+                },
+                ProductPermission::ManageEndpoints,
+                AuditAction::EnrollEndpoint,
+                AuditRedfishOperation::ProbeCoreCapabilities,
+                AuditFailure::TlsTrustFailed,
+                state.clock.now(),
+            )
+            .await;
+            return trust_rejected_response(source);
+        }
     };
     let enrollment = EndpointEnrollment::new(
         state.services.as_ref(),
@@ -1862,6 +1905,32 @@ where
     Time: Clock,
 {
     let Ok(import) = parse_endpoint_csv(request.csv().as_bytes()) else {
+        // V5A-7: the malformed CSV is a verdict of the write path — the
+        // audit records the `csv-invalid` failure before the 400 returns.
+        // The parameter summary's row count is the submitted document's
+        // newline-separated data-row count (all lines but the header): the
+        // closest honest count the handler can derive for a document that
+        // did not parse (quoted newlines over-count, which the summary
+        // documents as an approximation). The summary cannot represent a
+        // zero-row document, so a header-only CSV records no event.
+        let row_count = request.csv().lines().count().saturating_sub(1);
+        let parameters = u32::try_from(row_count)
+            .ok()
+            .and_then(|count| AuditParameterSummary::csv_endpoint_import(count).ok());
+        if let Some(parameters) = parameters {
+            record_web_failure(
+                &state,
+                &context,
+                AuditTarget::Product,
+                parameters,
+                ProductPermission::ManageEndpoints,
+                AuditAction::ImportEndpoints,
+                AuditRedfishOperation::None,
+                AuditFailure::CsvInvalid,
+                state.clock.now(),
+            )
+            .await;
+        }
         return json_error(
             StatusCode::BAD_REQUEST,
             "endpoint CSV is invalid".to_owned(),
@@ -3852,6 +3921,67 @@ async fn record_center_write<Services, Gateway, Time>(
     let _ = state.services.append_audit_event(&terminal).await;
 }
 
+/// Appends one failed audit lifecycle (started + `Rejected` terminal) for a
+/// product-surface write whose refusal happens in the web layer itself
+/// (V5A-7): the TLS trust refusal of an enrollment and the malformed-CSV
+/// refusal of an import are verdicts of the request surface, recorded under
+/// the action's own shape before the 4xx response is returned.
+///
+/// An append failure never changes the request verdict — the audit trail is
+/// a best-effort side effect, exactly like [`record_center_write`].
+#[allow(clippy::too_many_arguments)]
+async fn record_web_failure<Services, Gateway, Time>(
+    state: &WebState<Services, Gateway, Time>,
+    context: &AuthContext,
+    target: AuditTarget,
+    parameters: AuditParameterSummary,
+    permission: ProductPermission,
+    action: AuditAction,
+    redfish_operation: AuditRedfishOperation,
+    failure: AuditFailure,
+    now: OffsetDateTime,
+) where
+    Services: AuditEventWriter,
+    Time: Clock,
+{
+    let Ok(context) = AuditOperationContext::try_new_with_actor_principal(
+        AuditOperationId::generate(),
+        context.actor(),
+        state.origin,
+        target,
+        parameters,
+        permission,
+        action,
+        redfish_operation,
+        context.actor_principal_id(),
+    ) else {
+        return;
+    };
+    let started = AuditEvent::started(context.clone(), now);
+    let _ = state.services.append_audit_event(&started).await;
+    let Ok(sequence) = AuditSequence::FIRST.next() else {
+        return;
+    };
+    let Ok(failed) = AuditEvent::failed(
+        context,
+        sequence,
+        failure,
+        AuditFailureVerification::Rejected,
+        now,
+    ) else {
+        return;
+    };
+    let _ = state.services.append_audit_event(&failed).await;
+}
+
+/// Maps one trust expectation onto its audit summary value.
+fn audit_trust_of(expectation: &EndpointTrustExpectation) -> AuditTlsTrust {
+    match expectation {
+        EndpointTrustExpectation::SystemCaOnly => AuditTlsTrust::SystemCa,
+        EndpointTrustExpectation::ExplicitPin(_) => AuditTlsTrust::PinnedCertificate,
+    }
+}
+
 /// Lists the center's aggregated endpoint view (§15.5), optionally narrowed
 /// to one site by the `site_id` query, and filtered by the acting
 /// principal's D3 site scope.
@@ -3958,16 +4088,39 @@ where
     Time: Clock,
 {
     let Some(actor) = context.actor_principal_id() else {
+        // The guarded console always resolves a signed-in principal, so this
+        // gate is a defensive dead path; it records no audit because no
+        // identity exists to audit under (a `User` actor requires the
+        // principal, and the schema CHECK pins the pair).
         return json_error(
             StatusCode::FORBIDDEN,
             "a signed-in principal is required to dispatch center operations".to_owned(),
         );
     };
     let site = InstanceId::from_uuid(request.site_id());
+    let endpoint = EndpointId::from_uuid(request.endpoint_id());
+    let now = state.clock.now();
     if !auth::dispatch_scope_allows(context.role(), context.assignment_site_id(), site) {
-        return json_error(
+        // The handler-side 403 gate is a refused dispatch like any other
+        // (V5A-9): the audit record names the acting principal, the §15.6
+        // dispatch shape, and the refused outcome, and the response carries
+        // the stable `not_authorized` code.
+        record_center_write(
+            &state,
+            &context,
+            AuditTarget::Endpoint(endpoint),
+            ProductPermission::DispatchCenterOperations,
+            AuditAction::DispatchCenterOperation,
+            CenterWriteOutcome::Refused,
+            now,
+        )
+        .await;
+        return json_error_with_status(
             StatusCode::FORBIDDEN,
-            "this role cannot dispatch to the requested site".to_owned(),
+            Json(CenterOperationDispatchRefusalResponse::new(
+                CenterOperationRefusalCode::NotAuthorized,
+                "this role cannot dispatch to the requested site".to_owned(),
+            )),
         );
     }
     let Ok(target) = ResourceODataId::parse(request.target()) else {
@@ -3976,8 +4129,6 @@ where
             "operation target is invalid".to_owned(),
         );
     };
-    let endpoint = EndpointId::from_uuid(request.endpoint_id());
-    let now = state.clock.now();
     match state
         .services
         .dispatch_center_operation(site, endpoint, &target, request.command(), actor, now)
@@ -4017,34 +4168,54 @@ where
     }
 }
 
-/// Maps one center dispatch refusal to its HTTP verdict.
+/// Maps one center dispatch refusal to its HTTP verdict and its stable
+/// refusal code (V5A-9).
+///
+/// The coded body lets the console distinguish why a dispatch was refused —
+/// authorization, an unknown endpoint, a foreign endpoint, an unknown
+/// target, an unserializable command, or a center-store failure — without
+/// parsing the human-readable message. The console only checks the status
+/// of a refused submission, so the coded body is purely additive.
 fn center_dispatch_refusal_response(refusal: &CenterOperationRefusal) -> Response {
-    let (status, message) = match refusal {
+    let (status, code, message) = match refusal {
         CenterOperationRefusal::NotAuthorized => (
             StatusCode::FORBIDDEN,
+            CenterOperationRefusalCode::NotAuthorized,
             "this role cannot dispatch to the requested site",
         ),
         CenterOperationRefusal::UnknownEndpoint { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
+            CenterOperationRefusalCode::UnknownEndpoint,
             "the endpoint is not in the center's projection",
         ),
         CenterOperationRefusal::EndpointNotInSite { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
+            CenterOperationRefusalCode::EndpointNotInSite,
             "the endpoint does not belong to the requested site",
         ),
         CenterOperationRefusal::UnknownTarget { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
+            CenterOperationRefusalCode::UnknownTarget,
             "the target is not part of the endpoint's projection",
         ),
         CenterOperationRefusal::CommandSerialization => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            CenterOperationRefusalCode::CommandSerialization,
             "the operation command could not be serialized",
         ),
-        CenterOperationRefusal::Store => {
-            (StatusCode::SERVICE_UNAVAILABLE, "the center store failed")
-        }
+        CenterOperationRefusal::Store => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            CenterOperationRefusalCode::StoreFailed,
+            "the center store failed",
+        ),
     };
-    json_error(status, message.to_owned())
+    json_error_with_status(
+        status,
+        Json(CenterOperationDispatchRefusalResponse::new(
+            code,
+            message.to_owned(),
+        )),
+    )
 }
 
 /// Projects one registered site onto its console wire shape (§15.5).
@@ -4081,13 +4252,13 @@ fn project_center_endpoint(endpoint: &CenterEndpointView) -> CenterEndpointViewR
 
 /// Projects one center operation onto its console wire shape (§15.6).
 ///
-/// The tracking state is the record's derived phase. TODO(W3C-3): the
-/// center-side classification has landed — a `failed-unsupported` receipt
-/// (E3-4) is recorded as the operation's §13.7 failure kind on the tracking
-/// record and in the durable receipt — so only the display-side vocabulary
-/// remains: the tracking view has no unsupported phase and no
-/// classification field, and the console still renders the plain `failed`
-/// phase; tracked with the W3C-3 batch.
+/// The tracking state is the record's derived phase, and the record's §13.7
+/// failure classification rides the wire as the response's classification
+/// field (V5E-4, W3C-3). The remaining fold point of W3C-3 is the center
+/// view construction: the runtime's tracking view still assembles without
+/// the classified record (the view's `failure_kind` stays `None` there),
+/// and the console card renders the plain `failed` phase until the view
+/// carries the classification.
 fn project_center_operation(operation: &CenterOperationView) -> CenterOperationResponse {
     CenterOperationResponse::new(
         operation.operation_id().into_uuid(),
@@ -4097,6 +4268,7 @@ fn project_center_operation(operation: &CenterOperationView) -> CenterOperationR
         operation.target().map(str::to_owned),
         project_operation_state(operation.state()),
         operation.actor().map(str::to_owned),
+        operation.failure_kind().map(project_failure_kind),
         operation.ttl_expires_at(),
         operation.created_at(),
     )
@@ -6337,20 +6509,20 @@ mod tests {
         CoreResourceReadOutcome, EndpointDiscovery, EndpointRefreshFailureKind,
         EndpointRefreshOutcome, MAX_REFRESH_TARGETS, ProtectedCredentialCreation,
         ResolvedCredential, ResourceDecodeFailure, ResourceDiagnostics, ResourceObservation,
-        StoredCapability, TlsIdentityObservation,
+        StoredCapability, SystemCaEvaluation, TlsIdentityObservation,
     };
     use rutilus_domain::{
-        AccountCommand, AccountId, AccountPassword, AccountUserName, Argon2IdHash, BatchOperation,
-        BatchOperationId, BootstrapCode, BootstrapCodeId, CreateAccount, CredentialId,
-        CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress, EndpointCapability,
-        EndpointCapabilityObservation, EndpointDisplayName, EndpointId, FailureKind, Operation,
-        OperationId, OperationSource, OperationState, OperationTarget, PasswordCredential,
-        Principal, PrincipalId, PrincipalName, PrincipalState, RedfishCommand, RefreshGeneration,
-        ResetType, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId, ResourceODataType,
-        ResourceSnapshot, ResourceSnapshotPayload, Role, RoleAssignment, RoleId, SeriesKey,
-        Session, SessionId, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
-        TelemetrySeriesId, TlsCertificate, TlsTrust, TotpAuthenticator, TotpAuthenticatorError,
-        UpdateAccountPassword,
+        AccountCommand, AccountId, AccountPassword, AccountUserName, Argon2IdHash, AuditFailure,
+        AuditVerification, BatchOperation, BatchOperationId, BootstrapCode, BootstrapCodeId,
+        CreateAccount, CredentialId, CredentialUsername, CredentialVersionId, Endpoint,
+        EndpointAddress, EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName,
+        EndpointId, FailureKind, Operation, OperationId, OperationSource, OperationState,
+        OperationTarget, PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState,
+        RedfishCommand, RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId,
+        ResourceODataId, ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, Role,
+        RoleAssignment, RoleId, SeriesKey, Session, SessionId, SystemCommand, TargetId,
+        TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsCertificate, TlsTrust,
+        TotpAuthenticator, TotpAuthenticatorError, UpdateAccountPassword,
     };
     use secrecy::{ExposeSecret, SecretBox, SecretString};
     use serde_json::{Value, json};
@@ -13051,11 +13223,337 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // V5A-9: the refusal body carries the stable machine code, so the
+        // console can distinguish the refusal reason without parsing the
+        // message.
+        assert_eq!(json_body(response).await?["code"], "store_failed");
         {
             let events = audit.lock().map_err(|_| MockWriteError)?;
             assert_eq!(events.len(), 2, "a refused dispatch must still audit");
             assert_eq!(events[1].outcome().kind().as_str(), "failed");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_dispatch_scope_gate_refusal_is_audited_with_the_acting_principal()
+    -> Result<(), Box<dyn Error>> {
+        // V5A-9: the handler-side 403 gate of a §15.6 dispatch is a refused
+        // dispatch like any other — the audit names the acting principal and
+        // the refused outcome before the 403 is returned, so a gate refusal
+        // is never invisible to the trail.
+        let auth = AuthTestState::default();
+        let scoped_site = InstanceId::generate();
+        auth.seed_scoped_principal("operator", "operator-password", Role::Operator, scoped_site);
+        let mut state = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        state.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: state.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) =
+            sign_in_center(&router, &auth, "operator", "operator-password").await?;
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        // The operator's D3 scope covers `scoped_site` only; dispatching to
+        // another site is refused by the handler gate with 403.
+        let foreign_site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!(
+                        r#"{{"site_id": "{}", "endpoint_id": "{}", "target": "/redfish/v1/Systems/1", "command": {{"System": {{"Reset": "PowerCycle"}}}}}}"#,
+                        foreign_site.into_uuid(),
+                        endpoint.into_uuid()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(response).await?["code"], "not_authorized");
+        let events = audit.lock().map_err(|_| MockWriteError)?;
+        assert_eq!(
+            events.len(),
+            2,
+            "the gate refusal must audit start + terminal"
+        );
+        assert_eq!(
+            events[0].context().action().as_str(),
+            "dispatch-center-operation"
+        );
+        assert!(
+            events[0].context().actor_principal_id().is_some(),
+            "the gate refusal must name the acting principal"
+        );
+        assert_eq!(events[1].outcome().kind().as_str(), "failed");
+        assert_eq!(
+            events[1].outcome().failure().map(AuditFailure::as_str),
+            Some("center-request-refused")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_malformed_csv_import_is_audited_as_csv_invalid() -> Result<(), Box<dyn Error>> {
+        // V5A-7: the malformed-CSV 400 is a verdict of the write path — the
+        // audit records the `csv-invalid` failure with the document's row
+        // count before the refusal is returned.
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        let mut state = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        state.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: state.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        // A document with the wrong column names: one data row, rejected
+        // before any row is parsed.
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/endpoints/import")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"csv": "name,url,credential,pin\nrow1,row2,row3,row4"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = audit.lock().map_err(|_| MockWriteError)?;
+        assert_eq!(events.len(), 2, "the refusal must audit start + terminal");
+        assert_eq!(events[0].context().action().as_str(), "import-endpoints");
+        assert_eq!(
+            events[1].outcome().failure().map(AuditFailure::as_str),
+            Some("csv-invalid")
+        );
+        assert_eq!(
+            events[0].context().parameters().row_count(),
+            Some(1),
+            "the summary carries the document's newline-separated data-row count"
+        );
+        Ok(())
+    }
+
+    /// A gateway whose TLS identity observation always succeeds with one
+    /// certificate under the rejected system-CA evaluation — the bench for
+    /// the fingerprint-refusal audit (the remaining gateway roles stay
+    /// unavailable; the refusal happens before they are reached).
+    #[derive(Clone, Copy)]
+    struct FixedTrustGateway;
+
+    impl TlsIdentityProbe for FixedTrustGateway {
+        type Error = MockWriteError;
+
+        fn observe<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+        ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+            let Ok(certificate) = TlsCertificate::from_der(vec![0x42; 32]) else {
+                return Box::pin(async { Err(MockWriteError) });
+            };
+            Box::pin(async move {
+                Ok(TlsIdentityObservation::new(
+                    certificate,
+                    SystemCaEvaluation::Rejected,
+                ))
+            })
+        }
+    }
+
+    impl RedfishDiscovery for FixedTrustGateway {
+        type Error = MockWriteError;
+
+        fn probe_core_capabilities<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CoreResourceReader for FixedTrustGateway {
+        type Error = MockWriteError;
+
+        fn read_core_resources<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_tls_fingerprint_is_audited_as_tls_trust_failed() -> Result<(), Box<dyn Error>>
+    {
+        // V5A-7: the TLS fingerprint refusal of an enrollment is a verdict
+        // of the write path — the audit records the `tls-trust-failed`
+        // failure under the enrollment shape before the 400 is returned.
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        let mut state = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        state.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: state.clone(),
+            }),
+            Arc::new(FixedTrustGateway),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        // The observed certificate fingerprints 0x42×32; the request pins a
+        // different fingerprint, so the expectation is refused.
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/endpoints")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!(
+                        r#"{{"display_name": "Rack BMC", "address": "https://192.0.2.10", "credential_id": "{}", "trust": {{"mode": "pinned_certificate", "fingerprint_sha256": "{}"}}}}"#,
+                        CredentialId::generate().into_uuid(),
+                        "00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F"
+                    )))?,
+            )
+            .await?;
+        // The refusal is the fingerprint-conflict verdict (409) carrying the
+        // observed fingerprint.
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let events = audit.lock().map_err(|_| MockWriteError)?;
+        assert_eq!(events.len(), 2, "the refusal must audit start + terminal");
+        assert_eq!(events[0].context().action().as_str(), "enroll-endpoint");
+        assert_eq!(
+            events[1].outcome().failure().map(AuditFailure::as_str),
+            Some("tls-trust-failed")
+        );
+        assert_eq!(
+            events[1]
+                .outcome()
+                .verification()
+                .map(AuditVerification::as_str),
+            Some("rejected")
+        );
+        assert!(matches!(
+            events[0].context().target(),
+            rutilus_domain::AuditTarget::EndpointAddress(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_operation_view_carries_the_failure_classification()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-4 / W3C-3: the tracking view projects the record's §13.7
+        // failure classification onto the wire, and an unclassified record
+        // serializes the additive field as absent.
+        let state = CenterTestState::default();
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+        let created = OffsetDateTime::UNIX_EPOCH;
+        state.seed_operation(
+            CenterOperationView::new(
+                OperationId::generate(),
+                Some(site),
+                endpoint,
+                command,
+                Some("/redfish/v1/Systems/1".to_owned()),
+                OperationState::Failed,
+                Some("admin".to_owned()),
+                Some(created + Duration::minutes(15)),
+                created,
+            )
+            .with_failure_kind(Some(FailureKind::CapabilityUnsupported)),
+        )?;
+        state.seed_operation(CenterOperationView::new(
+            OperationId::generate(),
+            Some(site),
+            endpoint,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown)),
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationState::Succeeded,
+            Some("admin".to_owned()),
+            Some(created + Duration::minutes(15)),
+            created,
+        ))?;
+        let router = test_center_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/v1/center/operations").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let operations = body["operations"]
+            .as_array()
+            .ok_or("operations must be an array")?;
+        assert_eq!(operations.len(), 2);
+        let classified = operations
+            .iter()
+            .find(|operation| operation["state"] == "failed")
+            .ok_or("the failed operation must be listed")?;
+        assert_eq!(classified["failure_kind"], "capability_unsupported");
+        let plain = operations
+            .iter()
+            .find(|operation| operation["state"] == "succeeded")
+            .ok_or("the succeeded operation must be listed")?;
+        assert!(
+            plain.get("failure_kind").is_none_or(Value::is_null),
+            "an unclassified record carries the additive field as absent"
+        );
         Ok(())
     }
 

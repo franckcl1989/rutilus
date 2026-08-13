@@ -37,6 +37,12 @@ mod m20260812_000002_resource_feature_lists;
 mod m20260813_000001_audit_center_actions;
 mod m20260813_000002_endpoint_health_checks;
 mod m20260813_000003_audit_failure_vocabulary;
+mod m20260813_000004_audit_operation_vocabulary;
+
+/// The 000004 down's restore DDL, exposed for the migration test that pins
+/// the restored shape byte for byte against the 000003 forward shape
+/// (`tests/audit_operation_vocabulary.rs`).
+pub use m20260813_000004_audit_operation_vocabulary::AUDIT_EVENTS_PRE_OPERATION_VOCABULARY_DDL;
 
 pub struct Migrator;
 
@@ -70,6 +76,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000001_audit_center_actions::Migration),
             Box::new(m20260813_000002_endpoint_health_checks::Migration),
             Box::new(m20260813_000003_audit_failure_vocabulary::Migration),
+            Box::new(m20260813_000004_audit_operation_vocabulary::Migration),
         ]
     }
 }

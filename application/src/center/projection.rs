@@ -22,11 +22,15 @@
 //! with the cursor advanced — while a boundary failure propagates and the
 //! connection re-delivers the frame.
 //!
-//! A site-reported event whose BMC timestamp runs ahead of the center's
-//! clock by at most [`EVENT_TIMESTAMP_TOLERANCE`] is still accepted (the
-//! recorded receive time is clamped to the event's own timestamp so the
-//! persisted timeline never inverts); beyond that skew the record is
-//! rejected and logged like any other undecodable record.
+//! A site-reported event is recorded truthfully (V5C-6): `observed_at` is
+//! the center's receive time — never the event's own timestamp — and the
+//! BMC timestamp is kept separately in the record's `event_timestamp`, the
+//! same two-clock record the site side keeps. A record whose BMC timestamp
+//! runs after the receive time is refused by the domain timeline invariant
+//! exactly like the site side refuses it at ingestion (a received event
+//! cannot have a future timestamp): the record is logged and skipped like
+//! any other undecodable record, and the batch cursor advances, so a
+//! permanently mis-clocked report never wedges the event stream.
 //!
 //! # The artifact assembly
 //!
@@ -58,16 +62,20 @@ use time::OffsetDateTime;
 
 use crate::{ArtifactRepository, BoundaryFuture, CenterCursor, center::session::ResolvedSite};
 
-/// The clock skew a site-reported event may carry.
+/// The reserved message id of the §15.5 absorption dead-letter rows
+/// (V5E-3).
 ///
-/// The site's clock (and the BMC clocks behind it) is not the center's
-/// clock: a site whose clock runs ahead reports events whose BMC
-/// timestamps lie in the center's near future. Without a tolerance those
-/// events are rejected as undecodable and the batch cursor advances past
-/// them — permanent loss. Sixty seconds is far beyond the skew of two
-/// NTP-synced clocks (milliseconds) while still catching a genuinely
-/// misconfigured clock.
-const EVENT_TIMESTAMP_TOLERANCE: time::Duration = time::Duration::seconds(60);
+/// Every ownership-absorbed event record of a batch is reflected as a
+/// durable dead-letter event row under this id before the cursor advances,
+/// so an absorption is never silently lost: the row names the record's
+/// endpoint, its original message id, and the reporting site in its message
+/// text, and carries the record's own severity-level fact as a `Warning`.
+/// The id is the product's own reserved `Center` registry namespace — no
+/// BMC reports under it — and the dead-letter row's dedup key (this id plus
+/// the record's own event timestamp) never collides with the dedup key of
+/// the original record's message id, so a later legitimate report of the
+/// same event still stores its own row.
+const CENTER_ABSORBED_EVENT_MESSAGE_ID: &str = "Center.1.0.EventAbsorbed";
 
 /// The assumed payload size of every chunk of a site's artifact transfer.
 ///
@@ -772,6 +780,23 @@ where
     /// batch's endpoints is one batch lookup, and the surviving records are
     /// appended as one batch write, instead of a query and a transaction per
     /// record.
+    ///
+    /// An ownership-absorbed record is never silently lost (V5E-3): before
+    /// the cursor advances, the record is reflected as a durable dead-letter
+    /// event row under [`CENTER_ABSORBED_EVENT_MESSAGE_ID`] — the record's
+    /// endpoint, its original message id, and the reporting site in the
+    /// message text — written through the same batch write as the owned
+    /// records. The alternatives were evaluated and rejected: delaying the
+    /// cursor to re-deliver the batch would wedge the site's event stream
+    /// forever on the permanent anomalies the ownership check absorbs (an
+    /// endpoint of another site, or an endpoint the center no longer
+    /// projects — the in-order §15.4 delivery guarantees the endpoint
+    /// snapshot precedes the events of one site, so the absorption never
+    /// heals on a re-delivery), at the cost of every later legitimate event
+    /// of the site; and the dead-letter needs no new table — the events
+    /// table is the §9.3 append-only record that already outlives its
+    /// sources, and the reserved message id keeps the dead-letter rows
+    /// distinguishable and dedup-safe.
     async fn consume_event_batch(
         &self,
         site: &ResolvedSite,
@@ -810,9 +835,10 @@ where
         // §14.4 记录事件来源 with the §15.5 site scope: each event's
         // endpoint must be a projection of the reporting site. The batch's
         // endpoint ownership is resolved in one preload; a record that names
-        // an unknown endpoint, or an endpoint of another site, is logged and
-        // skipped exactly like an undecodable record — one site can never
-        // plant an event under another site's endpoint.
+        // an unknown endpoint, or an endpoint of another site, is refused
+        // for the projection exactly like an undecodable record — one site
+        // can never plant an event under another site's endpoint — and is
+        // reflected as its dead-letter row instead of vanishing.
         let endpoint_ids = events
             .iter()
             .map(Event::endpoint_id)
@@ -824,31 +850,43 @@ where
             .find_endpoint_projections(&endpoint_ids)
             .await
             .map_err(CenterProjectionError::Projection)?;
-        let mut owned = Vec::new();
+        let mut records = Vec::with_capacity(events.len());
         for event in events {
             match projections.get(&event.endpoint_id()) {
                 Some(projection) if projection.site_id() == Some(site.instance_id()) => {
-                    owned.push(event);
+                    records.push(event);
                 }
                 Some(_) => {
+                    let reason = "the endpoint belongs to another site";
                     tracing::warn!(
-                        "site {}: skipping event record {}: the endpoint belongs to another site",
+                        "site {}: skipping event record {}: {reason}",
                         site.instance_id(),
                         event.id()
                     );
+                    if let Ok(dead_letter) =
+                        absorption_dead_letter(&event, site.instance_id(), reason)
+                    {
+                        records.push(dead_letter);
+                    }
                 }
                 None => {
+                    let reason = "the endpoint is not projected";
                     tracing::warn!(
-                        "site {}: skipping event record {}: the endpoint is not projected",
+                        "site {}: skipping event record {}: {reason}",
                         site.instance_id(),
                         event.id()
                     );
+                    if let Ok(dead_letter) =
+                        absorption_dead_letter(&event, site.instance_id(), reason)
+                    {
+                        records.push(dead_letter);
+                    }
                 }
             }
         }
-        if !owned.is_empty() {
+        if !records.is_empty() {
             self.store
-                .upsert_events(&owned, site.instance_id())
+                .upsert_events(&records, site.instance_id())
                 .await
                 .map_err(CenterProjectionError::Projection)?;
         }
@@ -1267,20 +1305,21 @@ fn decode_resource(
 }
 
 /// Decodes one event record into the domain event; `now` is the product
-/// receive time the timeline judgment compares against.
+/// receive time recorded as the event's `observed_at`.
 ///
-/// A record whose BMC timestamp runs ahead of the receive time by at most
-/// [`EVENT_TIMESTAMP_TOLERANCE`] is accepted with the recorded receive time
-/// clamped to the event's own timestamp: the domain invariant
-/// (`event_timestamp <= observed_at`) and persistence read-back both refuse
-/// an inverted timeline, so clamping is the only way to keep the event —
-/// recording the real receive time would make the row unreadable. The
-/// alternative, rejecting the event, is exactly the clock-skew loss this
-/// tolerance fixes. Beyond the tolerance the record is refused and reported
-/// honestly through the existing decode-failure classification (logged and
-/// skipped once, the cursor advancing): refusing to advance would wedge the
-/// event stream on a permanently mis-clocked site and block every later
-/// event.
+/// The record is truthful about the two clocks (V5C-6): `observed_at` is
+/// the center's receive time — never the event's own timestamp — and the
+/// BMC timestamp stays in the record's `event_timestamp`, exactly the
+/// two-clock record the site side keeps. A record whose BMC timestamp runs
+/// after the receive time is refused by the domain timeline invariant
+/// (`event_timestamp <= observed_at`), precisely as the site side refuses
+/// the same record at ingestion — a received event cannot have a future
+/// timestamp, and inventing one for `observed_at` (clamping the receive
+/// time to the event's clock) would record a lie in the timeline the dedup
+/// key and the recent listing order by. The refusal is reported honestly
+/// through the existing decode-failure classification (logged and skipped
+/// once, the cursor advancing): refusing to advance would wedge the event
+/// stream on a permanently mis-clocked report and block every later event.
 fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'static str> {
     let id = record
         .event_id
@@ -1299,14 +1338,6 @@ fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'st
     };
     let event_timestamp = OffsetDateTime::from_unix_timestamp(record.occurred_at_unix)
         .map_err(|_| "unparseable occurrence timestamp")?;
-    if event_timestamp > now + EVENT_TIMESTAMP_TOLERANCE {
-        return Err("event timestamp is beyond the tolerated clock skew");
-    }
-    let observed_at = if event_timestamp > now {
-        event_timestamp
-    } else {
-        now
-    };
     Event::new(
         id,
         endpoint_id,
@@ -1314,9 +1345,53 @@ fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'st
         severity,
         None,
         event_timestamp,
-        observed_at,
+        now,
     )
     .map_err(|_| "event timestamp is after the receive time")
+}
+
+/// The §15.5 absorption dead-letter row of one ownership-absorbed event
+/// record (V5E-3): a durable event-row reflection under the reserved
+/// [`CENTER_ABSORBED_EVENT_MESSAGE_ID`].
+///
+/// The row keeps every fact that identifies the absorbed record — its
+/// endpoint, its original message id, its BMC timestamp, and the receive
+/// time — and the absorption reason in its message text, so the event is
+/// never silently lost. The dedup key of the dead-letter row is derived
+/// from the reserved message id and the record's own timestamp, so it never
+/// collides with the original record's dedup key: a later legitimate report
+/// of the same event still stores its own row. The dead-letter is always a
+/// `Warning` — an absorption is an administrative fact, whatever the
+/// absorbed record's own severity said — and it is site-attributed like
+/// every center event row.
+///
+/// # Errors
+///
+/// Returns `Err` when the reserved message id is unusable (a build defect —
+/// the constant is fixed) or the row cannot be built (a timeline defect the
+/// decoded record cannot carry); the caller then logs the absorption
+/// without the durable row.
+fn absorption_dead_letter(
+    event: &Event,
+    site: InstanceId,
+    reason: &str,
+) -> Result<Event, &'static str> {
+    let message_id = MessageId::parse(CENTER_ABSORBED_EVENT_MESSAGE_ID)
+        .map_err(|_| "the reserved absorption message id is not usable")?;
+    Event::new(
+        EventId::generate(),
+        event.endpoint_id(),
+        message_id,
+        EventSeverity::Warning,
+        Some(format!(
+            "event absorbed: endpoint {}, message id {}, reported by site {site}: {reason}",
+            event.endpoint_id(),
+            event.message_id()
+        )),
+        event.event_timestamp(),
+        event.observed_at(),
+    )
+    .map_err(|_| "the absorption dead-letter row cannot be built")
 }
 
 /// Decodes one artifact manifest into the domain artifact under the site's
@@ -2664,8 +2739,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_timestamps_within_the_clock_tolerance_are_accepted() -> Result<(), Box<dyn Error>>
-    {
+    async fn a_future_event_timestamp_is_refused_and_never_clamped() -> Result<(), Box<dyn Error>> {
+        // V5C-6: the center records the two clocks truthfully — `observed_at`
+        // is the receive time, the BMC timestamp stays in `event_timestamp` —
+        // so a record whose BMC timestamp runs after the receive time is
+        // refused by the domain timeline invariant, exactly as the site side
+        // refuses the same record at ingestion. The center must never clamp
+        // the receive time up to the event's clock: that would record a lie
+        // in the timeline the dedup key and the recent listing order by.
         let (store, state) = MockProjectionStore::new();
         let cursor = MockCursor::new();
         let projection = CenterProjection::new(store, cursor.clone());
@@ -2674,12 +2755,43 @@ mod tests {
         state.claim_endpoint(endpoint_id, site.instance_id());
         let now = base_time();
 
-        // The site's clock runs 30 seconds ahead of the center's — within
-        // the tolerance, the event is accepted instead of lost. The
-        // recorded receive time is clamped to the event's own timestamp so
-        // the persisted row keeps the domain timeline invariant.
+        // The record's BMC timestamp runs 30 seconds after the receive time.
         let batch = EventBatch {
             events: vec![event_record(&endpoint_id, now.unix_timestamp() + 30)],
+        };
+        projection
+            .on_frame(&site, 3, &EnvelopeMessage::EventBatch(batch), now)
+            .await?;
+
+        // The record is refused and logged honestly; the batch cursor
+        // advances, so the mis-clocked record cannot wedge the stream.
+        assert_eq!(state.events_owned().len(), 0);
+        let stored = cursor
+            .get(site.instance_id(), SyncStream::Event)
+            .await?
+            .ok_or("the cursor was not stored")?;
+        assert_eq!(stored.cursor_value(), "3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observed_at_is_the_receive_time_never_the_event_time() -> Result<(), Box<dyn Error>> {
+        // V5C-6: the persisted record keeps the two clocks separate — the
+        // BMC's own timestamp in `event_timestamp` and the center's receive
+        // time in `observed_at` — so a viewer compares them directly, like
+        // the site side's records.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor);
+        let site = resolved_site();
+        let endpoint_id = EndpointId::generate();
+        state.claim_endpoint(endpoint_id, site.instance_id());
+        let now = base_time();
+
+        // The BMC clock runs 90 seconds behind the center's clock; the
+        // record arrives at `now`.
+        let batch = EventBatch {
+            events: vec![event_record(&endpoint_id, now.unix_timestamp() - 90)],
         };
         projection
             .on_frame(&site, 3, &EnvelopeMessage::EventBatch(batch), now)
@@ -2690,17 +2802,14 @@ mod tests {
         assert_eq!(events[0].endpoint_id(), endpoint_id);
         assert_eq!(
             events[0].event_timestamp().unix_timestamp(),
-            now.unix_timestamp() + 30
+            now.unix_timestamp() - 90,
+            "the BMC's own timestamp stays in event_timestamp"
         );
         assert_eq!(
             events[0].observed_at().unix_timestamp(),
-            now.unix_timestamp() + 30
+            now.unix_timestamp(),
+            "observed_at is the receive time, never the event time"
         );
-        let stored = cursor
-            .get(site.instance_id(), SyncStream::Event)
-            .await?
-            .ok_or("the cursor was not stored")?;
-        assert_eq!(stored.cursor_value(), "3");
         Ok(())
     }
 
@@ -2761,14 +2870,30 @@ mod tests {
             .on_frame(&site, 3, &EnvelopeMessage::EventBatch(batch), now)
             .await?;
 
-        // Only the endpoint the reporting site owns is stored; the foreign
-        // and unknown records are logged and skipped without failing the
-        // batch, and the cursor advances past all three. The whole batch
-        // was one ownership preload (the three distinct endpoints) and one
-        // batch write.
+        // Only the endpoint the reporting site owns is stored as a real
+        // event; the foreign and unknown records are refused for the
+        // projection — one site can never plant an event under another
+        // site's endpoint — and reflected as durable dead-letter rows
+        // (V5E-3) instead of vanishing. The whole batch was one ownership
+        // preload (the three distinct endpoints) and one batch write.
         let events = state.events_owned();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].endpoint_id(), owned);
+        let dead_letters = events
+            .iter()
+            .filter(|event| event.message_id().as_str() == CENTER_ABSORBED_EVENT_MESSAGE_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(dead_letters.len(), 2);
+        assert_eq!(
+            dead_letters[0].endpoint_id(),
+            foreign,
+            "the dead-letter names the absorbed record's endpoint"
+        );
+        assert_eq!(
+            dead_letters[1].endpoint_id(),
+            unknown,
+            "the dead-letter names the absorbed record's endpoint"
+        );
         assert_eq!(state.endpoint_ownership_preloads(), 1);
         assert_eq!(state.event_batch_writes(), 1);
         let stored = cursor
@@ -2776,6 +2901,169 @@ mod tests {
             .await?
             .ok_or("the cursor was not stored")?;
         assert_eq!(stored.cursor_value(), "3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ownership_absorbed_records_land_durable_dead_letter_rows() -> Result<(), Box<dyn Error>>
+    {
+        // V5E-3: an absorption is never silently lost. Before the cursor
+        // advances, each ownership-absorbed record is reflected as a
+        // dead-letter event row under the reserved message id that keeps
+        // every identifying fact — the endpoint, the original message id,
+        // the BMC timestamp, and the receive time — plus the absorption
+        // reason. The alternative of delaying the cursor to re-deliver the
+        // batch is rejected: the absorption is permanent (the endpoint
+        // belongs to another site, or the center no longer projects it), so
+        // the re-delivery would wedge the site's event stream forever at
+        // the cost of every later legitimate event.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor.clone());
+        let site = resolved_site();
+        let other_site = resolved_site();
+        let now = base_time();
+        let foreign = EndpointId::generate();
+        let unknown = EndpointId::generate();
+        state.claim_endpoint(foreign, other_site.instance_id());
+        let foreign_timestamp = now.unix_timestamp() - 20;
+        let unknown_timestamp = now.unix_timestamp() - 40;
+
+        let batch = EventBatch {
+            events: vec![
+                event_record(&foreign, foreign_timestamp),
+                event_record(&unknown, unknown_timestamp),
+            ],
+        };
+        projection
+            .on_frame(&site, 3, &EnvelopeMessage::EventBatch(batch), now)
+            .await?;
+
+        let events = state.events_owned();
+        assert_eq!(
+            events.len(),
+            2,
+            "both absorbed records land as dead-letters"
+        );
+        let foreign_letter = events
+            .iter()
+            .find(|event| event.endpoint_id() == foreign)
+            .ok_or("the foreign record's dead-letter is missing")?;
+        assert_eq!(
+            foreign_letter.message_id().as_str(),
+            CENTER_ABSORBED_EVENT_MESSAGE_ID
+        );
+        assert_eq!(foreign_letter.severity(), EventSeverity::Warning);
+        assert_eq!(
+            foreign_letter.event_timestamp().unix_timestamp(),
+            foreign_timestamp,
+            "the dead-letter keeps the absorbed record's BMC timestamp"
+        );
+        assert_eq!(
+            foreign_letter.observed_at().unix_timestamp(),
+            now.unix_timestamp(),
+            "the dead-letter keeps the receive time"
+        );
+        let message = foreign_letter
+            .message()
+            .ok_or("the dead-letter message is missing")?;
+        assert!(
+            message.contains("endpoint") && message.contains(&foreign.to_string()),
+            "the dead-letter names the absorbed record's endpoint: {message}"
+        );
+        assert!(
+            message.contains("ResourceEvent.1.0.ResourceUpdated"),
+            "the dead-letter names the absorbed record's message id: {message}"
+        );
+        assert!(
+            message.contains("the endpoint belongs to another site"),
+            "the dead-letter names the absorption reason: {message}"
+        );
+        let unknown_letter = events
+            .iter()
+            .find(|event| event.endpoint_id() == unknown)
+            .ok_or("the unknown record's dead-letter is missing")?;
+        assert!(
+            unknown_letter
+                .message()
+                .is_some_and(|message| message.contains("the endpoint is not projected")),
+            "the dead-letter names the absorption reason"
+        );
+        // The absorbed records' original message ids never appear: the
+        // events table holds the dead-letter reflections, not planted
+        // events.
+        assert!(
+            events
+                .iter()
+                .all(|event| event.message_id().as_str() != "ResourceEvent.1.0.ResourceUpdated"),
+            "the absorbed records' original message ids must not appear"
+        );
+        // The batch cursor still advances past the absorbed records.
+        let stored = cursor
+            .get(site.instance_id(), SyncStream::Event)
+            .await?
+            .ok_or("the cursor was not stored")?;
+        assert_eq!(stored.cursor_value(), "3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_row_never_collides_with_the_original_records_dedup_key()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-3: the dead-letter's dedup key is derived from the reserved
+        // message id and the record's own timestamp, so it can never
+        // suppress the original record: when the same BMC event is later
+        // reported by its legitimate owner, it stores its own row beside
+        // the dead-letter instead of being absorbed as a duplicate.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor.clone());
+        let site = resolved_site();
+        let other_site = resolved_site();
+        let now = base_time();
+        let foreign = EndpointId::generate();
+        let occurred_at_unix = now.unix_timestamp() - 10;
+        state.claim_endpoint(foreign, other_site.instance_id());
+
+        // Site B's report of the foreign endpoint's event is absorbed as a
+        // dead-letter row.
+        projection
+            .on_frame(
+                &site,
+                3,
+                &EnvelopeMessage::EventBatch(EventBatch {
+                    events: vec![event_record(&foreign, occurred_at_unix)],
+                }),
+                now,
+            )
+            .await?;
+        // The endpoint's legitimate owner later reports the same event: the
+        // row must land, not be suppressed by the dead-letter's dedup key.
+        projection
+            .on_frame(
+                &other_site,
+                4,
+                &EnvelopeMessage::EventBatch(EventBatch {
+                    events: vec![event_record(&foreign, occurred_at_unix)],
+                }),
+                now + Duration::SECOND,
+            )
+            .await?;
+
+        let events = state.events_owned();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message_id().as_str() == CENTER_ABSORBED_EVENT_MESSAGE_ID),
+            "the dead-letter row is stored"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message_id().as_str() == "ResourceEvent.1.0.ResourceUpdated"),
+            "the legitimate owner's report is stored beside the dead-letter"
+        );
         Ok(())
     }
 }

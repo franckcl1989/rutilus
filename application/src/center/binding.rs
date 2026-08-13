@@ -19,6 +19,21 @@
 //!    material — the server and CA fingerprints the site must pin (§10.4
 //!    explicit trust) — so the binding result is the §10.4 carrier.
 //!
+//! # Revoke before re-bind (V5E-2, V5E-5)
+//!
+//! The site identity fingerprint is the durable fact of the D2 flow: the
+//! site presents the same fingerprint on every registration, so a re-bind
+//! is recognized by it. [`CenterBindingFlow::bind_site`] looks the
+//! fingerprint up before issuing anything: a fingerprint that still holds a
+//! `Bound` binding is refused with [`CenterBindingFlowError::BindingStillInForce`]
+//! — the operator must revoke the old binding first, or two live sites
+//! would claim the same identity and the V4R-7 re-bind self-healing would
+//! leave the endpoints frozen under the old site. A fingerprint whose
+//! previous binding was revoked is the re-bind the flow exists for: the
+//! dead site's pending §15.6 offers are retired (the queue-level TTL
+//! termination of [`CenterBindingFlow::retire_site_offers`], V5E-5) so the
+//! old instance id's outbox rows do not linger pending forever.
+//!
 //! # The certificate-identity cross-validation (S3b audit item 1)
 //!
 //! [`SiteIdentity`] carries the three facts the app layer parses from a
@@ -53,7 +68,7 @@ use rutilus_security::{BindingCodeError, generate_binding_code};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::BoundaryFuture;
+use crate::{BoundaryFuture, CenterOutbox};
 
 /// The certificate identity of one inbound center connection (§15.1, S3b).
 ///
@@ -585,6 +600,14 @@ where
     /// The binding is not pending, so no code can bind it.
     #[error("the binding is not pending")]
     BindingNotPending,
+    /// The presented site identity fingerprint already holds a binding in
+    /// force (V5E-2): the operator must revoke that binding before a re-bind
+    /// — otherwise two live sites would claim the same identity, and the
+    /// endpoints of the old site would stay frozen under it.
+    #[error(
+        "the site identity is already bound to instance {site}; revoke that binding before binding a new one"
+    )]
+    BindingStillInForce { site: InstanceId },
     /// A one-time code could not be generated.
     #[error("a binding code could not be generated: {0}")]
     CodeGeneration(#[source] BindingCodeError),
@@ -668,17 +691,28 @@ where
             expires_at,
         ))
     }
+}
 
+impl<Store, Issuer> CenterBindingFlow<Store, Issuer>
+where
+    Store: InstanceRepository + CenterBindingRepository + CenterOutbox,
+    Issuer: SiteCertificateIssuer,
+{
     /// Binds a registered site with its one-time code and the site's own
     /// identity fingerprint.
     ///
     /// The presented code is parsed and matched to its pending registration
-    /// by hash; the outstanding code must not be expired (D2 TTL). The
-    /// certificate is issued before the atomic consumption — see the module
-    /// doc — with the site's fingerprint bound into the private-arc
-    /// extension, and the consumption records the fingerprint on the
-    /// `bound` row. The result carries the issued certificate and the
-    /// center's §10.4 trust material for the site to pin.
+    /// by hash; the outstanding code must not be expired (D2 TTL). The site
+    /// identity fingerprint is then checked against its previous bindings
+    /// (V5E-2): a fingerprint that still holds a `Bound` binding is refused
+    /// — the operator must revoke the old binding first — and a fingerprint
+    /// whose previous binding was revoked is the re-bind path, whose dead
+    /// site's pending §15.6 offers are retired (V5E-5). The certificate is
+    /// issued after the pre-checks — see the module doc — with the site's
+    /// fingerprint bound into the private-arc extension, and the consumption
+    /// records the fingerprint on the `bound` row. The result carries the
+    /// issued certificate and the center's §10.4 trust material for the site
+    /// to pin.
     ///
     /// # Errors
     ///
@@ -721,6 +755,36 @@ where
                     CenterBindingFlowError::BindingNotPending
                 }
             })?;
+        // V5E-2/V5E-5: the site identity fingerprint is the durable fact of
+        // the D2 flow — the same site presents it on every registration —
+        // so the previous binding it resolves to decides the re-bind. A
+        // still-`Bound` previous binding is refused before anything is
+        // issued: accepting it would leave two live sites claiming the same
+        // identity, and the V4R-7 re-bind self-healing would keep the old
+        // site's endpoints frozen under it (a revoked binding is what the
+        // re-home path treats as the operator's unbind). A previous binding
+        // that was revoked is the re-bind the flow exists for, and the dead
+        // site's pending offers are retired below. The pending binding being
+        // bound can never match this lookup: the fingerprint is recorded on
+        // a binding only at consumption, so the pending row carries `None`.
+        if let Some(previous) = self
+            .store
+            .find_binding_by_site_fingerprint(site_fingerprint)
+            .await
+            .map_err(CenterBindingFlowError::Binding)?
+        {
+            if previous.state() == CenterBindingState::Bound {
+                return Err(CenterBindingFlowError::BindingStillInForce {
+                    site: previous.site_instance_id(),
+                });
+            }
+            // V5E-5: the revoked site can never connect again (admission
+            // refuses its certificate), so its pending §15.6 offers are
+            // dead — retire them like the flush's TTL retirement instead of
+            // leaving the old instance id's queue pending forever.
+            self.retire_site_offers(previous.site_instance_id(), now)
+                .await;
+        }
         let issued = self
             .issuer
             .issue_site_certificate(binding.site_instance_id(), site_fingerprint)
@@ -738,6 +802,44 @@ where
             self.issuer.center_trust_anchor(),
         ))
     }
+
+    /// Retires the pending §15.6 offers of a site whose binding was revoked
+    /// (V5E-5): the queue-level TTL termination of the old instance id's
+    /// outbox rows.
+    ///
+    /// The center's durable outbox holds exactly the §15.6 offers, and the
+    /// revoked site is refused at connection admission forever, so every
+    /// pending row of the old id is dead — the same judgment as the flush's
+    /// TTL retirement, which only runs for a site that reconnects. The
+    /// retirement acknowledges each row, leaving it the same retired
+    /// delivered-history state the flush leaves behind; a dispatch retry can
+    /// never resurrect it under a fresh id, and the new site's queue is
+    /// never touched.
+    ///
+    /// The retirement is best-effort by design: a failed retire leaves the
+    /// dead rows pending exactly as before (the status quo), and a bind must
+    /// not fail because a cleanup write failed — the failure is logged at
+    /// `warn` so the operator sees it.
+    async fn retire_site_offers(&self, site: InstanceId, now: OffsetDateTime) {
+        let pending = match self.store.list_pending(site, u64::MAX).await {
+            Ok(pending) => pending,
+            Err(source) => {
+                tracing::warn!(
+                    "site {site}: could not read the revoked site's pending offers to retire \
+                     them: {source}"
+                );
+                return;
+            }
+        };
+        for entry in pending {
+            if let Err(source) = self.store.acknowledge(entry.id(), now).await {
+                tracing::warn!(
+                    "site {site}: could not retire the pending offer {}: {source}",
+                    entry.id()
+                );
+            }
+        }
+    }
 }
 
 /// The test-side in-memory store and issuer behind the center-side use-case
@@ -746,13 +848,14 @@ where
 pub(crate) mod test_support {
     use std::{error::Error, sync::Mutex};
 
+    use rutilus_center_protocol::{Envelope, EnvelopeMessage};
     use rutilus_domain::{
         BindingCode, CenterBinding, CenterBindingId, CenterBindingState, CertificateFingerprint,
-        InstanceId, SiteInstance,
+        InstanceId, OutboxEntry, OutboxEntryId, OutboxEntryState, SiteInstance,
     };
     use time::OffsetDateTime;
 
-    use crate::BoundaryFuture;
+    use crate::{BoundaryFuture, CenterOutbox};
 
     use super::{
         CenterBindingRepository, CenterTrustAnchor, InstanceRepository, IssuedSiteCertificate,
@@ -770,6 +873,7 @@ pub(crate) mod test_support {
     pub(crate) struct MockBindingStore {
         instances: Mutex<Vec<SiteInstance>>,
         bindings: Mutex<Vec<CenterBinding>>,
+        entries: Mutex<Vec<OutboxEntry>>,
     }
 
     impl MockBindingStore {
@@ -777,7 +881,86 @@ pub(crate) mod test_support {
             Self {
                 instances: Mutex::new(Vec::new()),
                 bindings: Mutex::new(Vec::new()),
+                entries: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Revokes one binding row through the domain state machine — the
+        /// operator's unbind of the V5E-2 re-bind test.
+        pub(crate) fn revoke_binding(
+            &self,
+            binding_id: CenterBindingId,
+        ) -> Result<(), MockStoreError> {
+            let mut rows = self.bindings.lock().map_err(|_| MockStoreError)?;
+            let binding = rows
+                .iter_mut()
+                .find(|binding| binding.id() == binding_id)
+                .ok_or(MockStoreError)?;
+            binding.revoke().map_err(|_| MockStoreError)
+        }
+
+        /// Seeds one pending outbox entry for a site — a dispatched §15.6
+        /// offer the V5E-5 retirement must retire.
+        pub(crate) fn seed_pending_offer(
+            &self,
+            site: InstanceId,
+            now: OffsetDateTime,
+        ) -> Result<(), MockStoreError> {
+            let envelope = Envelope {
+                sequence: 1,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::OperationOffer(
+                    rutilus_center_protocol::OperationOffer {
+                        operation_id: String::from("operation-1"),
+                        endpoint_id: String::from("endpoint-1"),
+                        site_id: site.to_string(),
+                        command_json: b"{}".to_vec(),
+                        target: String::from("/redfish/v1/Systems/1"),
+                        expires_at_unix: now.unix_timestamp(),
+                        actor_context: String::from("principal-1"),
+                    },
+                )),
+            };
+            let payload_json = serde_json::to_string(&envelope).map_err(|_| MockStoreError)?;
+            let sequence = i64::try_from(
+                self.entries
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|entry| entry.instance_id() == site)
+                    .count(),
+            )
+            .unwrap_or(i64::MAX)
+            .saturating_add(1);
+            self.entries
+                .lock()
+                .map_err(|_| MockStoreError)?
+                .push(OutboxEntry::new(
+                    OutboxEntryId::generate(),
+                    site,
+                    sequence,
+                    payload_json,
+                    now,
+                ));
+            Ok(())
+        }
+
+        /// The pending outbox entry ids of one site — the observable queue
+        /// of the V5E-5 retirement.
+        pub(crate) fn pending_offer_ids(
+            &self,
+            site: InstanceId,
+        ) -> Result<Vec<OutboxEntryId>, MockStoreError> {
+            Ok(self
+                .entries
+                .lock()
+                .map_err(|_| MockStoreError)?
+                .iter()
+                .filter(|entry| {
+                    entry.instance_id() == site && entry.state() == OutboxEntryState::Pending
+                })
+                .map(OutboxEntry::id)
+                .collect())
         }
 
         /// Seeds one binding row directly, for admission tests that need a
@@ -931,6 +1114,75 @@ pub(crate) mod test_support {
                     .rev()
                     .find(|binding| binding.site_cert_fingerprint() == Some(site_fingerprint))
                     .cloned())
+            })
+        }
+    }
+
+    impl CenterOutbox for MockBindingStore {
+        type Error = MockStoreError;
+
+        fn enqueue<'a>(
+            &'a self,
+            _instance_id: InstanceId,
+            _message: &'a EnvelopeMessage,
+            _created_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<OutboxEntry, Self::Error>> {
+            Box::pin(async move { Err(MockStoreError) })
+        }
+
+        fn list_pending(
+            &self,
+            instance_id: InstanceId,
+            limit: u64,
+        ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self
+                    .entries
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|entry| {
+                        entry.instance_id() == instance_id
+                            && entry.state() == OutboxEntryState::Pending
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(OutboxEntry::sequence);
+                rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                Ok(rows)
+            })
+        }
+
+        fn list_offers(
+            &self,
+            instance_id: InstanceId,
+        ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self
+                    .entries
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|entry| entry.instance_id() == instance_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(OutboxEntry::sequence);
+                Ok(rows)
+            })
+        }
+
+        fn acknowledge(
+            &self,
+            entry_id: OutboxEntryId,
+            acked_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self.entries.lock().map_err(|_| MockStoreError)?;
+                let entry = rows
+                    .iter_mut()
+                    .find(|entry| entry.id() == entry_id)
+                    .ok_or(MockStoreError)?;
+                entry.ack(acked_at).map_err(|_| MockStoreError)
             })
         }
     }
@@ -1177,6 +1429,148 @@ mod tests {
             .find_binding_owned(registered.binding_id())?
             .ok_or("the stored binding is missing")?;
         assert_eq!(stored.state(), CenterBindingState::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_a_site_identity_already_bound_until_the_old_binding_is_revoked()
+    -> Result<(), Box<dyn Error>> {
+        // V5E-2: the site identity fingerprint is the durable fact of the
+        // D2 flow, so a re-bind under the same fingerprint while the old
+        // binding is still in force is refused — accepting it would leave
+        // two live sites claiming one identity, and the V4R-7 re-bind
+        // self-healing (which treats a revoked binding as the operator's
+        // unbind) would keep the old site's endpoints frozen forever.
+        let store = MockBindingStore::new();
+        let issuer = MockIssuer::new();
+        let flow = flow(&store, &issuer);
+        let base = base_time();
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x77; 32]);
+
+        // The first site binds under the fingerprint.
+        let first = flow
+            .register_site("https://center.example", "Site One", base)
+            .await?;
+        flow.bind_site(
+            first.code().as_str(),
+            site_fingerprint,
+            base + Duration::MINUTE,
+        )
+        .await?;
+
+        // A second registration under the same fingerprint is refused with
+        // the honest verdict naming the live site — before any certificate
+        // is issued for it.
+        let second = flow
+            .register_site(
+                "https://center.example",
+                "Site Two",
+                base + Duration::SECOND,
+            )
+            .await?;
+        assert!(matches!(
+            flow.bind_site(
+                second.code().as_str(),
+                site_fingerprint,
+                base + Duration::seconds(2)
+            )
+            .await,
+            Err(CenterBindingFlowError::BindingStillInForce { site })
+                if site == first.instance_id()
+        ));
+        // The refused bind consumed nothing: the second registration's
+        // binding is still pending and no certificate was issued for it.
+        let stored = store
+            .find_binding_owned(second.binding_id())?
+            .ok_or("the second binding is missing")?;
+        assert_eq!(stored.state(), CenterBindingState::Pending);
+        assert_eq!(issuer.issued_owned()?.len(), 1);
+
+        // After the old binding is revoked — the operator's unbind that
+        // precedes every re-bind — the same code binds the fingerprint.
+        store.revoke_binding(first.binding_id())?;
+        let outcome = flow
+            .bind_site(
+                second.code().as_str(),
+                site_fingerprint,
+                base + Duration::seconds(3),
+            )
+            .await?;
+        assert_eq!(outcome.site_instance_id(), second.instance_id());
+        // A fresh identity on a different fingerprint is never affected.
+        let third = flow
+            .register_site(
+                "https://center.example",
+                "Site Three",
+                base + Duration::seconds(4),
+            )
+            .await?;
+        flow.bind_site(
+            third.code().as_str(),
+            CertificateFingerprint::from_bytes([0x88; 32]),
+            base + Duration::seconds(5),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_retires_the_revoked_site_pending_offers() -> Result<(), Box<dyn Error>> {
+        // V5E-5: when a re-bind follows the revocation (the fingerprint's
+        // previous binding is revoked), the dead site's pending §15.6
+        // offers are retired like the flush's TTL retirement — the revoked
+        // site can never connect again, so its outbox rows must not linger
+        // pending forever. The new site's queue is never touched.
+        let store = MockBindingStore::new();
+        let issuer = MockIssuer::new();
+        let flow = flow(&store, &issuer);
+        let base = base_time();
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x77; 32]);
+
+        let first = flow
+            .register_site("https://center.example", "Site One", base)
+            .await?;
+        flow.bind_site(
+            first.code().as_str(),
+            site_fingerprint,
+            base + Duration::MINUTE,
+        )
+        .await?;
+        // The live site's pending offers are left alone.
+        store.seed_pending_offer(first.instance_id(), base + Duration::SECOND)?;
+        store.seed_pending_offer(first.instance_id(), base + Duration::SECOND)?;
+        assert_eq!(
+            store.pending_offer_ids(first.instance_id())?.len(),
+            2,
+            "a live site's pending offers stay pending"
+        );
+
+        // The operator revokes the site and it re-binds under a fresh
+        // instance identity with the same fingerprint.
+        store.revoke_binding(first.binding_id())?;
+        let second = flow
+            .register_site(
+                "https://center.example",
+                "Site Two",
+                base + Duration::seconds(2),
+            )
+            .await?;
+        flow.bind_site(
+            second.code().as_str(),
+            site_fingerprint,
+            base + Duration::seconds(3),
+        )
+        .await?;
+
+        // The dead site's queue was retired; the new site's queue is empty.
+        assert!(
+            store.pending_offer_ids(first.instance_id())?.is_empty(),
+            "the revoked site's pending offers must be retired by the re-bind"
+        );
+        assert!(
+            store.pending_offer_ids(second.instance_id())?.is_empty(),
+            "the new site's queue is never touched by the retirement"
+        );
         Ok(())
     }
 

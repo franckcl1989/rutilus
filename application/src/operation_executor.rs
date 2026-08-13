@@ -40,8 +40,9 @@ use rutilus_domain::{
     AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
     CapabilityState, ChassisCommand, ControlCommand, DeploymentPosture, EndpointCapability,
     EndpointId, EventCommand, FailureKind, LogCommand, ManagerCommand, OemCommand, Operation,
-    OperationEvent, OperationId, OperationState, ProductPermission, RedfishCommand,
-    SecureBootCommand, SystemCommand, TelemetryCommand, UpdateCommand,
+    OperationEvent, OperationId, OperationSource, OperationState, ProductPermission,
+    RedfishCommand, SecureBootCommand, SystemCommand, TelemetryCommand, UpdateCommand,
+    execution_attribution,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
@@ -253,7 +254,9 @@ where
         let command = operation.command();
         let engine = OperationEngine::new(&self.store);
 
-        let started = self.start_audit(endpoint_id, &command).await?;
+        let started = self
+            .start_audit(endpoint_id, &command, operation.source())
+            .await?;
 
         if !self.endpoint_exists(endpoint_id).await? {
             return self
@@ -515,12 +518,16 @@ where
                     .recover_step(&engine, operation_id, OperationEvent::RemoteTaskStarted)
                     .await;
             }
-            let started = self.start_audit(endpoint_id, &command).await?;
+            let started = self
+                .start_audit(endpoint_id, &command, operation.source())
+                .await?;
             return self
                 .judge_running(&engine, operation_id, endpoint_id, &command, &started)
                 .await;
         }
-        let started = self.start_audit(endpoint_id, &command).await?;
+        let started = self
+            .start_audit(endpoint_id, &command, operation.source())
+            .await?;
         self.verify_target(&engine, operation_id, endpoint_id, &command, &started)
             .await
             .map_err(guard_recovery_race)
@@ -664,7 +671,12 @@ where
     /// Builds and appends the §16.3 start fact before any pre-flight work.
     ///
     /// The context names the command's §7.5 write family, so the audit record
-    /// shows which typed write the attempt dispatched or judged.
+    /// shows which typed write the attempt dispatched or judged. The actor
+    /// and origin are resolved from the operation's persisted source through
+    /// [`execution_attribution`] (audit follow-up V5A-3): a center-dispatched
+    /// operation executed at the site names the center's automation with the
+    /// site origin, and the site console's own write names the local
+    /// operator at the site.
     ///
     /// # Errors
     ///
@@ -675,17 +687,15 @@ where
         &self,
         endpoint_id: EndpointId,
         command: &RedfishCommand,
+        source: OperationSource,
     ) -> Result<StartedAudit, ExecutorErrorOf<Store, Gateway, Audit>> {
-        let context = operation_audit_context(
-            endpoint_id,
-            command_audit_operation(command),
-            self.actor,
-            self.origin,
-        )
-        .map_err(|source| ExecutorError::Audit {
-            stage: OperationAuditStage::Start,
-            source: AuditRecordError::Context(source),
-        })?;
+        let (actor, origin) = execution_attribution(self.actor, self.origin, source);
+        let context =
+            operation_audit_context(endpoint_id, command_audit_operation(command), actor, origin)
+                .map_err(|source| ExecutorError::Audit {
+                stage: OperationAuditStage::Start,
+                source: AuditRecordError::Context(source),
+            })?;
         let terminal_sequence =
             AuditSequence::FIRST
                 .next()
@@ -2843,6 +2853,13 @@ mod tests {
                 .map(|state| state.events.clone())
                 .map_err(|_| MockError::Events)
         }
+
+        fn clear(&self) -> Result<(), MockError> {
+            self.state
+                .lock()
+                .map(|mut state| state.events.clear())
+                .map_err(|_| MockError::Events)
+        }
     }
 
     impl AuditEventWriter for MockAudit {
@@ -2950,6 +2967,67 @@ mod tests {
         );
         assert_eq!(events[0].context().actor(), AuditActor::System);
         assert_eq!(events[0].context().origin(), DeploymentPosture::Site);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn site_executions_attribute_center_dispatched_and_local_work_by_source()
+    -> Result<(), Box<dyn Error>> {
+        // V5A-3: at the Site posture the operation's persisted source selects
+        // the §16.3 actor and origin of the start fact — a center-dispatched
+        // offer names the center's dispatch automation as the actor with the
+        // site as the execution origin, and the site console's own write
+        // names the local operator at the site.
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        // The site runtime's own construction: the local operator as the
+        // posture's base actor.
+        let executor = OperationExecutor::new(
+            &store,
+            &gateway,
+            &audit,
+            FixedClock(clock_time()),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Site,
+        );
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle));
+
+        let center_dispatched = Operation::new(
+            OperationId::generate(),
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            command.clone(),
+            created_at(),
+        );
+        store.insert(center_dispatched.clone())?;
+        executor.execute_operation(center_dispatched.id()).await?;
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].context().actor(), AuditActor::System);
+        assert_eq!(events[0].context().origin(), DeploymentPosture::Site);
+        assert_eq!(events[1].context().actor(), AuditActor::System);
+        audit.clear()?;
+
+        let site_console = Operation::new(
+            OperationId::generate(),
+            OperationSource::Site,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            command,
+            created_at(),
+        );
+        store.insert(site_console.clone())?;
+        executor.execute_operation(site_console.id()).await?;
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].context().actor(), AuditActor::LocalOperator);
+        assert_eq!(events[0].context().origin(), DeploymentPosture::Site);
+        assert_eq!(events[1].context().actor(), AuditActor::LocalOperator);
+        assert_eq!(events[1].context().origin(), DeploymentPosture::Site);
         Ok(())
     }
 

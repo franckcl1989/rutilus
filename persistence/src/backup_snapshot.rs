@@ -643,8 +643,8 @@ mod tests {
         assert!(matches!(
             compatibility,
             RestoreCompatibility::NewerSchema {
-                backup_applied: 27,
-                supported: 26
+                backup_applied: 28,
+                supported: 27
             }
         ));
         Ok(())

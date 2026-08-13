@@ -12,26 +12,54 @@ use uuid::Uuid;
 
 const AUDIT_FAILURE_VOCABULARY_MIGRATION: &str = "m20260813_000003_audit_failure_vocabulary";
 
-/// The thirteen-code failure vocabulary, in the exact order the 000003
-/// migration's `ck_audit_events_outcome` list carries it — the same order as
-/// the `AuditFailure` enum in `rutilus-domain`. The test pins the list
-/// against the enum in both directions: every domain variant's code is one
-/// of these literals, and every literal parses as a domain variant, so a
-/// code added on either side without the other fails the test.
-const FAILURE_CODES: [&str; 13] = [
-    "credential-unavailable",
-    "tls-trust-failed",
-    "redfish-discovery-failed",
-    "endpoint-persistence-failed",
-    "core-resource-read-failed",
-    "snapshot-persistence-failed",
-    "csv-invalid",
-    "endpoint-import-row-failed",
-    "center-store-failed",
-    "center-request-refused",
-    "authentication-failed",
-    "session-revocation-failed",
-    "capability-unsupported",
+/// The exhaustive domain-side enumeration of [`AuditFailure`]: the `match`
+/// has no wildcard arm, so adding a variant to the domain enum fails this
+/// file's compilation instead of silently leaving the schema-binding
+/// expectations stale — the exhaustive-pin style the domain vocabulary
+/// itself uses.
+fn pin_audit_failure_vocabulary(failure: AuditFailure) {
+    use AuditFailure::{
+        AuthenticationFailed, CapabilityUnsupported, CenterRequestRefused, CenterStoreFailed,
+        CoreResourceReadFailed, CredentialUnavailable, CsvInvalid, EndpointImportRowFailed,
+        EndpointPersistenceFailed, RedfishDiscoveryFailed, SessionRevocationFailed,
+        SnapshotPersistenceFailed, TlsTrustFailed,
+    };
+    match failure {
+        CredentialUnavailable
+        | TlsTrustFailed
+        | RedfishDiscoveryFailed
+        | EndpointPersistenceFailed
+        | CoreResourceReadFailed
+        | SnapshotPersistenceFailed
+        | CsvInvalid
+        | EndpointImportRowFailed
+        | CenterStoreFailed
+        | CenterRequestRefused
+        | AuthenticationFailed
+        | SessionRevocationFailed
+        | CapabilityUnsupported => {}
+    }
+}
+
+/// Every [`AuditFailure`] variant, in enum order — the iteration list of
+/// the schema-binding test. [`pin_audit_failure_vocabulary`] makes the list
+/// compile-exhaustive: a variant added to the enum fails the pin's `match`
+/// whether or not this list is updated, so the two sides of the binding can
+/// never drift silently.
+const ALL_FAILURES: [AuditFailure; 13] = [
+    AuditFailure::CredentialUnavailable,
+    AuditFailure::TlsTrustFailed,
+    AuditFailure::RedfishDiscoveryFailed,
+    AuditFailure::EndpointPersistenceFailed,
+    AuditFailure::CoreResourceReadFailed,
+    AuditFailure::SnapshotPersistenceFailed,
+    AuditFailure::CsvInvalid,
+    AuditFailure::EndpointImportRowFailed,
+    AuditFailure::CenterStoreFailed,
+    AuditFailure::CenterRequestRefused,
+    AuditFailure::AuthenticationFailed,
+    AuditFailure::SessionRevocationFailed,
+    AuditFailure::CapabilityUnsupported,
 ];
 
 // The test walks the full failure vocabulary and the target-principal
@@ -45,49 +73,17 @@ async fn full_failure_vocabulary_and_target_principal_persist_foreign_shapes_are
     Migrator::up(&database, None).await?;
     let occurred_at = OffsetDateTime::now_utc();
 
-    // Direction 1 (domain → schema): every `AuditFailure` variant's stable
-    // code is one of the thirteen pinned literals, and each code persists
-    // through the real schema on a failed terminal event and reads back.
-    for (variant, expected) in [
-        (
-            AuditFailure::CredentialUnavailable,
-            "credential-unavailable",
-        ),
-        (AuditFailure::TlsTrustFailed, "tls-trust-failed"),
-        (
-            AuditFailure::RedfishDiscoveryFailed,
-            "redfish-discovery-failed",
-        ),
-        (
-            AuditFailure::EndpointPersistenceFailed,
-            "endpoint-persistence-failed",
-        ),
-        (
-            AuditFailure::CoreResourceReadFailed,
-            "core-resource-read-failed",
-        ),
-        (
-            AuditFailure::SnapshotPersistenceFailed,
-            "snapshot-persistence-failed",
-        ),
-        (AuditFailure::CsvInvalid, "csv-invalid"),
-        (
-            AuditFailure::EndpointImportRowFailed,
-            "endpoint-import-row-failed",
-        ),
-        (AuditFailure::CenterStoreFailed, "center-store-failed"),
-        (AuditFailure::CenterRequestRefused, "center-request-refused"),
-        (AuditFailure::AuthenticationFailed, "authentication-failed"),
-        (
-            AuditFailure::SessionRevocationFailed,
-            "session-revocation-failed",
-        ),
-        (
-            AuditFailure::CapabilityUnsupported,
-            "capability-unsupported",
-        ),
-    ] {
-        assert_eq!(variant.as_str(), expected);
+    // Direction 1 (domain → schema), generated by the domain itself: every
+    // `AuditFailure` variant's stable code persists through the real schema
+    // on a failed terminal event and reads back — a code added to the enum
+    // must land in the CHECK before this test passes, and the expected set
+    // comes from the enum, never from a transcribed list that could drift
+    // with it.
+    let mut expected_codes: Vec<&str> = Vec::new();
+    for variant in ALL_FAILURES {
+        pin_audit_failure_vocabulary(variant);
+        let expected = variant.as_str();
+        expected_codes.push(expected);
         let inserted = insert_failed_execute_row(&database, expected, occurred_at).await?;
         let stored = rutilus_entity::audit_event::Entity::find_by_id(inserted.id)
             .one(&database)
@@ -97,16 +93,18 @@ async fn full_failure_vocabulary_and_target_principal_persist_foreign_shapes_are
         assert_eq!(stored.verification.as_deref(), Some("rejected"));
     }
 
-    // Direction 2 (schema → domain): every pinned literal is a code the
-    // domain vocabulary knows and parses back to itself, so the CHECK
-    // cannot widen beyond the domain without the test refusing it.
-    for code in FAILURE_CODES {
-        assert_eq!(
-            code.parse::<AuditFailure>().map(AuditFailure::as_str),
-            Ok(code),
-            "{code} is in the schema CHECK but not in the domain vocabulary"
-        );
-    }
+    // Direction 2 (schema → domain): the `failure IN (...)` list of the
+    // live CHECK, read from the schema's own DDL, must be exactly the
+    // domain vocabulary — the CHECK cannot carry a code the domain does not
+    // know without the test refusing it.
+    let mut expected_sorted = expected_codes.clone();
+    expected_sorted.sort_unstable();
+    let mut schema_sorted = live_failure_check_codes(&database).await?;
+    schema_sorted.sort_unstable();
+    assert_eq!(
+        expected_sorted, schema_sorted,
+        "the live CHECK must accept exactly the domain failure vocabulary"
+    );
 
     // A failure code the vocabulary does not know at all is refused.
     let unknown = insert_failed_execute_row(&database, "binding-code-expired", occurred_at).await;
@@ -224,10 +222,13 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
             .is_some()
     );
 
-    // The down refuses the target-principal row: the restored 000001 shape
-    // has no column for it, and silently dropping the target would falsify
-    // the audit record rather than refuse it.
-    let refused_target = Migrator::down(&database, Some(1)).await;
+    // Two rollbacks reach the 000003 down: the 000004 rollback in front
+    // succeeds — the rows are representable in the 000003 shape, which keeps
+    // the target column and the thirteen failure codes — and the 000003 down
+    // then refuses the target-principal row: the restored 000001 shape has
+    // no column for it, and silently dropping the target would falsify the
+    // audit record rather than refuse it.
+    let refused_target = Migrator::down(&database, Some(2)).await;
     assert!(
         refused_target.is_err(),
         "the down must refuse rows carrying a target principal"
@@ -240,7 +241,7 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
     // Without the target row, the two new failure codes still refuse the
     // down: the restored eleven-code CHECK rejects them during the copy,
     // exactly like the 000001 down refuses its center rows.
-    let refused_codes = Migrator::down(&database, Some(1)).await;
+    let refused_codes = Migrator::down(&database, Some(2)).await;
     assert!(
         refused_codes.is_err(),
         "the down must refuse rows carrying the new failure codes"
@@ -248,7 +249,7 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
     rutilus_entity::audit_event::Entity::delete_many()
         .exec(&database)
         .await?;
-    Migrator::down(&database, Some(1)).await?;
+    Migrator::down(&database, Some(2)).await?;
 
     // The restored 000001 shape refuses the two new codes again while the
     // eleven codes it already knew stay accepted. The rows go through raw
@@ -311,6 +312,45 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
     );
 
     Ok(())
+}
+
+/// The codes of one `IN (...)` list inside a `CREATE TABLE` DDL, anchored on
+/// the constrained column — the schema side of the domain↔CHECK binding,
+/// read from the real DDL instead of a transcribed list, so the test
+/// compares the actual CHECK against the actual domain vocabulary.
+fn in_list_codes(ddl: &str, anchor: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let marker = format!("{anchor} IN (");
+    let start = ddl
+        .find(&marker)
+        .ok_or_else(|| format!("no `{marker}` list in the DDL"))?
+        + marker.len();
+    // The list's literals nest no parentheses, so the first `)` closes it.
+    let end = ddl[start..]
+        .find(')')
+        .ok_or_else(|| format!("the `{anchor} IN (` list is not closed"))?
+        + start;
+    Ok(ddl[start..end]
+        .split(',')
+        .map(|code| code.trim().trim_matches('\'').to_owned())
+        .collect())
+}
+
+/// The `failure IN (...)` codes of the live `audit_events` CHECK.
+async fn live_failure_check_codes(
+    database: &DatabaseConnection,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    use sea_orm::sea_query::{Alias, Expr, Query};
+    let statement = Query::select()
+        .expr(Expr::cust("sql"))
+        .from(Alias::new("sqlite_master"))
+        .cond_where(Expr::cust("type = 'table' AND name = 'audit_events'"))
+        .to_owned();
+    let row = database
+        .query_one(&statement)
+        .await?
+        .ok_or("audit_events is not in the live schema")?;
+    let ddl: String = row.try_get_by_index(0)?;
+    in_list_codes(&ddl, "failure")
 }
 
 /// The number of registered migrations before the named migration.

@@ -33,7 +33,7 @@ pub use audit::{
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOutcome,
     AuditOutcomeKind, AuditParameterSummary, AuditParameterSummaryError, AuditProgress,
     AuditRedfishOperation, AuditSequence, AuditSequenceError, AuditTarget, AuditTlsTrust,
-    AuditVerification, ProductPermission,
+    AuditVerification, ProductPermission, execution_attribution,
 };
 pub use batch_operation::{
     BatchOperation, BatchOperationState, BatchOutcomeCounts, OperationOutcome, derive_batch_state,

@@ -762,6 +762,8 @@ where
             instance.state(),
             gateway,
             retention,
+            DeploymentPosture::Site,
+            AuditActor::LocalOperator,
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
                     DeploymentPosture::Site,

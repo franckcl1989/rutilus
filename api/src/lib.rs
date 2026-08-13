@@ -5855,6 +5855,12 @@ pub struct CenterOperationResponse {
     state: OperationStateResponse,
     #[serde(default)]
     actor: Option<String>,
+    /// The §13.7 failure classification of a `Failed` tracking record
+    /// (V5E-4, W3C-3): `capability-unsupported` for a provably unsupported
+    /// write, `None` otherwise. The additive field tolerates consoles built
+    /// before it existed (W3C-1).
+    #[serde(default)]
+    failure_kind: Option<FailureKindResponse>,
     #[serde(with = "time::serde::rfc3339::option")]
     ttl_expires_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
@@ -5872,6 +5878,7 @@ impl CenterOperationResponse {
         target: Option<String>,
         state: OperationStateResponse,
         actor: Option<String>,
+        failure_kind: Option<FailureKindResponse>,
         ttl_expires_at: Option<OffsetDateTime>,
         created_at: OffsetDateTime,
     ) -> Self {
@@ -5883,6 +5890,7 @@ impl CenterOperationResponse {
             target,
             state,
             actor,
+            failure_kind,
             ttl_expires_at,
             created_at,
         }
@@ -5923,6 +5931,13 @@ impl CenterOperationResponse {
     #[must_use]
     pub fn actor(&self) -> Option<&str> {
         self.actor.as_deref()
+    }
+
+    /// The §13.7 failure classification of the tracking record, when it is
+    /// `Failed` with a classified refusal (V5E-4, W3C-3).
+    #[must_use]
+    pub const fn failure_kind(&self) -> Option<FailureKindResponse> {
+        self.failure_kind
     }
 
     /// When the outstanding offer stops being actionable (§15.6).
@@ -6044,6 +6059,68 @@ impl CenterOperationSubmitResponse {
     #[must_use]
     pub const fn ttl_expires_at(&self) -> OffsetDateTime {
         self.ttl_expires_at
+    }
+}
+
+/// The stable machine code of one §15.6 center dispatch refusal (V5A-9).
+///
+/// The codes mirror the web layer's [`CenterOperationRefusal`] verdicts so
+/// the console can distinguish why a dispatch was refused — authorization,
+/// an unknown endpoint, a foreign endpoint, an unknown target, an
+/// unserializable command, or a center-store failure — without parsing the
+/// human-readable message. The vocabulary is forward-tolerant (W3C-1):
+/// [`Unknown`] absorbs a wire value this build does not know, so a future
+/// code never breaks a console built before it existed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CenterOperationRefusalCode {
+    /// The acting principal is not authorized to dispatch to the target site
+    /// (§16.1, D3).
+    NotAuthorized,
+    /// The endpoint is not in the center's projection.
+    UnknownEndpoint,
+    /// The endpoint belongs to a different site; the offer would be dropped
+    /// by the addressed site (§15.6).
+    EndpointNotInSite,
+    /// The target is not part of the endpoint's projected resources.
+    UnknownTarget,
+    /// The typed command could not be serialized into its wire payload.
+    CommandSerialization,
+    /// The center store failed.
+    StoreFailed,
+    /// A refusal code this build does not know — the fallback of a future
+    /// wire value (W3C-1). This build never constructs it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The wire body of one refused §15.6 center dispatch (V5A-9).
+///
+/// The response carries the stable [`CenterOperationRefusalCode`] beside the
+/// human-readable message, so the console can render the refusal kind
+/// without parsing message text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CenterOperationDispatchRefusalResponse {
+    code: CenterOperationRefusalCode,
+    message: String,
+}
+
+impl CenterOperationDispatchRefusalResponse {
+    #[must_use]
+    pub const fn new(code: CenterOperationRefusalCode, message: String) -> Self {
+        Self { code, message }
+    }
+
+    /// The stable refusal code the console can switch on.
+    #[must_use]
+    pub const fn code(&self) -> CenterOperationRefusalCode {
+        self.code
+    }
+
+    /// The human-readable refusal message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -11164,6 +11241,7 @@ mod tests {
             OperationStateResponse::Queued,
             Some("admin".to_owned()),
             None,
+            None,
             observed_at,
         );
 
@@ -12780,6 +12858,9 @@ mod tests {
         Ok(())
     }
 
+    // The contract, the tracking view, and the refusal body are pinned in
+    // one test, so the line budget is the coverage.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn the_operation_submit_contract_carries_exactly_the_s15_6_set() -> Result<(), Box<dyn Error>> {
         let site_id = uuid!("01989abc-def0-7abc-8def-0123456789ce");
@@ -12836,10 +12917,11 @@ mod tests {
             uuid!("41989abc-def0-7abc-8def-0123456789ce"),
             Some(site_id),
             endpoint_id,
-            command,
+            command.clone(),
             Some("/redfish/v1/Systems/1".to_owned()),
             OperationStateResponse::Queued,
             Some("admin".to_owned()),
+            None,
             Some(created_at),
             created_at,
         );
@@ -12860,6 +12942,60 @@ mod tests {
             )?)?,
             acknowledgement
         );
+
+        // V5E-4 / W3C-3: a failed tracking record carries its §13.7
+        // classification, and an older console's payload (no field) still
+        // parses (W3C-1).
+        let classified = CenterOperationResponse::new(
+            uuid!("41989abc-def0-7abc-8def-0123456789ce"),
+            Some(site_id),
+            endpoint_id,
+            command.clone(),
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationStateResponse::Failed,
+            Some("admin".to_owned()),
+            Some(FailureKindResponse::CapabilityUnsupported),
+            Some(created_at),
+            created_at,
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterOperationResponse>(serde_json::to_value(&classified)?)?,
+            classified
+        );
+        assert_eq!(
+            classified.failure_kind(),
+            Some(FailureKindResponse::CapabilityUnsupported)
+        );
+        let legacy = serde_json::from_value::<CenterOperationResponse>(json!({
+            "operation_id": uuid!("41989abc-def0-7abc-8def-0123456789ce"),
+            "site_id": site_id,
+            "endpoint_id": endpoint_id,
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "target": "/redfish/v1/Systems/1",
+            "state": "failed",
+            "actor": "admin",
+            "ttl_expires_at": "2026-08-05T10:11:27Z",
+            "created_at": "2026-08-05T10:11:12Z"
+        }))?;
+        assert_eq!(legacy.failure_kind(), None);
+
+        // V5A-9: the refusal body carries the stable machine code, and an
+        // unknown wire code falls back to `Unknown` (W3C-1).
+        let refusal = CenterOperationDispatchRefusalResponse::new(
+            CenterOperationRefusalCode::UnknownTarget,
+            "the target is not part of the endpoint's projection".to_owned(),
+        );
+        let wire = serde_json::to_value(&refusal)?;
+        assert_eq!(wire["code"], json!("unknown_target"));
+        assert_eq!(
+            serde_json::from_value::<CenterOperationDispatchRefusalResponse>(wire)?,
+            refusal
+        );
+        let unknown = serde_json::from_value::<CenterOperationDispatchRefusalResponse>(json!({
+            "code": "future-refusal-code",
+            "message": "a newer server's refusal"
+        }))?;
+        assert_eq!(unknown.code(), CenterOperationRefusalCode::Unknown);
         Ok(())
     }
 }
