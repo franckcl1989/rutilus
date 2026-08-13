@@ -93,6 +93,37 @@
 > APPROVE）；**复跑前置已齐备**：run-all 脚本 + 最新 debug 二进制（已确认即 HEAD 产物——
 > cargo build 0 编译步骤，最后 Rust 源码提交 64125e0 早于二进制构建 23:36-23:37）+ 空
 > logs//tmp/。
+> **迭代十四（2026-08-13，HEAD = 6f8b698，4 个提交）——CI 首跑修复批次**：首个 GitHub
+> push/CI run 暴露 4 类本地（Windows）不可见的解析/平台缺陷，已全部修复：`26ad869`（fix(ci)：
+> quote the signing-skip echo——workflow 级 YAML 缺陷：`run: echo "signing skipped: certificate
+> not configured"` 是 plain scalar、值含 ": " 被 YAML 解析为 mapping 指示符，workflow 文件整体
+> 非法、每个 push 事件在解析期失败（run 31660470408 "workflow file issue"）；单引号修复后以
+> yq/go-yaml（GitHub Actions 所用引擎）全文件解析通过——该文件此前从未被 GitHub 解析过，
+> release-artifacts 的 CI 侧冒烟仍为跟进项，yq 成为本地校验路径）、`43fcbae`（fix(ci)：gate the
+> release signing on env-mapped secrets——GitHub 拒绝 `if:` 条件引用 secrets context
+> （"Unrecognized named-value: 'secrets'"，release-artifacts 9 处）；7 个签名相关 secret 改 job 级
+> env 映射（env 值可消费 secrets）、受影响 `if:` 全部改比 env.X，表达式逻辑逐字节一致、步骤级
+> env 物化不动；安全注记：job 级映射把 env 暴露面扩到全部步骤（值被 mask、无步骤 echo），与
+> 物化步骤既有机制相同）、`c8ccb86`（fix(platform)：clear the linux-target clippy errors——首轮
+> CI 暴露 3 处跨平台 lint 错误（Windows 本地构建从不编译）：`require_private_permissions` 的
+> permissions 参数按值传入只读（改引用，Unix 孪生同步、调用点借用），2 个 Linux 透传 secret-store
+> 函数 async 签名无 await（Linux 孪生保留签名 + 函数级 allow：Windows/macOS 孪生必须 await
+> spawn_blocking 且 SystemSecretStore 调用点刻意 cfg-free，统一签名是设计）；linux 目标本地复现
+> 三处全修、双平台零警告、workspace check/fmt/tests 绿）、`6f8b698`（fix(migration)：hold the
+> test tempdir for the pool connection lifetime——4 个 connect() 辅助（audit_action_shapes /
+> audit_execute_operation / center_tables / product_users）只返回 DatabaseConnection、TempDir 在
+> 池的 eager 连接仍持有数据库时被 drop：Windows 不能删除打开的文件故测试存活，Linux unlink
+> 成功、首个写语句创建 rollback journal 时 stat 已不存在的路径——SQLITE_IOERR_FSTAT /
+> "disk I/O error"，即首个 ubuntu CI run 报告的失败；改为随连接一并返回 TempDir（存活期覆盖
+> 连接），与 center_data_sites/center_role_sites 既有 tuple 形态一致）。**测试计数复核
+> （2026-08-13，`cargo test --workspace -- --list` 口径）：总数 1731（lib/集成 1730 + doc 1，
+> doc = test-support 头文档），与迭代十登记总数一致（迭代十登记的分解「lib/集成 1731 + doc 1
+> = 1732」与 `--list` 口径不符——`--list` 总数 1731 已含 doc 1，即 lib/集成 1730）、迭代
+> 十一~十四无 Rust 测试增删；per-crate
+> 修正：infra-redfish 291→295（旧 291 为迭代三+四 bfb001e 实测，深度审查批次 6128a17 已 +4：
+> redfish_gateway.rs 246→249、application_adapter.rs 18→19）与 test-support 55→54（历史 55 混入
+> 头文档 doc-test 1，与新 `--list` 口径分离；54 = 26 lib〔mock_bmc/tests.rs 21 + mock_center/mod.rs 4 +
+> mock_center/tls.rs 1〕+ 28 集成〔gateway_mock_bmc.rs〕），其余 per-crate 与迭代十登记一致）**。
 > 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-12 复核）：
@@ -303,7 +334,7 @@
 > `docs/known-limitations.md` §九 8 行与 `docs/security-review.md` N3 行已同步为最终状态
 > （以 known-limitations 为准）。全 workspace 门禁复跑全绿（fmt / clippy `-D warnings`
 > 零警告 / **1723**（`cargo test --workspace -- --list` 口径：lib/集成 1723 + doc 1 = 1724）
-> 0 失败，2026-08-12；per-crate：test-support 55 / ui 141 / application 301 / web 133 /
+> 0 失败，2026-08-12；per-crate：test-support 54 / ui 141 / application 301 / web 133 /
 > rutilus 145）。
 
 ### 7.1 逐项盘点
@@ -311,7 +342,7 @@
 | 0.9.0 内容 | 状态 | 证据 |
 |---|---|---|
 | 五厂商实验室 | ⏳ 待做（依赖物理设备） | Mock 层已覆盖五厂商 profile（Dell/HPE/Lenovo/xFusion/Inspur，外加 NVIDIA/AMI/LiteOn/Delta/Supermicro，共 11 个 `MockProfile`，`test-support/src/mock_bmc/profile.rs:47-134`）；§19.1 Physical Device Test「五厂商至少各一台真实设备进入 1.0.0 认证矩阵」未达成（`docs/known-limitations.md` §五） |
-| 所有 Fixture 回归 | 🟡 部分 | 合成 fixture（Mock BMC 固定资源树 + 确定性证书）回归已有：`test-support/tests/gateway_mock_bmc.rs` **28 个测试**（Service Root 读取/47 能力探测/核心资源读取/会话生命周期/各厂商 profile；迭代七 T-I 044bae2 补 AMI/HPE 真网关解码 E2E 5 个：`ami_profile_*` `:1793, :1861`、`hpe_profile_*` `:2003, :2070`、`namespace_free_endpoint_leaves_ami_and_hpe_families_absent` `:2202`）、`test-support/src/mock_bmc/tests.rs` 21 个，合计 test-support 55 测试全过；§19.1 Fixture Test 要求的**脱敏真实响应 fixture 目录**（五厂商各固件版本，随 nv-redfish 升级回归）尚无（`known-limitations.md` §五） |
+| 所有 Fixture 回归 | 🟡 部分 | 合成 fixture（Mock BMC 固定资源树 + 确定性证书）回归已有：`test-support/tests/gateway_mock_bmc.rs` **28 个测试**（Service Root 读取/47 能力探测/核心资源读取/会话生命周期/各厂商 profile；迭代七 T-I 044bae2 补 AMI/HPE 真网关解码 E2E 5 个：`ami_profile_*` `:1793, :1861`、`hpe_profile_*` `:2003, :2070`、`namespace_free_endpoint_leaves_ami_and_hpe_families_absent` `:2202`）、`test-support/src/mock_bmc/tests.rs` 21 个、mock_center 5〔mod.rs 4 + tls.rs 1〕，合计 test-support 54 测试全过（lib 26 + 集成 28，头文档 doc-test 不计入）；§19.1 Fixture Test 要求的**脱敏真实响应 fixture 目录**（五厂商各固件版本，随 nv-redfish 升级回归）尚无（`known-limitations.md` §五） |
 | 故障注入 | 🟡 部分 | §19.3 多数场景已有单进程自动化覆盖：BMC 慢响应（`redfish_gateway.rs:24192, 25091`、`tls_probe.rs:568`）、TLS 证书变化（`domain/src/endpoint.rs:327` `verify_identity`/`TlsIdentityChanged`）、JSON 字段类型错误（`redfish_gateway.rs:19215, 19466` undecodable 成员跳过）、Action 响应丢失/写连接丢弃（`redfish_gateway.rs:28766, 28807`）、Task 消失（`redfish_gateway.rs:23109`）、SSE 流中断/解码失败（`redfish_gateway.rs:32605, 32674`）、重复消息/重复 Operation（`center_sync.rs:3478, 3528`、`operation_engine.rs:1332` 批量重投 no-op、`event_repository.rs:328` 事件去重）、大文件上传中断（`web/tests/artifact_path.rs:735`）、系统时间变化（`application/src/telemetry_sampler.rs:1050, 1076`、`operation_engine.rs:986` 时钟回拨如实记录）、文件写失败（`artifact_store.rs:1476`）、**登录 Token 失效**（`redfish_gateway.rs:23331` 任务轮询 401 → `AuthenticationFailed` 分类 + 临时 Session 删除、下轮自动重认证（清会话重建），`:33313-33347` SSE 请求 401 → `Reconnectable` 会话重建信号、端点不作消失处理）、**Schema 缺字段**（最小 schema 的字符串字段为 `Option` + missing-field 默认值：serde 把缺失属性与显式 null 同映射 `None`，`redfish_gateway.rs:4124`）；**未覆盖 4 项已更新（迭代八，2026-08-12）**：产品进程在任务中终止、BMC 更新中重启、SQLite 写入中断 3 项已有 Windows 侧进程级演练套件（`scripts/drills/`，见 7.2-B），**首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP**（防护修复后快速 FAIL 路径已验证），**功能验证待真实交互控制台复跑**；磁盘空间不足仍保持未覆盖（无管理员权限的可靠模拟手段受限） |
 | 跨平台 E2E | ✅ 已完成 | windows/macos 任务新增跨平台 E2E 套件步骤（`ci.yml:130-147`）：`cargo test --locked -p rutilus-web`（`web/tests/` 9 个路径套件，均为无 socket/子进程/定时器的内存假件）+ `cargo test --locked -p rutilus --test version`；`app/tests/mock_center_client.rs`（回环 mTLS/WebSocket 中心互操作）因真实 socket 与握手/协商时序**故意不纳入**非默认任务（`ci.yml:139-141` 注释）——三平台 E2E 运行达成 |
 | 数据库压力 | ✅ 已完成 | 压力/容量测试套件落地：`persistence/tests/stress_capacity.rs` 3 个测试（`two_hundred_endpoints_round_trip_with_generation_consistent_refreshes` :336、`one_hundred_sites_advance_outbox_inbox_and_sync_cursors` :585、`five_thousand_endpoint_projections_round_trip_at_the_center` :832），规模常量对齐设计最低验证规模（200/100/5,000，`:47-52`）；本机复跑 3 测试全过（2026-08-12，debug 构建、WAL） |
@@ -327,7 +358,7 @@
 | 用户手册 | ✅ 已完成 | `docs/user-manual.md`（436 行，条目后标注来源文件；`rutilus version` 输出已更新为三行，含 Git Commit） |
 | 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状；§8.1 已补充 `--log-format json` 结构化输出与 span 上下文，§九已补充合成规模实测容量数据） |
 | 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（190 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；§三「CI 现状」已更新（windows/macos E2E 套件、aarch64 musl、macOS Universal 2 入 CI，Windows ARM64 未入 CI 的真实原因，`support-matrix.md:90-95`） |
-| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:150`：合成规模套件已实测、发布级容量建议已发布（release 构建数据，见 operations-manual §九））；§八「§12.4 诊断中的解码错误路径 / ExtendedInfo 展示」行已同步为**已实现**（`known-limitations.md:154`：E1 生产捕获点已合入，如实注记 odata_type 捕获时为 None 等）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致），同日再更新为「发布级容量建议已发布（release 构建数据，正式规模环境复核仍待做）」（release 实测数据登记，2026-08-12，见 operations-manual §九）；§七新增深度审查批次条目（密码策略 API 边界 / 429 不写审计 / ETag 现状 / 迁移 down 纪律，`known-limitations.md:138-141`）；§九新增深度审查遗留项登记 8 项（`known-limitations.md:173-180`），迭代七已全部落地/处置（见 §7.5） |
+| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:150`：合成规模套件已实测、发布级容量建议已发布（release 构建数据，见 operations-manual §九））；§八「§12.4 诊断中的解码错误路径 / ExtendedInfo 展示」行已同步为**已实现**（`known-limitations.md:154`：E1 生产捕获点已合入，如实注记 odata_type 捕获时为 None 等）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致），同日再更新为「发布级容量建议已发布（release 构建数据，正式规模环境复核仍待做）」（release 实测数据登记，2026-08-12，见 operations-manual §九）；§七新增深度审查批次条目（密码策略 API 边界 / 429 不写审计 / ETag 现状 / 迁移 down 纪律，`known-limitations.md:138-141`）；§九新增深度审查遗留项登记 8 项（`known-limitations.md:176-183`），迭代七已全部落地/处置（见 §7.5） |
 | 性能容量测试 | 🟡 部分 | 压力/容量套件已落地（`persistence/tests/stress_capacity.rs`，规模达设计最低验证规模）并有本机实测数据（2026-08-12：debug 构建、WAL、Windows 开发机基线 + release 构建 3 次全过）：debug 下 5,000 投影写入 5.78s（≈865 行/s）、幂等重投 9.72s、5,000 行清单查询 0.482s，release 下 5,000 投影首次写入 ≈3.5–4.2s、幂等重投 ≈7.9s、清单查询 ≈0.16–0.20s；关键观察：写路径被 `write_gate`（`Semaphore(1)`，`persistence/src/lib.rs:101, 240`）全局串行化，5,000 规模耗时 ≈ 事务数 × 单事务成本——这是发布真实容量建议时最有价值的记录；**发布级容量建议已发布（release 构建数据，2026-08-12，见 `operations-manual.md` §九）**；正式规模环境复核仍待做 |
 
 ### 7.2 剩余工作精确分类
@@ -499,8 +530,9 @@ known-limitations §八 events 存储增长（§14.4 展示有界/存储无界�
 
 **测试计数（2026-08-12，迭代七合入后本机复跑，口径 `cargo test -p <crate> -- --list` / `cargo test --workspace -- --list` + `grep ": test$"`）**：
 
-- per-crate：test-support **55**（gateway_mock_bmc.rs 28〔23 + T-I 新增 5〕+ mock_bmc/tests.rs
-  21 + mock_center 5〔mod.rs 4 + tls.rs 1〕+ lib.rs 头文档 doc-test 1）、ui **141**（T-H 新增 fragment 纯函数测试 4 个；
+- per-crate：test-support **54**（gateway_mock_bmc.rs 28〔23 + T-I 新增 5〕+ mock_bmc/tests.rs
+  21 + mock_center 5〔mod.rs 4 + tls.rs 1〕，即 lib 26 + 集成 28；lib.rs 头文档 doc-test 1
+  已与新 `--list` 口径分离、不计入）、ui **141**（T-H 新增 fragment 纯函数测试 4 个；
   上轮登记 136，本轮复跑 141）、application **301**（293 + T-G 贯通 4 + T-B 对抗 4）、
   web **133**（T-D 新增有界性测试 4 个）、rutilus **145**（141 + T-E 预快照 3 + T-F 重试 1）；
 - workspace 总计：**1723**（lib/集成 1723 + doc 1 = 1724），0 失败；fmt / clippy
@@ -509,6 +541,6 @@ known-limitations §八 events 存储增长（§14.4 展示有界/存储无界�
 **测试计数（2026-08-12，迭代十合入后本机复跑，口径 `cargo test --workspace --locked -- --test-threads 4`）**：
 
 - per-crate：migration **38**（30 基线 + down_order_gate 新增 8）；五个核心 crate 与迭代七基线
-  相等——test-support **55** / ui **141** / application **301** / web **133** / rutilus(app) **145**；
+  相等——test-support **54** / ui **141** / application **301** / web **133** / rutilus(app) **145**；
 - workspace 总计：**1731**（lib/集成 1731 + doc 1 = 1732），0 失败；增量恰 +8（down_order_gate）；
   fmt / clippy `-D warnings` 全 workspace 零警告。
