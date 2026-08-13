@@ -32,7 +32,7 @@ gloo-net = { version = "0.6.0", default-features = false, features = ["http", "j
 hmac = "0.13.0"
 http-body-util = "0.1.4"
 leptos = { version = "=0.8.20", default-features = false, features = ["csr"] }
-nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
+nv-redfish = { version = "=0.14.1", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
 prost = "0.14.4"
 prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"
