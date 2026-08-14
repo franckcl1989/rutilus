@@ -279,17 +279,22 @@ fn sql_identifier(word: &str) -> &str {
 /// of the line, newline consumed) and `/* ... */` block comments, each
 /// replaced by a single space so the words around it stay separate words.
 ///
-/// Single-quoted SQL string literals are preserved verbatim — a `--` or
-/// `/*` inside a literal is literal text, not a comment — with a doubled
-/// `''` recognized as an escaped quote rather than the end of the literal.
-/// (The same implementation `bare_sql_gate.rs` uses, so the two gates
-/// cannot disagree about what a comment is.) A comment between the words of
-/// a raw statement (`DROP /* reason */ TABLE parents`) would otherwise hide
-/// the shape from the word scan, and comment content could read like a
-/// shape. The boundary is the same as `bare_sql_gate`: only single-quoted
-/// literals are preserved, so a comment marker inside a double-quoted
-/// identifier (`DROP TABLE "weird--name"`) is read as a comment — a
-/// registered residue, not expanded.
+/// Quoted regions are preserved verbatim — a `--` or `/*` inside them is
+/// text, not a comment — in every spelling the `SQLite` grammar allows:
+/// single-quoted string literals (`'...'`, a doubled `''` being the escaped
+/// quote), double-quoted identifiers (`"..."`, a doubled `""` the escaped
+/// quote), backtick-quoted identifiers (`` `...` ``), and bracket-quoted
+/// identifiers (`[...]`, closed by the first `]`). An unterminated quote
+/// runs to the end of the string, so a fragment never strips mid-quote.
+/// (The same implementation `bare_sql_gate.rs` uses — the same quote
+/// states the statement split [`split_sql_statements`] uses — so the two
+/// gates cannot disagree about what a comment or a quoted region is.) A
+/// comment between the words of a raw statement (`DROP /* reason */ TABLE
+/// parents`) would otherwise hide the shape from the word scan, and comment
+/// content could read like a shape; a comment marker inside a quoted
+/// identifier (`DROP TABLE "weird--name"`) is identifier text, so the drop
+/// names the whole quoted identifier and a following `;`-separated
+/// statement survives the strip like any other.
 fn strip_sql_comments(statement: &str) -> String {
     let chars: Vec<char> = statement.chars().collect();
     let mut stripped = String::with_capacity(statement.len());
@@ -329,6 +334,40 @@ fn strip_sql_comments(statement: &str) -> String {
                     break;
                 }
                 stripped.push(chars[i]);
+                i += 1;
+            }
+        } else if chars[i] == '"' || chars[i] == '`' {
+            // A double-quoted or backtick-quoted `SQLite` identifier is
+            // preserved verbatim, a doubled quote being the escaped quote.
+            let quote = chars[i];
+            stripped.push(quote);
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        stripped.push(quote);
+                        stripped.push(quote);
+                        i += 2;
+                        continue;
+                    }
+                    stripped.push(quote);
+                    i += 1;
+                    break;
+                }
+                stripped.push(chars[i]);
+                i += 1;
+            }
+        } else if chars[i] == '[' {
+            // A bracket-quoted `SQLite` identifier is preserved verbatim,
+            // closed by the first `]`.
+            stripped.push('[');
+            i += 1;
+            while i < chars.len() && chars[i] != ']' {
+                stripped.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                stripped.push(']');
                 i += 1;
             }
         } else {
@@ -1789,6 +1828,96 @@ impl MigrationTrait for Migration {
         violations
             .iter()
             .any(|violation| violation.contains("weird;name") && violation.contains("children")),
+        "the parent-first drop of the quoted name must be rejected, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// The W8-W-1 blind spot: the stripper used to protect only single-quoted
+/// literals, so a comment marker inside a quoted identifier (`"a--b"`,
+/// `` `a--b` ``, `[a--b]`) was read as a comment start. `DROP TABLE
+/// "weird--name"` recorded a fictional drop of `weird` while the real drop
+/// was skipped, and a `;`-separated drop after the quoted name was swallowed
+/// with the comment — a parent-first pair could pass with its child drop
+/// erased, and a fictional drop could constrain an unrelated pair. All four
+/// quote spellings are preserved verbatim now (the same quote states
+/// `bare_sql_gate`'s stripper uses, so the two gates cannot disagree), so
+/// the quoted name drops whole and the following statement still constrains
+/// the order.
+#[test]
+fn gate_keeps_quoted_identifiers_whole_against_comment_markers() -> Result<(), Box<dyn Error>> {
+    // ① A `--` inside a double-quoted identifier is identifier text, not a
+    // comment: the drop names the whole quoted identifier, never a fiction.
+    assert_eq!(
+        drop_table_names(r#"DROP TABLE "weird--name""#),
+        vec!["weird--name"],
+        "a `--` inside a double-quoted identifier must not split the name",
+    );
+    // ② The swallowed-comment shape used to erase a `;`-separated drop that
+    // followed the quoted name — the parent-first pair passed with its
+    // child drop gone. The following drop survives the strip now.
+    assert_eq!(
+        drop_table_names(r#"DROP TABLE "parents--note"; DROP TABLE children"#),
+        vec!["parents--note", "children"],
+        "a `;`-separated drop after the quoted name must survive the strip",
+    );
+    // ③ Backtick- and bracket-quoted names hold `--` whole too.
+    assert_eq!(
+        drop_table_names("DROP TABLE [weird--name]; DROP TABLE `other--x`"),
+        vec!["weird--name", "other--x"],
+        "bracket- and backtick-quoted names must stay whole too",
+    );
+    // ④ A single-quoted literal keeps the existing behavior: `--` inside it
+    // is text, never a comment, so it can neither fake nor hide a drop, and
+    // a `REFERENCES` clause after a literal containing `--` is still read.
+    assert_eq!(
+        drop_table_names("DROP TABLE parents; ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'a--b'"),
+        vec!["parents"],
+        "a `--` inside a single-quoted literal must not fake a drop",
+    );
+
+    // The quoted `--` name participates in the child-first check end to end:
+    // an edge built against `weird--name` constrains a drop that names it.
+    // The SQL strings are raw strings so the quotes reach the gate lexer
+    // unescaped (the lexer keeps `\"` verbatim).
+    let source = r##"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"CREATE TABLE children (parent_id UUID NOT NULL REFERENCES "weird--name"(id))"#,
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(r#"DROP TABLE "weird--name""#)
+            .await?;
+        connection.execute_unprepared("DROP TABLE children").await
+    }
+}
+"##;
+    let source = tokenize("synthetic_quoted_comment_name.rs", source);
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "weird--name".to_owned())),
+        "the quoted REFERENCES clause must yield the edge, got: {edges:?}",
+    );
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("weird--name") && violation.contains("children")),
         "the parent-first drop of the quoted name must be rejected, got:\n{}",
         violations.join("\n"),
     );

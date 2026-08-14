@@ -897,12 +897,19 @@ where
             if let Err(error) = accept_loop.await {
                 tracing::error!("the center accept loop task failed: {error}");
             }
-            // W7-C-3: the queued audit appends are replayed in a bounded
-            // final drain before the drain task stops, so the stop does not
-            // discard the whole compensation queue (the same two-branch
-            // discipline as the Edge postures' `run_background_services`).
-            drain_audit_compensation_final(&state).await;
+            // W8-C-1: the compensation drain task is joined BEFORE the
+            // bounded final drain — the W7-C-4 discipline of the Edge
+            // postures' `run_background_services`. The stop signal cannot
+            // interrupt a drain pass that is already in flight (the task's
+            // select only fires between passes), so an append that fails
+            // during the shutdown is requeued by the in-flight pass; joining
+            // first lets every such requeue land in the queue, and the final
+            // drain then applies its bounded budget to the full remaining
+            // set. Draining first would let those in-flight requeues bypass
+            // the final drain's budget entirely and be dropped without a
+            // replay attempt.
             drain_compensation(&mut compensation).await;
+            drain_audit_compensation_final(&state).await;
             result.map_err(CenterRunError::Serve)
         }
         signal = stop => {
@@ -914,9 +921,16 @@ where
             if let Err(error) = accept_loop.await {
                 tracing::error!("the center accept loop task failed: {error}");
             }
-            // W7-C-3: bounded final drain before the drain task stops.
-            drain_audit_compensation_final(&state).await;
+            // W8-C-1: the compensation drain task is joined BEFORE the
+            // bounded final drain — the W7-C-4 discipline of the Edge
+            // postures: the stop signal cannot interrupt an in-flight drain
+            // pass, so joining first lets the pass's requeues land in the
+            // queue and the final drain's bounded budget cover the full
+            // remaining set (draining first would let those in-flight
+            // requeues bypass the budget and be dropped without a replay
+            // attempt).
             drain_compensation(&mut compensation).await;
+            drain_audit_compensation_final(&state).await;
             server.await.map_err(CenterRunError::Serve)
         }
     }
@@ -1003,6 +1017,11 @@ impl RefusalWarnThrottle {
 /// accepted connection, until the stop watch fires, then every in-flight
 /// connection is joined.
 ///
+/// Finished connection tasks are reaped as new connections are accepted
+/// (W8-P-5): the tracking Vec never accumulates every historical handle,
+/// staying bounded by the number of concurrent connections instead of
+/// growing with the total number of accepted connections over the run.
+///
 /// The admission is resolved inside the accept (audit follow-up F4): a
 /// refused site receives its `NegotiationResult` at negotiation time —
 /// `not-bound` when its binding is not in force, so it converges its
@@ -1033,8 +1052,8 @@ async fn run_center_accept_loop(
                     Ok(accepted) => {
                         // The site id is captured before the task takes the
                         // connection, so a task failure is logged with its
-                        // site (the join below is the only observation
-                        // point left).
+                        // site (the reap and the shutdown join are the
+                        // observation points).
                         let site_id = accepted.site().instance_id();
                         connections.push((
                             site_id,
@@ -1044,6 +1063,16 @@ async fn run_center_accept_loop(
                                 stop.clone(),
                             )),
                         ));
+                        // W8-P-5: the finished handles are reaped after
+                        // every accept, so the Vec stays bounded by the
+                        // concurrent connections plus this one — a site
+                        // reconnecting on a fixed cadence (the W7-C-2
+                        // generation guard legitimizes fast reconnects)
+                        // can no longer accumulate one stale handle per
+                        // reconnect for the whole run. The shutdown join
+                        // below then awaits only the still-running
+                        // connections, exactly once.
+                        reap_finished_connections(&mut connections).await;
                     }
                     Err(CenterAcceptError::AdmissionRejected { reason }) => {
                         // The site received its refusal answer already;
@@ -1079,6 +1108,34 @@ async fn run_center_accept_loop(
         // panic signal is recorded here.
         if let Err(error) = connection.await {
             tracing::error!("the center connection task for site {site_id} failed: {error}");
+        }
+    }
+}
+
+/// Reaps the finished connection handles of the accept loop (W8-P-5): each
+/// finished task's handle is awaited and removed from the Vec, so the Vec
+/// stays bounded by the number of concurrent connections instead of
+/// accumulating one handle per accepted connection for the whole run.
+///
+/// The outcome is observed exactly like the shutdown join — a `JoinError`
+/// (a panic or a cancel) is logged with the site id, so the periodic reap
+/// loses no observability: the connection task's own error paths are
+/// already logged inside the task, and the panic/cancel signal is the only
+/// thing the join reports. Awaiting a finished task's handle resolves
+/// immediately (its output is already stored), so the reap never suspends
+/// the accept loop.
+async fn reap_finished_connections(
+    connections: &mut Vec<(InstanceId, tokio::task::JoinHandle<()>)>,
+) {
+    let mut index = 0;
+    while index < connections.len() {
+        if connections[index].1.is_finished() {
+            let (site_id, connection) = connections.swap_remove(index);
+            if let Err(error) = connection.await {
+                tracing::error!("the center connection task for site {site_id} failed: {error}");
+            }
+        } else {
+            index += 1;
         }
     }
 }
@@ -1260,7 +1317,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::standalone_runtime::{AUDIT_GLOBALS_TEST_LOCK, reset_audit_globals};
+    use crate::standalone_runtime::{
+        AUDIT_GLOBALS_TEST_LOCK, capture_warn_diagnostics, captured_text,
+        queue_audit_compensation_events, reset_audit_globals, wait_for_in_flight_drain_event,
+    };
 
     /// Probes one free port on the given host and returns it.
     async fn free_port(host: Ipv4Addr) -> io::Result<u16> {
@@ -2100,6 +2160,166 @@ mod tests {
             [event],
             "the queued terminal fact is durably persisted by the center drain"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_center_shutdown_requeue_from_the_background_drain_reaches_the_final_drain()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W8-C-1: the center shutdown path joins the background
+        // compensation drain BEFORE the bounded final drain, the W7-C-4
+        // discipline of the Edge postures. The stop signal cannot interrupt
+        // an in-flight drain pass, so an append that fails during the
+        // shutdown is requeued by that pass; joining first lets every such
+        // requeue land in the queue, and the final drain then applies its
+        // budget to it. The observable is the final drain's
+        // budget-exhausted warning with `remaining=2`: both queued events
+        // must reach the final drain. Under the reversed pre-fix order the
+        // final drain ran first, exhausted its budget against the one event
+        // already in the queue, and the drain task's in-flight requeue
+        // landed only after it — the warning reported `remaining=1` and the
+        // requeued event bypassed the final drain's budget entirely.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let binding = bind_console(&paths).await?;
+        let acceptor = bind_acceptor(&paths).await?;
+        let gateway = Arc::new(RedfishGateway::from_system_roots().await?);
+
+        let now = OffsetDateTime::now_utc();
+        let first = AuditEvent::started(audit_context()?, now);
+        let second = AuditEvent::started(audit_context()?, now + Duration::seconds(1));
+        queue_audit_compensation_events(&[first.clone(), second.clone()])?;
+
+        // Hold the store's write gate so the drain's first pass blocks with
+        // the first event in flight — the stop signal cannot interrupt it.
+        let gate_permit = state.store.acquire_write_gate().await?;
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = stop_receiver.await;
+            Ok::<(), io::Error>(())
+        };
+        let runtime = tokio::spawn(run_center_services(
+            Arc::clone(&state),
+            binding,
+            acceptor,
+            gateway,
+            stop,
+        ));
+
+        // Wait deterministically for the drain task to have popped the
+        // first event and blocked on the gate: the queue then holds exactly
+        // the second event.
+        wait_for_in_flight_drain_event(&second).await?;
+
+        // Sabotage the store underneath the in-flight append: every append
+        // now fails with a transient database condition, so the in-flight
+        // pass fails and requeues its events during the shutdown.
+        let writer = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(paths.database_path())
+                .create_if_missing(false),
+        )
+        .await?;
+        sea_orm::sqlx::query("DROP TABLE audit_events")
+            .execute(&writer)
+            .await?;
+        writer.close().await;
+
+        let (dispatch, buffer) = capture_warn_diagnostics();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        stop_sender
+            .send(())
+            .map_err(|()| io::Error::other("the test stop receiver was dropped"))?;
+        // Hold the gate for longer than the final drain's budget: the drain
+        // task's in-flight append can only fail (and requeue the first
+        // event) once the gate is released, and the shutdown path joins the
+        // drain task first — so both events are in the queue when the final
+        // drain starts, and its budget-exhausted warning reports
+        // `remaining=2`. Under the pre-fix order the final drain ran before
+        // the join and exhausted its 2-second budget while the first event
+        // was still in flight on the gate — `remaining=1`.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        drop(gate_permit);
+        drop(state);
+        let result = runtime
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+        assert!(
+            result.is_ok(),
+            "the shutdown run must complete, got: {result:?}"
+        );
+        let captured = captured_text(&buffer)?;
+        assert!(
+            captured.contains("remaining=2"),
+            "both requeued events must reach the bounded final drain (remaining=2), captured: \
+             {captured}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_accept_loop_reaping_keeps_the_connection_tracking_bounded()
+    -> Result<(), Box<dyn Error>> {
+        // W8-P-5: finished connection handles are reaped as new connections
+        // are accepted, so the accept loop's tracking Vec stays bounded by
+        // the number of concurrent connections instead of accumulating one
+        // handle per accepted connection for the whole run — a site
+        // reconnecting on a fixed cadence (the W7-C-2 generation guard
+        // legitimizes fast reconnects) can no longer grow the Vec without
+        // bound. The reap observes the outcome exactly like the shutdown
+        // join: a `JoinError` (a panic or a cancel) is logged with the site
+        // id, so no observability is lost to the reap.
+        let subscriber = CaptureSubscriber::new();
+        let captured = subscriber.clone();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut connections: Vec<(InstanceId, tokio::task::JoinHandle<()>)> = Vec::new();
+        let finished = tokio::spawn(async {});
+        let aborted = tokio::spawn(async { std::future::pending::<()>().await });
+        let running =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_hours(1)).await });
+        // The abort happens before the handle is pushed; the handle in the
+        // Vec then observes the cancellation as a finished task.
+        aborted.abort();
+        let finished_site = InstanceId::generate();
+        let aborted_site = InstanceId::generate();
+        let running_site = InstanceId::generate();
+        connections.push((finished_site, finished));
+        connections.push((aborted_site, aborted));
+        connections.push((running_site, running));
+        // Let the finished and aborted tasks actually complete, so the reap
+        // sees both as finished.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        reap_finished_connections(&mut connections).await;
+        assert_eq!(
+            connections.len(),
+            1,
+            "the finished and aborted handles must be reaped; only the still-running \
+             connection remains"
+        );
+        assert_eq!(
+            connections[0].0, running_site,
+            "the survivor is the still-running connection"
+        );
+        assert!(
+            captured
+                .captured()
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::ERROR
+                    && message.contains(&aborted_site.to_string())),
+            "the aborted task's JoinError is logged with its site id, exactly like the \
+             shutdown join would"
+        );
+        // The shutdown join would now await the survivor; the test cancels
+        // it through the same handle instead.
+        if let Some((_, survivor)) = connections.pop() {
+            survivor.abort();
+        }
         Ok(())
     }
 }

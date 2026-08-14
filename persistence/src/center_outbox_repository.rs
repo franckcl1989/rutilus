@@ -487,7 +487,11 @@ impl SqliteStore {
             }
             // The backfill is a write, so it runs under the write gate like
             // every other queue write; it cannot deadlock — no caller of
-            // this read holds the gate.
+            // this read holds the *write gate* while awaiting the read.
+            // (The center dispatch does call this read inside its per-site
+            // dispatch gate, R6-C-1, but that is a separate lock, held
+            // only for the duration of one dispatch, never across a
+            // write-gate acquisition by the same task.)
             let _write_permit = self
                 .write_gate
                 .acquire()
@@ -586,7 +590,11 @@ impl SqliteStore {
             }
             // The backfill is a write, so it runs under the write gate like
             // every other queue write; it cannot deadlock — no caller of
-            // this read holds the gate.
+            // this read holds the *write gate* while awaiting the read.
+            // (The center dispatch calls the cross-instance read inside
+            // its per-site dispatch gate, R6-C-1 — a separate lock held
+            // for one dispatch, never across a write-gate acquisition by
+            // the same task.)
             let _write_permit = self
                 .write_gate
                 .acquire()

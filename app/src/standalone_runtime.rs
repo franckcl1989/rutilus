@@ -502,7 +502,23 @@ impl AuditEventQuery for StandaloneState {
             // before any await.
             if let Ok(tail) = self.audit_tail.lock() {
                 let take = usize::try_from(limit.get()).map_err(|_| StandaloneAuditTailError)?;
-                return Ok(tail.iter().rev().take(take).cloned().collect());
+                // W8-D-2: the tail's insertion order is the mirror's append
+                // order, which can diverge from the store's canonical order
+                // (`occurred_at DESC, event_sequence DESC, id DESC`): a
+                // concurrently committed event can sit behind an older one,
+                // and an event sharing its `occurred_at` with the group's
+                // last entry is always pushed at the group's end regardless
+                // of its sequence. The query normalizes the tail to the
+                // canonical order before serving, so the offset==0 page and
+                // the store-backed offset>0 pages agree on every page
+                // boundary — no cross-page repeats, omissions, or time
+                // reversals. The tail is bounded ([`AUDIT_TAIL_EVENTS`]), so
+                // the sort cost is bounded, and a tail that already holds
+                // the canonical order (the warm-up's) sorts back to itself
+                // unchanged (an idempotent sort).
+                let mut events: Vec<AuditEvent> = tail.iter().cloned().collect();
+                events.sort_by(canonical_audit_tail_order);
+                return Ok(events.into_iter().rev().take(take).collect());
             }
             // V5A-6: the in-memory tail cache is broken (a poisoned lock —
             // `std::sync::Mutex` poisoning is permanent, so a mirror retry
@@ -555,6 +571,26 @@ impl AuditEventQuery for StandaloneState {
     }
 }
 
+/// The ascending mirror of the store's canonical audit listing order —
+/// the store lists newest first by `ORDER BY occurred_at DESC,
+/// event_sequence DESC, id DESC` (W7-D-1), so this comparator orders
+/// oldest first by `(occurred_at ASC, event_sequence ASC, id ASC)`.
+///
+/// The in-memory tail's insertion order is the mirror's append order,
+/// which can diverge from the store's canonical order (W8-D-2): a
+/// concurrently committed event can sit behind an older one, and an event
+/// sharing its `occurred_at` with the group's last entry is always pushed
+/// at the group's end regardless of its sequence. The tail query sorts by
+/// this comparator before serving, so the offset==0 view and the
+/// store-backed offset>0 pages agree event for event on every page
+/// boundary.
+fn canonical_audit_tail_order(left: &AuditEvent, right: &AuditEvent) -> std::cmp::Ordering {
+    left.occurred_at()
+        .cmp(&right.occurred_at())
+        .then_with(|| left.sequence().cmp(&right.sequence()))
+        .then_with(|| left.id().cmp(&right.id()))
+}
+
 impl StandaloneState {
     /// Warms the bounded in-memory audit tail from the store's newest
     /// persisted events (V5A-2), so the console's audit query sees the
@@ -602,6 +638,11 @@ impl StandaloneState {
     /// A mirror failure is warned about, never fatal: the event is already
     /// persisted, and the console query falls back to the store while the
     /// tail cache is broken (V5A-6).
+    ///
+    /// The mirror's insertion order is the append order, not the store's
+    /// canonical order — that divergence is normalized on the query side
+    /// (see [`canonical_audit_tail_order`]), so the mirror never needs to
+    /// re-sort the tail.
     fn mirror_audit_event_to_tail(&self, event: &AuditEvent) {
         match self.audit_tail.lock() {
             Ok(mut tail) => {
@@ -2996,7 +3037,10 @@ pub enum StandaloneExecutionError {
 // as `crate::standalone_runtime::…` in test builds without widening their
 // production visibility.
 #[cfg(test)]
-pub(crate) use tests::{AUDIT_GLOBALS_TEST_LOCK, reset_audit_globals};
+pub(crate) use tests::{
+    AUDIT_GLOBALS_TEST_LOCK, capture_warn_diagnostics, captured_text,
+    queue_audit_compensation_events, reset_audit_globals, wait_for_in_flight_drain_event,
+};
 
 #[cfg(test)]
 mod tests {
@@ -3034,6 +3078,19 @@ mod tests {
     /// same lock the standalone audit tests hold.
     pub(crate) static AUDIT_GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    /// Queues the given events into the process-wide compensation queue for
+    /// a shutdown-order test (W8-C-1): the caller must hold
+    /// [`AUDIT_GLOBALS_TEST_LOCK`] like every audit test, and the queue was
+    /// cleared by `reset_audit_globals` first.
+    pub(crate) fn queue_audit_compensation_events(events: &[AuditEvent]) -> Result<(), io::Error> {
+        let mut queue = AUDIT_COMPENSATION
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .map_err(|_| io::Error::other("the compensation queue is poisoned"))?;
+        queue.extend(events.iter().cloned());
+        Ok(())
+    }
 
     /// The tests share the process-wide audit compensation queue and the
     /// warm-up flag exactly like the production runtime does, so each test
@@ -4469,11 +4526,18 @@ mod tests {
     /// Builds a WARN-level capturing subscriber pair for the degradation and
     /// shutdown assertions: the `Dispatch` to install on the test thread and
     /// the buffer it appends into.
-    fn capture_warn_diagnostics() -> (tracing::Dispatch, Arc<Mutex<Vec<u8>>>) {
+    ///
+    /// `pub(crate)` for the center runtime's shutdown-order test (W8-C-1):
+    /// it asserts the same budget-exhausted warning the Edge tests assert.
+    /// ANSI styling is disabled so the captured text is the plain rendered
+    /// text — the field assertions (for example the final drain's
+    /// `remaining=2`) compare against the literal text.
+    pub(crate) fn capture_warn_diagnostics() -> (tracing::Dispatch, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let writer_buffer = Arc::clone(&buffer);
         let dispatch = tracing::Dispatch::new(
             tracing_subscriber::fmt()
+                .with_ansi(false)
                 .with_max_level(tracing::Level::WARN)
                 .with_writer(move || CaptureWriter(Arc::clone(&writer_buffer)))
                 .finish(),
@@ -4482,7 +4546,9 @@ mod tests {
     }
 
     /// The captured diagnostics' text.
-    fn captured_text(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<String, Box<dyn Error>> {
+    ///
+    /// `pub(crate)` for the center runtime's shutdown-order test (W8-C-1).
+    pub(crate) fn captured_text(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<String, Box<dyn Error>> {
         String::from_utf8(
             buffer
                 .lock()
@@ -4495,7 +4561,12 @@ mod tests {
     /// Waits until the compensation queue holds exactly `event` — the drain
     /// task has popped everything queued before it and blocked with its
     /// append in flight (the write gate the test holds).
-    async fn wait_for_in_flight_drain_event(event: &AuditEvent) -> Result<(), Box<dyn Error>> {
+    ///
+    /// `pub(crate)` for the center runtime's shutdown-order test (W8-C-1),
+    /// which pins the center's drain task the same way.
+    pub(crate) async fn wait_for_in_flight_drain_event(
+        event: &AuditEvent,
+    ) -> Result<(), Box<dyn Error>> {
         let mut waits = 0;
         loop {
             let in_flight = {
@@ -4639,6 +4710,98 @@ mod tests {
             AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?,
             [succeeded.clone(), progressed.clone(), started.clone()],
             "the healed event must join the console tail at its time position"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_tail_query_serves_the_canonical_order_across_a_mirror_divergence()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W8-D-2: the tail's insertion order is the append order, so a
+        // concurrently committed event can sit behind an older one — the
+        // mirror pushed the older event last, yet the query must still
+        // serve the store's canonical newest-first order
+        // (`occurred_at DESC`).
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        let now = OffsetDateTime::now_utc();
+        let newer = AuditEvent::started(import_context()?, now + Duration::from_secs(1));
+        let older = AuditEvent::started(import_context()?, now);
+        // The older event is appended after the newer one, so the tail's
+        // append order is [newer, older] — the reverse of the store's
+        // canonical order.
+        instance.state().append_audit_event(&newer).await?;
+        instance.state().append_audit_event(&older).await?;
+        assert_eq!(
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?,
+            [newer.clone(), older.clone()],
+            "the tail query must serve the canonical newest-first order even when the older \
+             event was mirrored last"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_tail_query_matches_the_store_within_a_shared_occurred_at_group()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W8-D-2: within an equal-`occurred_at` group, the mirror always
+        // pushes the newest event at the group's end regardless of its
+        // sequence, while the store orders the group by
+        // `event_sequence DESC, id DESC`. The tail query normalizes to the
+        // store's canonical order, so the offset==0 view must equal the
+        // store's first page event for event — the id tiebreak included.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        let now = OffsetDateTime::now_utc();
+        let context_a = import_context()?;
+        let context_b = import_context()?;
+        // Operation A starts and progresses at the same instant; operation
+        // B starts at that same instant. The group (occurred_at = now)
+        // holds three events with sequences 1, 2, 1.
+        let started_a = AuditEvent::started(context_a.clone(), now);
+        let progressed = AuditEvent::progress(
+            context_a,
+            AuditSequence::FIRST.next()?,
+            AuditProgress::RowValidated,
+            now,
+        )?;
+        let started_b = AuditEvent::started(context_b, now);
+        instance.state().append_audit_event(&started_a).await?;
+        instance.state().append_audit_event(&progressed).await?;
+        instance.state().append_audit_event(&started_b).await?;
+
+        let limit = audit_query_limit()?;
+        let via_tail = AuditEventQuery::list_recent_events(&*instance.state(), limit).await?;
+        let via_store = instance
+            .state()
+            .store
+            .list_recent_audit_events(limit.get(), 0)
+            .await?;
+        assert_eq!(
+            via_tail, via_store,
+            "the tail view must match the store's canonical order event for event, including \
+             the sequence and id tiebreaks within the shared occurred_at group"
+        );
+        assert_eq!(
+            via_tail.first().map(AuditEvent::id),
+            Some(progressed.id()),
+            "the group's sequence-2 event must lead the equal-occurred_at group in both views"
         );
         instance.close().await?;
         drop(directory);

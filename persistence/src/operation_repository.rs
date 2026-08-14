@@ -9,8 +9,8 @@ use rutilus_security::{
     encrypt_command,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel, JoinType,
+    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -18,6 +18,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::SqliteStore;
+
+/// How many operation ids one IN parameter list carries at most (W8-P-1).
+///
+/// The bound sits far below the bundled `SQLite` variable limit
+/// (`SQLITE_MAX_VARIABLE_NUMBER`, 32766), so the id list of an unbounded
+/// endpoint-history scan can never overflow the query and fail the
+/// endpoint's dispatch permanently.
+const IN_PARAMETER_CHUNK: usize = 999;
 
 impl SqliteStore {
     /// Atomically persists one operation and all of its targets.
@@ -626,16 +634,27 @@ impl SqliteStore {
     /// decrypted the whole global operation table. This read drives the
     /// SQL through the endpoint index (`ix_operation_targets_endpoint`)
     /// first: the endpoint's operation ids, then the operations by id, so
-    /// only the endpoint's own rows are fetched and decrypted; the state
-    /// filter is then a residual predicate over that bounded set.
+    /// only the endpoint's own rows are fetched and decrypted.
+    ///
+    /// The scan's id set and its IN parameters are bounded by the scan's
+    /// own question (W8-P-1): the state filter rides into the id query as
+    /// a JOIN with the operations table, so a state-scoped scan's id set
+    /// is that state's operations on the endpoint — never the endpoint's
+    /// full history of terminal rows, which the table never prunes — and
+    /// the id list is then chunked into IN parameters far below the
+    /// bundled `SQLite` variable limit (`32766`), so even the unbounded
+    /// state-less listing of a pathological endpoint history can never
+    /// overflow it. The state filter stays on the row query as a residual
+    /// predicate over the bounded set.
     ///
     /// An operation whose *any* target names the endpoint is returned
     /// (once, whether one or several of its targets do — the deduplication
     /// mirrors the target-identity join of the aggregate), in the same
-    /// acceptance order as [`Self::list_operations`]. The dispatch's
-    /// in-memory first-target check remains the authoritative candidate
-    /// filter; the two agree on the single-target center-sourced
-    /// operations the scan is built for.
+    /// acceptance order as [`Self::list_operations`] (the chunked row
+    /// reads concatenate; the final sort restores the deterministic
+    /// order). The dispatch's in-memory first-target check remains the
+    /// authoritative candidate filter; the two agree on the single-target
+    /// center-sourced operations the scan is built for.
     ///
     /// # Errors
     ///
@@ -651,15 +670,36 @@ impl SqliteStore {
             .begin()
             .await
             .map_err(OperationRepositoryError::Database)?;
-        let ids = operation_target::Entity::find()
-            .filter(operation_target::Column::EndpointId.eq(endpoint_id.into_uuid()))
-            .select_only()
-            .column(operation_target::Column::OperationId)
-            .into_tuple::<(Uuid,)>()
-            .all(&transaction)
-            .await
-            .map_err(OperationRepositoryError::Database)?;
-        let mut ids = ids.into_iter().map(|(id,)| id).collect::<Vec<_>>();
+        let mut ids: Vec<Uuid> = if let Some(state) = state {
+            operation_target::Entity::find()
+                .join(
+                    JoinType::InnerJoin,
+                    operation_target::Relation::Operation.def(),
+                )
+                .filter(operation_target::Column::EndpointId.eq(endpoint_id.into_uuid()))
+                .filter(operation::Column::State.eq(state.as_str()))
+                .select_only()
+                .column(operation_target::Column::OperationId)
+                .into_tuple::<(Uuid,)>()
+                .all(&transaction)
+                .await
+                .map_err(OperationRepositoryError::Database)?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect()
+        } else {
+            operation_target::Entity::find()
+                .filter(operation_target::Column::EndpointId.eq(endpoint_id.into_uuid()))
+                .select_only()
+                .column(operation_target::Column::OperationId)
+                .into_tuple::<(Uuid,)>()
+                .all(&transaction)
+                .await
+                .map_err(OperationRepositoryError::Database)?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect()
+        };
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
@@ -669,16 +709,32 @@ impl SqliteStore {
                 .map_err(OperationRepositoryError::Database)?;
             return Ok(Vec::new());
         }
-        let mut query = operation::Entity::find().filter(operation::Column::Id.is_in(ids));
-        if let Some(state) = state {
-            query = query.filter(operation::Column::State.eq(state.as_str()));
+        let mut models = Vec::with_capacity(ids.len());
+        // The chunk bound sits far below SQLite's 32766-variable limit
+        // (`SQLITE_MAX_VARIABLE_NUMBER`), so the IN list can never overflow
+        // it no matter how large the endpoint history is.
+        for chunk in ids.chunks(IN_PARAMETER_CHUNK) {
+            let mut query =
+                operation::Entity::find().filter(operation::Column::Id.is_in(chunk.to_vec()));
+            if let Some(state) = state {
+                query = query.filter(operation::Column::State.eq(state.as_str()));
+            }
+            models.extend(
+                query
+                    .order_by_asc(operation::Column::CreatedAt)
+                    .order_by_asc(operation::Column::Id)
+                    .all(&transaction)
+                    .await
+                    .map_err(OperationRepositoryError::Database)?,
+            );
         }
-        let models = query
-            .order_by_asc(operation::Column::CreatedAt)
-            .order_by_asc(operation::Column::Id)
-            .all(&transaction)
-            .await
-            .map_err(OperationRepositoryError::Database)?;
+        // The per-chunk orderings concatenate; this sort restores the
+        // deterministic acceptance order of one full listing.
+        models.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let mut operations = Vec::with_capacity(models.len());
         for model in models {
             let operation_id = OperationId::from_uuid(model.id);
@@ -1730,6 +1786,132 @@ mod tests {
                 .await?
                 .is_empty(),
             "an endpoint with no operations scans as empty"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_operations_for_endpoint_bounds_the_id_set_by_state_and_chunks_the_in_list()
+    -> Result<(), Box<dyn Error>> {
+        // W8-P-1: the scan's id set and its IN parameters must be bounded
+        // by the scan's own question — the endpoint's *in-flight* rows of
+        // the queried state — never by the endpoint's full history, whose
+        // terminal rows accumulate forever (the table is never pruned).
+        // The state filter rides into the id query as a JOIN, and the IN
+        // list is chunked, so a state-less listing of a history larger
+        // than one chunk still reads correctly instead of overflowing the
+        // bundled SQLite variable limit (32766) and failing the endpoint's
+        // dispatch permanently.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let endpoint_a = EndpointId::generate();
+        let endpoint_b = EndpointId::generate();
+        let command_json = serde_json::to_string(&one_command())?;
+        // Rows are written straight to the tables in one transaction —
+        // legacy plaintext commands, read back exactly like pre-encryption
+        // rows — so the history can cross the IN chunk bound cheaply.
+        let operation_row =
+            |id: Uuid, state: &str, created_at: OffsetDateTime| operation::ActiveModel {
+                id: Set(id),
+                source: Set(String::from("center")),
+                state: Set(state.to_owned()),
+                command: Set(command_json.clone()),
+                batch_id: Set(None),
+                failure_kind: Set(None),
+                created_at: Set(created_at),
+                updated_at: Set(created_at),
+            };
+        let target_row =
+            |operation_id: Uuid, endpoint_id: EndpointId| operation_target::ActiveModel {
+                operation_id: Set(operation_id),
+                target_id: Set(TargetId::generate().into_uuid()),
+                endpoint_id: Set(endpoint_id.into_uuid()),
+            };
+        let mut operations = Vec::new();
+        let mut targets = Vec::new();
+        for index in 0..1005 {
+            let id = OperationId::generate().into_uuid();
+            operations.push(operation_row(
+                id,
+                "succeeded",
+                base + Duration::SECOND * index,
+            ));
+            targets.push(target_row(id, endpoint_a));
+        }
+        for (index, endpoint) in [(2000, endpoint_a), (2001, endpoint_b)] {
+            let id = OperationId::generate().into_uuid();
+            operations.push(operation_row(id, "queued", base + Duration::SECOND * index));
+            targets.push(target_row(id, endpoint));
+        }
+        // A multi-target candidate of endpoint A: one operation row, two
+        // target rows — returned once, never duplicated, whether the JOIN
+        // sees one target row or two.
+        let multi_id = OperationId::generate().into_uuid();
+        operations.push(operation_row(
+            multi_id,
+            "queued",
+            base + Duration::SECOND * 2002,
+        ));
+        for _ in 0..2 {
+            targets.push(target_row(multi_id, endpoint_a));
+        }
+        let transaction = store.database.begin().await?;
+        for row in &operations {
+            row.clone().insert(&transaction).await?;
+        }
+        for row in &targets {
+            row.clone().insert(&transaction).await?;
+        }
+        transaction.commit().await?;
+
+        // The state-scoped scan carries only that state's ids: the 1005
+        // terminal rows never enter the id set or the IN list.
+        let queued = store
+            .list_operations_for_endpoint(Some(OperationState::Queued), endpoint_a)
+            .await?;
+        assert_eq!(
+            queued.len(),
+            2,
+            "the state-scoped scan returns only the endpoint's queued operations"
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|operation| operation.id() == OperationId::from_uuid(multi_id)),
+            "the multi-target candidate is returned once"
+        );
+
+        // The state-less listing crosses the IN chunk boundary (1005 ids
+        // in the first chunk, 1007 total) and still returns every
+        // operation once, in acceptance order.
+        let full = store.list_operations_for_endpoint(None, endpoint_a).await?;
+        assert_eq!(
+            full.len(),
+            1007,
+            "every history row plus the candidates, deduplicated once per operation"
+        );
+        assert!(
+            full.windows(2).all(|pair| {
+                let (a, b) = (&pair[0], &pair[1]);
+                (a.created_at(), a.id()) <= (b.created_at(), b.id())
+            }),
+            "the chunked listing restores the deterministic acceptance order"
+        );
+        assert!(
+            store
+                .list_operations_for_endpoint(Some(OperationState::Queued), endpoint_b)
+                .await?
+                .iter()
+                .all(|operation| {
+                    operation
+                        .targets()
+                        .first()
+                        .is_some_and(|target| target.endpoint_id() == endpoint_b)
+                }),
+            "endpoint B's scan still never sees endpoint A's rows"
         );
 
         store.close().await?;

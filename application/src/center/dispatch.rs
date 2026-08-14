@@ -436,14 +436,19 @@ where
     ///   offer for a different target is a different operation on the same
     ///   endpoint and command, and the retry starts fresh below; a record
     ///   the directed read does not know at all was never enqueued, and a
-    ///   fresh id cannot double-execute anything. The repair for the
-    ///   offerless record alone runs only for a single candidate, where no
-    ///   other operation could own the retry — and the same directed-read
-    ///   judgment governs the single candidate, so a different-target
-    ///   dispatch is never blind-merged into its id (F1, W3F-1) and an
-    ///   in-flight or scan-truncated offer returns in flight or
-    ///   re-delivers under the same id exactly like the multi-candidate
-    ///   path (W3F-5).
+    ///   fresh id cannot double-execute anything. The directed read
+    ///   addresses every instance's queue (W8-E-2): the endpoint can be
+    ///   re-homed while the dispatch is undecided, and the offer in the
+    ///   original site's queue is in flight — the retry returns the
+    ///   existing operation instead of re-delivering the same id to the
+    ///   new site, which would execute the same physical write twice. The
+    ///   repair for the offerless record alone runs only for a single
+    ///   candidate, where no other operation could own the retry — and the
+    ///   same cross-instance directed-read judgment governs the single
+    ///   candidate, so a different-target dispatch is never blind-merged
+    ///   into its id (F1, W3F-1) and an in-flight or scan-truncated offer
+    ///   returns in flight or re-delivers under the same id exactly like
+    ///   the multi-candidate path (W3F-5).
     ///
     /// The tracking scan queries every candidate state scoped to the
     /// endpoint (W7-P-1: the SQL rides the endpoint index first, so the
@@ -528,9 +533,18 @@ where
             {
                 return Ok(Some(dispatched));
             }
+            // W8-E-2: the never-enqueued judgment itself is cross-instance.
+            // `resolve_candidate` returned `None` either because no
+            // instance's queue knows the operation or because its newest
+            // offer targets a different resource; an offer *anywhere*
+            // (this site's queue, or another site's queue after a re-home)
+            // proves the id was already delivered for a different key and
+            // must not be reused — the retry starts fresh below. Only an
+            // id no instance's queue knows at all was never enqueued, and
+            // its stranded offer is delivered now.
             if self
                 .outbox
-                .find_offer_by_operation(request.site_id, operation_id)
+                .find_offer_by_operation_across_instances(request.site_id, operation_id)
                 .await
                 .map_err(CenterDispatchError::Outbox)?
                 .is_some()
@@ -551,12 +565,14 @@ where
         // [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] and skips the acknowledged
         // rows, so each candidate it cannot see is resolved through the
         // directed read over the plaintext `operation_id` column (R6-E-04)
-        // — one row per candidate, never a scan of the site's whole queue.
-        // A retry must never mint a fresh id for a delivered operation:
-        // the id is the §17.5 key, so the directed read is the honest
-        // fall-through — a fall-through that hid a delivered operation's
-        // offers would start fresh under a new id and double-execute the
-        // write at the site.
+        // — one row per candidate, never a scan of the site's whole queue;
+        // the read addresses every instance's queue (W8-E-2), so an offer
+        // left in the original site's queue after a re-home resolves as in
+        // flight. A retry must never mint a fresh id for a delivered
+        // operation: the id is the §17.5 key, so the directed read is the
+        // honest fall-through — a fall-through that hid a delivered
+        // operation's offers would start fresh under a new id and
+        // double-execute the write at the site.
         for operation_id in candidates {
             if let Some(dispatched) = self
                 .resolve_candidate(request, operation_id, &facts, now)
@@ -586,11 +602,14 @@ where
     /// may have been lost — re-delivered under the same id, or returned in
     /// flight, so the site's §17.5 idempotency still binds — and a pending
     /// offer beyond the scan's limit is the truncation case, resolved
-    /// exactly like the pending scan would. A candidate neither source
-    /// knows was never enqueued: nothing was ever delivered for it, so the
-    /// fresh start below cannot double-execute anything (the single-
-    /// candidate repair in `find_undecided` is the repair path for such a
-    /// record alone).
+    /// exactly like the pending scan would. The directed read addresses
+    /// every instance's queue (W8-E-2): after an endpoint re-home the
+    /// undecided offer lives in the original site's queue, and it is in
+    /// flight for the retry, never a never-enqueued record. A candidate
+    /// neither source knows — in no instance's queue — was never enqueued:
+    /// nothing was ever delivered for it, so the fresh start below cannot
+    /// double-execute anything (the single-candidate repair in
+    /// `find_undecided` is the repair path for such a record alone).
     async fn resolve_candidate(
         &self,
         request: &CenterOperationRequest,
@@ -606,12 +625,19 @@ where
         // the newest durable row of the operation, one row instead of a
         // scan of the site's whole queue (the pre-migration rows are
         // backfilled by the read itself).
+        //
+        // W8-E-2: the directed lookup addresses *every* instance's queue.
+        // An endpoint can be re-homed while the dispatch is undecided, and
+        // an offer in the original site's queue is in flight — the per-site
+        // read would see no row on the new site, judge the record
+        // never-enqueued, and re-deliver the same operation to the new
+        // site, executing the same physical write twice.
         let mut directed: Option<OfferFact> = None;
         let mut newest = rows.iter().copied().max_by_key(|fact| fact.sequence);
         if newest.is_none()
             && let Some(entry) = self
                 .outbox
-                .find_offer_by_operation(request.site_id, operation_id)
+                .find_offer_by_operation_across_instances(request.site_id, operation_id)
                 .await
                 .map_err(CenterDispatchError::Outbox)?
         {
@@ -621,9 +647,14 @@ where
         let Some(newest) = newest else {
             return Ok(None);
         };
-        if newest.target != request.target_odata_id.as_str() {
+        if canonical_target_key(&newest.target)
+            != canonical_target_key(request.target_odata_id.as_str())
+        {
             // A different operation on the same endpoint and command;
-            // the retry of this request starts fresh below.
+            // the retry of this request starts fresh below. Both sides
+            // run through the same target normalization (W8-F-2), so a
+            // spelling variant of the same URI never looks like a
+            // different operation.
             return Ok(None);
         }
         if now > newest.expires_at {
@@ -668,9 +699,11 @@ where
     /// silently unblock the re-homed retry, double-executing the same
     /// physical BMC write. A confirmed offer whose target disagrees with
     /// the request (W7-F-3) is a different operation on the same endpoint
-    /// and command, and its dispatch starts fresh below. The newest row
-    /// per operation survives the ack-time pruning, so the confirmation
-    /// is the directed read.
+    /// and command, and its dispatch starts fresh below; the target
+    /// comparison runs both sides through the shared URI normalization
+    /// (W8-F-2), so a spelling variant of the same target cannot bypass
+    /// the refusal. The newest row per operation survives the ack-time
+    /// pruning, so the confirmation is the directed read.
     async fn find_unknown_outcome(
         &self,
         request: &CenterOperationRequest,
@@ -704,10 +737,13 @@ where
             // W7-F-3: the offer's target is the dispatch key's target —
             // an `Unknown` outcome on another target is a different
             // operation on the same endpoint and command, and its
-            // dispatch starts fresh below.
-            if offer_facts(&entry)
-                .is_some_and(|fact| fact.target == request.target_odata_id.as_str())
-            {
+            // dispatch starts fresh below. Both sides run through the
+            // same target normalization (W8-F-2), so a spelling variant
+            // of the same URI cannot bypass the `Unknown` refusal.
+            if offer_facts(&entry).is_some_and(|fact| {
+                canonical_target_key(&fact.target)
+                    == canonical_target_key(request.target_odata_id.as_str())
+            }) {
                 return Ok(Some(operation.id()));
             }
         }
@@ -777,6 +813,60 @@ struct OfferFact {
     expires_at: OffsetDateTime,
     entry_id: OutboxEntryId,
     sequence: i64,
+}
+
+/// The dispatch-key normalization of a Redfish target URI (W8-F-2).
+///
+/// The §15.6 idempotency gates and the §13.5 `Unknown` refusal compare the
+/// request's target against the stored offer facts. Redfish URIs are
+/// case-insensitive (DSP0266), a trailing slash is insignificant, and a
+/// `%xx` escape is the literal character (RFC 3986: the hex digits are
+/// case-insensitive and an unreserved escape is equivalent to its
+/// literal), so a spelling variant must not sidestep the double-execution
+/// gate. The key percent-decodes first (an invalid escape stays literal),
+/// then lowercases ASCII, then strips every trailing slash. Internal
+/// whitespace is preserved — after decoding, `%20` and a literal space
+/// converge to the same key and no other space spelling is legal (RFC
+/// 3986 allows no bare whitespace in a URI).
+///
+/// The offer payload stores the request's target verbatim — the wire
+/// format is shared with the site and is not normalized — and every
+/// comparison runs both operands through this one function, so a stored
+/// row always compares equal to the request that produced it, including
+/// legacy rows written before this fix.
+fn canonical_target_key(target: &str) -> String {
+    let bytes = target.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    let mut key = String::from_utf8_lossy(&decoded).into_owned();
+    key.make_ascii_lowercase();
+    while key.ends_with('/') {
+        key.pop();
+    }
+    key
+}
+
+/// The value of one ASCII hex digit, or `None` for every other byte.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The §15.6 offer facts of one outbox entry: `Some(facts)` for an offer
@@ -2069,29 +2159,35 @@ mod tests {
             // W7-E-3: the production store's cross-instance read finds the
             // offer in *any* instance's queue — the mock mirrors that by
             // scanning every entry regardless of its instance.
+            //
+            // W8-E-4: the mock mirrors the production semantics exactly.
+            // The production read returns the newest row by (creation
+            // time, id) — never the oldest, which would misreport a
+            // retired row as the offer of record — and a row whose payload
+            // cannot be decoded is an error (fail closed, like the
+            // production `Corrupt` refusal) instead of a skipped row, so
+            // the tests exercise the production fail direction.
             Box::pin(async move {
-                let mut rows = self
-                    .state
-                    .entries
-                    .lock()
-                    .map_err(|_| MockStoreError)?
-                    .iter()
-                    .filter(|entry| {
-                        serde_json::from_str::<Envelope>(entry.payload_json())
-                            .ok()
-                            .and_then(|envelope| envelope.message)
-                            .is_some_and(|message| {
-                                matches!(
-                                    message,
-                                    EnvelopeMessage::OperationOffer(offer)
-                                        if offer.operation_id == operation_id.to_string()
-                                )
-                            })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                rows.sort_by_key(OutboxEntry::sequence);
-                Ok(rows.into_iter().next())
+                let rows = self.state.entries.lock().map_err(|_| MockStoreError)?;
+                let mut newest: Option<OutboxEntry> = None;
+                for entry in rows.iter() {
+                    let envelope: Envelope =
+                        serde_json::from_str(entry.payload_json()).map_err(|_| MockStoreError)?;
+                    let matches = match envelope.message {
+                        Some(EnvelopeMessage::OperationOffer(offer)) => {
+                            offer.operation_id == operation_id.to_string()
+                        }
+                        _ => false,
+                    };
+                    if matches
+                        && newest.as_ref().is_none_or(|current| {
+                            (entry.created_at(), entry.id()) > (current.created_at(), current.id())
+                        })
+                    {
+                        newest = Some(entry.clone());
+                    }
+                }
+                Ok(newest)
             })
         }
 
@@ -4477,6 +4573,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_re_homed_undecided_dispatch_returns_the_existing_operation_without_re_delivery()
+    -> Result<(), Box<dyn Error>> {
+        // W8-E-2: the W7-E-3 re-home gap applied to the undecided retry
+        // path. The idempotency scan finds the operation by endpoint
+        // (site-agnostic), but the single-candidate repair read addressed
+        // only the request site's queue — after the endpoint moved, the
+        // offer lives in the original site's queue, the repair read saw
+        // no row, judged the record "never enqueued", and re-delivered
+        // the same operation to the new site: a second execution of the
+        // same physical write. The repair reads now address every
+        // instance's queue: the cross-site offer is in flight, and the
+        // retry returns the existing operation without a new offer.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "the first dispatch enqueues one offer"
+        );
+
+        // The endpoint moves to site B while the operation is still
+        // undecided (no reply: the tracking record stays Queued).
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the re-homed retry must return the existing operation id"
+        );
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "no second offer may be delivered to the new site: the operation is in flight"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no fresh operation record may be minted for the re-homed retry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_re_homed_multi_candidate_dispatch_returns_the_existing_operation_without_re_delivery()
+    -> Result<(), Box<dyn Error>> {
+        // W8-E-2, multi-candidate variant: with two undecided operations
+        // on the endpoint, the fall-through loop resolves each candidate
+        // through the same cross-instance directed read, so the re-homed
+        // in-flight candidate is returned — never re-delivered under a
+        // fresh id.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Systems/2")));
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/2", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(state.offers_owned().len(), 2);
+
+        // The endpoint moves to site B; the retry of target 1 resolves
+        // through the cross-instance read even though the offer lives in
+        // site A's queue.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the multi-candidate fall-through must return the re-homed in-flight operation"
+        );
+        assert_eq!(
+            state.offers_owned().len(),
+            2,
+            "neither operation may be re-delivered to the new site"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "no fresh operation record may be minted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_re_homed_dispatch_with_an_expired_offer_re_delivers_under_the_same_id()
+    -> Result<(), Box<dyn Error>> {
+        // W8-E-2, TTL boundary: the cross-site in-flight judgment applies
+        // while the offer is actionable. Once the offer's §15.6 TTL
+        // passed, the retry retires the stale rows and delivers a fresh
+        // offer under the same id — the same §17.5 idempotency key, so
+        // the site can never execute it twice — exactly like the
+        // same-site expiry path.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + CENTER_OFFER_TTL + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the expired-offer retry re-delivers under the same operation id"
+        );
+        let offers = state.offers_owned();
+        assert_eq!(
+            offers.len(),
+            2,
+            "the stale offer is retired, one fresh offer delivered"
+        );
+        assert_eq!(
+            offers[1].site_id,
+            site_b.to_string(),
+            "the fresh offer is addressed to the re-homed site"
+        );
+        assert_eq!(
+            offers[0].site_id,
+            site_a.to_string(),
+            "the retired offer stays in the original site's queue as history"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_re_homed_different_target_dispatch_starts_fresh_instead_of_reusing_the_id()
+    -> Result<(), Box<dyn Error>> {
+        // W8-E-2, different-target variant: the never-enqueued judgment of
+        // the single-candidate repair is cross-instance too. An offer in
+        // the original site's queue proves the id was already delivered
+        // for a different resource — the retry of this target must start
+        // fresh under a new id, never re-deliver the old id (the pre-fix
+        // per-site check missed the cross-site row and reused the id for
+        // a different target).
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Systems/2")));
+        let other = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/2", actor)?,
+                now,
+            )
+            .await?;
+
+        // The endpoint moves to site B; the never-dispatched target 1 is
+        // retried. The candidate is the target-2 operation — its offer
+        // lives in site A's queue and targets a different resource — so
+        // the retry starts fresh instead of reusing the target-2 id.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_ne!(
+            retry.operation_id(),
+            other.operation_id(),
+            "the different-target retry must mint a fresh operation, never reuse the delivered id"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "the fresh dispatch records its own operation"
+        );
+        let offers = state.offers_owned();
+        assert_eq!(
+            offers.len(),
+            2,
+            "the original offer stays, the fresh dispatch enqueues its own"
+        );
+        assert_eq!(
+            offers[1].site_id,
+            site_b.to_string(),
+            "the fresh offer is addressed to the re-homed site"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_unknown_outcome_on_one_target_does_not_block_another_targets_dispatch()
     -> Result<(), Box<dyn Error>> {
         // W7-F-3: the R6-E-01 refusal is per dispatch key — a terminal
@@ -4547,6 +4886,255 @@ mod tests {
             state.operations.lock().map_err(|_| MockStoreError)?.len(),
             2,
             "the fresh dispatch records its own operation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spelling_variants_of_the_target_hit_the_undecided_idempotency_gate()
+    -> Result<(), Box<dyn Error>> {
+        // W8-F-2: the §15.6 idempotency gate compares the dispatch key's
+        // target. Redfish URIs are case-insensitive (DSP0266), a trailing
+        // slash is insignificant, and `%xx` escapes are their literals, so
+        // a spelling variant of the same URI must land on the same
+        // undecided operation — the pre-fix bare string comparison treated
+        // the variant as a different target, minted a fresh id, and
+        // double-executed the same physical write.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        for spelling in [
+            "/Redfish/v1/Systems/1/",
+            "/redfish/v1/Systems/%31",
+            "/redfish/v1/Systems/2",
+        ] {
+            state
+                .resources
+                .lock()
+                .map_err(|_| MockStoreError)?
+                .push((endpoint_id, spelling.to_owned()));
+        }
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        // A retry with the case and trailing-slash variant returns the
+        // existing operation; no second offer is enqueued.
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/Redfish/v1/Systems/1/", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the case and trailing-slash variant must hit the undecided gate"
+        );
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "the variant retry must not enqueue a second offer"
+        );
+
+        // The `%xx` escape variant is the same URI.
+        let escaped = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/%31", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            escaped.operation_id(),
+            first.operation_id(),
+            "the percent-escaped variant must hit the undecided gate"
+        );
+        assert_eq!(state.offers_owned().len(), 1);
+
+        // A genuinely different target is a different operation: fresh id.
+        let other = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/2", actor)?,
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_ne!(
+            other.operation_id(),
+            first.operation_id(),
+            "a different target is a different operation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spelling_variants_of_the_target_hit_the_unknown_outcome_refusal()
+    -> Result<(), Box<dyn Error>> {
+        // W8-F-2, `Unknown` side: the §13.5 refusal is the last gate
+        // against double execution — a spelling variant must not slip
+        // past it and dispatch a fresh operation against a write whose
+        // outcome is unproven.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        for spelling in ["/Redfish/v1/Systems/1/", "/redfish/v1/Systems/%31"] {
+            state
+                .resources
+                .lock()
+                .map_err(|_| MockStoreError)?
+                .push((endpoint_id, spelling.to_owned()));
+        }
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            first.operation_id(),
+            "unknown",
+            now + Duration::SECOND,
+        )
+        .await?;
+
+        for (label, spelling) in [
+            ("case and trailing-slash", "/Redfish/v1/Systems/1/"),
+            ("percent-escaped", "/redfish/v1/Systems/%31"),
+        ] {
+            let retry = dispatch
+                .dispatch(
+                    &request(site, endpoint_id, spelling, actor)?,
+                    now + Duration::seconds(2),
+                )
+                .await;
+            assert!(
+                matches!(
+                    retry,
+                    Err(CenterDispatchError::UnknownOutcomePending { operation_id })
+                        if operation_id == first.operation_id()
+                ),
+                "the {label} variant must hit the Unknown refusal with the existing operation id"
+            );
+        }
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "the refused variants enqueue nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_mock_cross_instance_read_matches_production_semantics()
+    -> Result<(), Box<dyn Error>> {
+        // W8-E-4: the mock cross-instance read must mirror the production
+        // read — the newest row by (creation time, id), and a row whose
+        // payload cannot be decoded fails the read closed (production
+        // reports `Corrupt` and the dispatch refuses with a 503) instead
+        // of being skipped, which would let the confirmation fail open in
+        // tests.
+        let (store, state) = MockDispatchStore::new();
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let operation_id = OperationId::generate();
+        let offer = |site: InstanceId, target: &str, expires_at_unix: i64| OperationOffer {
+            operation_id: operation_id.to_string(),
+            endpoint_id: String::from("endpoint-1"),
+            site_id: site.to_string(),
+            command_json: b"{}".to_vec(),
+            target: target.to_owned(),
+            expires_at_unix,
+            actor_context: String::from("principal-1"),
+        };
+        let older = store
+            .enqueue(
+                site_a,
+                &EnvelopeMessage::OperationOffer(offer(site_a, "/redfish/v1/Systems/1", 100)),
+                now,
+            )
+            .await?;
+        let newer = store
+            .enqueue(
+                site_b,
+                &EnvelopeMessage::OperationOffer(offer(site_b, "/redfish/v1/Systems/1", 200)),
+                now + Duration::SECOND,
+            )
+            .await?;
+        let found = store
+            .find_offer_by_operation_across_instances(site_a, operation_id)
+            .await?
+            .ok_or("the cross-instance read must find the matching offer")?;
+        assert_eq!(
+            found.id(),
+            newer.id(),
+            "the mock returns the newest row by creation time, exactly like production"
+        );
+        assert_ne!(
+            found.id(),
+            older.id(),
+            "the oldest row is retired history, never the offer of record"
+        );
+
+        // A valid non-offer row (an acknowledgement envelope without a
+        // message) is skipped, not an error.
+        state
+            .entries
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push(OutboxEntry::new(
+                OutboxEntryId::generate(),
+                site_a,
+                99,
+                serde_json::to_string(&Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: None,
+                })?,
+                now + Duration::seconds(2),
+            ));
+        let found = store
+            .find_offer_by_operation_across_instances(site_a, operation_id)
+            .await?;
+        assert_eq!(
+            found.as_ref().map(OutboxEntry::id),
+            Some(newer.id()),
+            "a valid non-offer row must be skipped"
+        );
+
+        // A corrupt row fails the read closed.
+        state
+            .entries
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push(OutboxEntry::new(
+                OutboxEntryId::generate(),
+                site_b,
+                100,
+                String::from("this is not an envelope"),
+                now + Duration::seconds(3),
+            ));
+        assert!(
+            matches!(
+                store
+                    .find_offer_by_operation_across_instances(site_a, operation_id)
+                    .await,
+                Err(MockStoreError)
+            ),
+            "a corrupt row must fail the read closed, like production's Corrupt refusal"
         );
         Ok(())
     }

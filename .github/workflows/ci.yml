@@ -602,14 +602,17 @@ jobs:
       #
       # W6-1 ran-assertion (2026-08-13): scripts/assert-tests-ran.sh fails
       # the step unless the number of tests that actually ran and passed
-      # is >= 50. The pin is the master-measured count (2026-08-13 gate
-      # re-run: `cargo test --locked -p rutilus-migration` reports 50
-      # passed — 38 基线 + 12 down_order_gate). Floor semantics, not
+      # is >= 50. The pin is the master-measured count (2026-08-14 gate
+      # re-run, W8-W-4 re-sync: `cargo test --locked -p rutilus-migration
+      # -- --list` reports 67 passed — 17 down_order_gate + 7 bare_sql_gate
+      # + 43 other migration tests). Floor semantics, not
       # exact count: the step fails only when the count dips below the
       # pin — deleting a non-gate test file that still leaves 49 passing
       # tests passes, and only a dip below 50 (whole-suite deletion,
       # #[ignore], or cfg-emptying) fails. The pin is the lower bound of
-      # the measured baseline; the test total grows with the product.
+      # the measured baseline; the test total grows with the product
+      # (the wave-eight gate self-check additions were still landing when
+      # this comment was re-synced — re-measure at integration).
       #
       # R6-W-7 (2026-08-14): the --expect-tests list adds a NAME-level
       # assertion on top of the count — six core down_order_gate test names

@@ -1442,11 +1442,13 @@ fn decode_manifest(
     // declare a manifest that fills the center's disk past the cap. The
     // rejection flows through the same absorb-skip-warn path as every other
     // undecodable manifest — the center protocol has no HTTP status to
-    // answer with, and a refused declaration leaves no row behind, so the
-    // site's next delivery of the same identity re-declares and is refused
-    // again (the at-least-once outbox keeps the frame until the site learns
-    // of the skip) while the warning names the reason in the center log.
-    // Once the declared total is capped, the chunk path's
+    // answer with, so the frame is absorbed once: a warn names the reason
+    // in the center log, the cursor advances, and no row is left behind.
+    // The site learns nothing from the absorption — its outbox frame is
+    // acknowledged by the cursor advance, so the artifact simply vanishes
+    // from the center view until a human inspects it (protocol-level
+    // refusal feedback is future work, registered in known-limitations
+    // §九). Once the declared total is capped, the chunk path's
     // `end <= artifact.size_bytes()` check bounds the accumulated bytes the
     // same way the site side's `append_chunk` does (§14.3).
     if manifest.total_bytes > ARTIFACT_MAX_SIZE_BYTES {

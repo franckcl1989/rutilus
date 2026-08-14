@@ -4562,6 +4562,26 @@ impl AuditListState {
         }
     }
 
+    /// The error-hint copy for the audit section (L3, W8-W-5): the
+    /// initial-load failure names the unavailable log, while a failed
+    /// load-earlier — including a retry in flight that still carries the
+    /// failed window (N1) — names the older page instead, so the hint can
+    /// never claim the whole log is unavailable when only an older page
+    /// failed to load. The `is_failed` guard keeps the hint hidden while a
+    /// load is in flight, so the `Loading(Some(..))` arm is latent today;
+    /// selecting by the carried page's flag (the same flag the guard's
+    /// `Ready` arm reads) keeps the copy honest for any future guard
+    /// alignment, instead of the W8-W-5 trap of lumping `Loading` into the
+    /// unavailable branch.
+    fn error_hint_text(&self) -> &'static str {
+        match self {
+            Self::Ready(page) | Self::Loading(Some(page)) if page.load_failed => {
+                L().error_audit_load_earlier
+            }
+            Self::Failed | Self::Ready(_) | Self::Idle | Self::Loading(_) => L().unavailable_audit,
+        }
+    }
+
     fn event_cards(&self) -> Vec<AuditEventCardProjection> {
         self.page()
             .map(|page| {
@@ -4574,6 +4594,12 @@ impl AuditListState {
             .unwrap_or_default()
     }
 }
+
+/// The L3/W8-W-5 load-earlier failure hint, pinned in English against the
+/// i18n catalog so a copy change fails the test instead of silently
+/// drifting the `AuditListState::error_hint_text` selection.
+#[cfg(test)]
+const AUDIT_LOAD_EARLIER_ERROR_HINT: &str = Lang::En.strings().error_audit_load_earlier;
 
 /// One immutable, secret-free audit event projected for a list card.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -15018,16 +15044,7 @@ mod browser {
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
-                    {move || match state.get() {
-                        AuditListState::Failed => L().unavailable_audit,
-                        // L3: the window is kept — the hint names the failed
-                        // load-earlier instead of the unavailable log.
-                        AuditListState::Ready(page) if page.load_failed => {
-                            L().error_audit_load_earlier
-                        }
-                        AuditListState::Ready(_) | AuditListState::Idle
-                        | AuditListState::Loading(_) => L().unavailable_audit,
-                    }}
+                    {move || state.get().error_hint_text()}
                 </p>
             </section>
         }
@@ -21832,6 +21849,51 @@ mod tests {
             success.count_text(),
             "2 audit events",
             "the count follows the appended window"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_retry_in_flight_after_a_failed_load_earlier_keeps_the_earlier_failure_hint()
+    -> Result<(), Box<dyn Error>> {
+        // W8-W-5: `Loading(Some(page))` during a load-earlier retry after a
+        // previous failure carries the failed window (N1) — the copy arm
+        // must select by the carried page's flag and name the failed older
+        // page instead of falling into the "audit log unavailable" branch.
+        // The `is_failed` guard keeps the hint hidden while the retry loads,
+        // but the arm must stay honest for any future guard alignment.
+        let newest = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": true,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:10:11Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 2,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e0",
+                    "message": "newest"
+                }
+            ]
+        }))?;
+        let page = AuditPage::new(newest, 50);
+        let failed = page.with_failed_load();
+        let retry = AuditListState::Loading(Some(failed));
+        assert!(
+            !retry.is_failed(),
+            "the guard keeps the hint hidden while a retry is in flight"
+        );
+        assert_eq!(
+            retry.error_hint_text(),
+            AUDIT_LOAD_EARLIER_ERROR_HINT,
+            "a kept window with a failed load-earlier names the older page, \
+             not the unavailable log"
+        );
+        assert_eq!(
+            AuditListState::Loading(None).error_hint_text(),
+            Lang::En.strings().unavailable_audit,
+            "a fresh load in flight stays on the unavailable copy"
         );
         Ok(())
     }

@@ -226,10 +226,14 @@ pub enum AppliedMigrationsError {
 /// fresh marker would record the current live pair — possibly the mixed
 /// pair an interrupted first generation left behind — as the pre-restore
 /// state, and the next open would then legitimize that mixed pair as
-/// "untouched". The re-run is refused instead, so the interrupted state can
-/// only be resolved through a store open, which accepts exactly the
-/// recorded snapshot pair (complete) or the recorded pre-restore pair
-/// (untouched) and refuses a mixed pair.
+/// "untouched". The re-run is refused instead. Resolution depends on the
+/// pair the interruption left behind: a complete pair (both files from the
+/// snapshot, or both from the pre-restore state) is accepted and cleared by
+/// the next store open, while a mixed pair is refused by the open as well —
+/// it must first be made complete (copy the database and WAL back from the
+/// preserved pre-restore snapshot) before the open can verify and clear the
+/// marker. Manually deleting the marker while the pair is mixed only
+/// re-opens the W7-F-2 legitimization hole on the next re-run.
 ///
 /// # Errors
 ///
@@ -662,7 +666,12 @@ pub enum RestoreError {
     },
     #[error(
         "an interrupted restore is pending at {path}; refusing to overwrite its marker — \
-         open the instance to verify the live pair, or resolve the marker manually: {source}"
+         do not delete the marker while the live pair is mixed: first make the pair complete \
+         again by copying the database and WAL back from the pre-restore snapshot (the \
+         preserved pre-restore copy), then start the instance once — the open verifies the \
+         pair and clears the marker — and re-run the restore afterwards. Deleting the marker \
+         first would record the mixed pair as the pre-restore state and the next open would \
+         legitimize it: {source}"
     )]
     RestoreInterrupted {
         path: PathBuf,

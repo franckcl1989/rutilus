@@ -80,8 +80,9 @@
 //! holding a spaced `AS ( SELECT` or `AS WITH ... SELECT` sequence (`CHECK
 //! (a <> ' AS ( SELECT ')`) reads like the new shapes, while a sequence
 //! glued to the quotes (`'AS ( SELECT'`) does not form the pair. Quoted
-//! literals are preserved verbatim by the stripper — a `--` or `/*` inside
-//! a literal is text, not a comment — so the boundary stands unchanged.
+//! regions — literals and quoted identifiers — are preserved verbatim by
+//! the stripper — a `--` or `/*` inside them is text, not a comment — so
+//! the boundary stands unchanged.
 //! Outside quoted literals the new shapes have no false-positive surface
 //! per the `SQLite` grammar: in DDL the `AS` keyword is followed either by
 //! the select-stmt (`CREATE TABLE/VIEW ... AS`) or by a type name (a column
@@ -302,15 +303,22 @@ fn first_keyword(sql: &str) -> &str {
 /// of the line, newline consumed) and `/* ... */` block comments, each
 /// replaced by a single space so the words around it stay separate words.
 ///
-/// Single-quoted SQL string literals are preserved verbatim — a `--` or
-/// `/*` inside a literal is literal text, not a comment — with a doubled
-/// `''` recognized as an escaped quote rather than the end of the literal.
+/// Quoted regions are preserved verbatim — a `--` or `/*` inside them is
+/// text, not a comment — in every spelling the `SQLite` grammar allows:
+/// single-quoted string literals (`'...'`, a doubled `''` being the escaped
+/// quote), double-quoted identifiers (`"..."`, a doubled `""` the escaped
+/// quote), backtick-quoted identifiers (`` `...` ``), and bracket-quoted
+/// identifiers (`[...]`, closed by the first `]`). An unterminated quote
+/// runs to the end of the string, so a fragment never strips mid-quote.
 /// The embedded-DML scan runs on the stripped statement, so a comment
 /// sitting between the shape's words (`CREATE TABLE x AS -- comment
 /// SELECT ...`) can no longer hide the `AS SELECT` pair or a trigger-body
-/// DML word, and comment content can never read like DML. (The first-word
-/// gate keeps scanning the raw statement: a leading comment is not a DDL
-/// first word, so a comment-first statement still fails the carve-out.)
+/// DML word, and comment content can never read like DML — while a quoted
+/// table name like `"a--b"` or `` `a--b` `` stays whole, so a comment
+/// marker inside an identifier can neither hide a shape nor fake one. (The
+/// first-word gate keeps scanning the raw statement: a leading comment is
+/// not a DDL first word, so a comment-first statement still fails the
+/// carve-out.)
 fn strip_sql_comments(statement: &str) -> String {
     let chars: Vec<char> = statement.chars().collect();
     let mut stripped = String::with_capacity(statement.len());
@@ -350,6 +358,40 @@ fn strip_sql_comments(statement: &str) -> String {
                     break;
                 }
                 stripped.push(chars[i]);
+                i += 1;
+            }
+        } else if chars[i] == '"' || chars[i] == '`' {
+            // A double-quoted or backtick-quoted `SQLite` identifier is
+            // preserved verbatim, a doubled quote being the escaped quote.
+            let quote = chars[i];
+            stripped.push(quote);
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        stripped.push(quote);
+                        stripped.push(quote);
+                        i += 2;
+                        continue;
+                    }
+                    stripped.push(quote);
+                    i += 1;
+                    break;
+                }
+                stripped.push(chars[i]);
+                i += 1;
+            }
+        } else if chars[i] == '[' {
+            // A bracket-quoted `SQLite` identifier is preserved verbatim,
+            // closed by the first `]`.
+            stripped.push('[');
+            i += 1;
+            while i < chars.len() && chars[i] != ']' {
+                stripped.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                stripped.push(']');
                 i += 1;
             }
         } else {
@@ -520,10 +562,11 @@ fn as_select_clause(cand: &str, rest: &[&str], statement: &str) -> Option<String
 /// literal holding a spaced `AS ( SELECT` or `AS WITH ... SELECT` sequence
 /// (`' AS ( SELECT '`) reads like the shape, while a sequence glued to the
 /// quotes (`'AS ( SELECT'`) does not form the pair. The stripper preserves
-/// quoted literals verbatim — `--`/`/*` inside a literal is text, not a
-/// comment — so the boundary stands: a quoted `'AS -- SELECT'` (comment
-/// marker inside the literal) is not treated as a comment and does not form
-/// the adjacent pair. Outside literals, per the `SQLite` grammar, `AS` in DDL
+/// quoted regions verbatim — `--`/`/*` inside a literal or a quoted
+/// identifier is text, not a comment — so the boundary stands: a quoted
+/// `'AS -- SELECT'` (comment marker inside the literal) is not treated as a
+/// comment and does not form the adjacent pair. Outside literals, per the
+/// `SQLite` grammar, `AS` in DDL
 /// is followed by the select-stmt or by a type name (a column type,
 /// `CAST(x AS TEXT)`), never by `(` or `WITH` in another role — so the
 /// parenthesized and CTE shapes have no false-positive surface in real DDL,
@@ -997,6 +1040,92 @@ fn strip_sql_comments_removes_comment_text_and_keeps_literals() {
     assert_eq!(
         strip_sql_comments("CREATE TABLE x AS -- trailing comment (no newline)"),
         "CREATE TABLE x AS  "
+    );
+}
+
+/// The W8-S-2 blind spot: the stripper used to protect only single-quoted
+/// literals, so a comment marker inside a quoted identifier (`"a--b"`,
+/// `` `a--b` ``, `[a--b]`) was read as a comment start and the rest of the
+/// statement — a real `AS SELECT` pair, or a `;`-separated DML tail — was
+/// swallowed to the end of the line: `CREATE TABLE "a--b" AS SELECT ...`
+/// stripped to `CREATE TABLE "a` with no `AS` pair left, and
+/// `DROP TABLE "a--b"; DELETE FROM operations` lost its DML tail with the
+/// comment. All four quote spellings the `SQLite` grammar allows are
+/// preserved verbatim now — the same quote states
+/// [`split_sql_statements`] uses, so the strip and the split cannot
+/// disagree about what is quoted — and the hidden shapes surface like any
+/// other, while a legal table name holding `--` flags nothing.
+#[test]
+fn quoted_identifiers_cannot_hide_ctas_or_dml_from_the_stripper() {
+    let allowance = "only CREATE/ALTER/DROP/PRAGMA are allowed";
+    // ① A CTAS whose table name carries `--` in double quotes used to strip
+    // to `CREATE TABLE "a` — no `AS` pair left — and pass. The quoted name
+    // is preserved, so the `AS SELECT` data copy is flagged.
+    let ctas = r#"CREATE TABLE "a--b" AS SELECT * FROM src"#;
+    assert_eq!(
+        strip_sql_comments(ctas),
+        ctas,
+        "a quoted identifier is not comment text"
+    );
+    assert!(
+        !raw_statement_violations(ctas, &DDL_FIRST_WORDS, allowance).is_empty(),
+        "the double-quoted-name CTAS must be flagged: {ctas}"
+    );
+    // ② The same quote swallowing used to eat a `;`-separated DML tail along
+    // with the rest of the line — the whole string then passed on the one
+    // remaining segment. The tail survives the strip and fails the segment
+    // check on its own.
+    let dml_tail = r#"DROP TABLE "a--b"; DELETE FROM operations"#;
+    assert!(
+        !raw_statement_violations(dml_tail, &DDL_FIRST_WORDS, allowance).is_empty(),
+        "the DML tail after the quoted name must be flagged: {dml_tail}"
+    );
+    // ③ Backtick- and bracket-quoted table names holding `--` are legal
+    // `SQLite` identifiers; preserving them must not flag the statement.
+    for clean in [
+        "CREATE TABLE `a--b` (id INTEGER PRIMARY KEY)",
+        "DROP TABLE [weird--name]",
+        "CREATE TABLE [t--x] (id INTEGER PRIMARY KEY); DROP INDEX [ix--y]",
+    ] {
+        assert_eq!(
+            strip_sql_comments(clean),
+            clean,
+            "a quoted identifier is not comment text: {clean}"
+        );
+        assert!(
+            raw_statement_violations(clean, &DDL_FIRST_WORDS, allowance).is_empty(),
+            "a legal quoted name must pass: {clean}"
+        );
+    }
+    // ④ Single-quoted literals keep the existing behavior: `--` inside a
+    // literal is text, not a comment, and no shape forms around it.
+    let literal = "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS -- SELECT'), b TEXT)";
+    assert_eq!(
+        strip_sql_comments(literal),
+        literal,
+        "a single-quoted literal is preserved verbatim"
+    );
+    assert!(
+        raw_statement_violations(literal, &DDL_FIRST_WORDS, allowance).is_empty(),
+        "a literal containing `--` must not flag the statement: {literal}"
+    );
+    // The doubled-quote escape of every quote spelling stays a quote, not a
+    // terminator: the region runs on to the real closing quote, so the
+    // comment after it is still stripped.
+    assert_eq!(
+        strip_sql_comments(r#"DROP TABLE "weird""name" -- done"#),
+        r#"DROP TABLE "weird""name"  "#,
+        "a doubled `\"` is an escaped quote, not the end of the identifier"
+    );
+    assert_eq!(
+        strip_sql_comments("DROP TABLE `weird``name` -- done"),
+        "DROP TABLE `weird``name`  ",
+        "a doubled backtick is an escaped quote, not the end of the identifier"
+    );
+    assert_eq!(
+        strip_sql_comments("DROP TABLE [weird--name] -- done"),
+        "DROP TABLE [weird--name]  ",
+        "a bracket identifier runs to its closing bracket"
     );
 }
 
