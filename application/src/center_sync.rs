@@ -49,9 +49,11 @@ use rutilus_domain::{
     ArtifactId, ArtifactState, CapabilityState, EndpointId, Event, EventId, EventSeverity,
     FailureKind, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation,
     OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry, OutboxEntryId,
-    RedfishCommand, RefreshGeneration, SyncCursor, SyncCursorId, SyncStream, TargetId, TlsTrust,
+    RedfishCommand, RefreshGeneration, Sha256Hex, SyncCursor, SyncCursorId, SyncStream, TargetId,
+    TlsTrust,
 };
 use rutilus_operation_engine::OperationStore;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -243,6 +245,13 @@ pub trait CenterOutbox: Send + Sync {
     /// Marks one entry acknowledged. The write is idempotent: a repeated
     /// acknowledgement (the center may deliver its `Ack` more than once) is
     /// a successful no-op.
+    ///
+    /// Acknowledging a content row (an entry without an `operation_id` — the
+    /// site-side queue) is terminal delivery, and the production repository
+    /// deletes the row instead of keeping an acknowledged row the pruning
+    /// never touches (W11-S-1); the retire path relies on the same
+    /// semantics to clean up a retired half-set instead of leaving acked
+    /// rows behind. Offer rows keep their acknowledged history (R6-E-04).
     fn acknowledge(
         &self,
         entry_id: OutboxEntryId,
@@ -610,6 +619,19 @@ pub struct CenterSync<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time> 
     /// deliberately in-memory — a restart re-reports the current states,
     /// which the center's idempotent receipt absorbs (at-least-once).
     last_progress: Mutex<HashMap<OperationId, Option<OperationState>>>,
+    /// The outbox entry ids enqueued by the current artifact distribution
+    /// (W11-F-2, W11-C-2, W11-C-3).
+    ///
+    /// `distribute_artifact` clears the ledger at the start and appends
+    /// every entry it enqueues. A failed distribution retires exactly these
+    /// ids — the fresh partial set — instead of scanning the pending queue,
+    /// so the retire reaches the set even when the queue's oldest window is
+    /// full of unrelated entries (the W11-F-2 window breakthrough), and a
+    /// distribution that failed before enqueueing anything has an empty
+    /// ledger and retires nothing (W11-C-3: the zero-enqueue path skips the
+    /// scan). The engine drives the report sequentially, so the ledger never
+    /// races two distributions.
+    distribution_entries: Mutex<Vec<OutboxEntryId>>,
     /// Whether the state-indexed discovery scan of
     /// [`Self::report_center_operations`] has completed at least once in
     /// this process run.
@@ -660,6 +682,7 @@ where
             instance_id,
             options,
             last_progress: Mutex::new(HashMap::new()),
+            distribution_entries: Mutex::new(Vec::new()),
             discovery_done: AtomicBool::new(false),
         }
     }
@@ -863,9 +886,33 @@ where
         // The operation results and the incremental data reporting enqueue
         // before the flush, so one batch carries them all.
         self.report_center_operations().await?;
-        self.report_incremental_sync().await?;
+        let artifact_outcome = self.report_incremental_sync().await?;
         self.flush_outbox(&mut session, &mut sent, peer_acked)
             .await?;
+        // W11-P-1: an absorbed artifact failure leaves the stream stalled —
+        // the report only runs once per connection, the absorption keeps the
+        // connection alive (the flush and the receive loop keep running), and
+        // the heartbeat outlives every idle timeout, so without a timer the
+        // retry never arrives on a stable network. The stall timer ends this
+        // connection one reconnect period after the absorption; the connect
+        // loop's own backoff then schedules the next attempt, which re-runs
+        // the report and retries the artifact (the W10-D-1 self-healing, now
+        // on a bounded schedule instead of the old never).
+        let stalled_artifact = match artifact_outcome {
+            ArtifactStreamOutcome::Complete => None,
+            ArtifactStreamOutcome::Stalled { artifact_id } => {
+                tracing::error!(
+                    "site {}: the artifact stream is stalled before artifact {}; the \
+                     connection ends after {:?} so the report retries it",
+                    self.instance_id,
+                    artifact_id,
+                    self.options.reconnect_after
+                );
+                Some(artifact_id)
+            }
+        };
+        let stall = tokio::time::sleep(self.options.reconnect_after);
+        tokio::pin!(stall);
         loop {
             tokio::select! {
                 () = stop.as_mut() => return Ok(()),
@@ -880,6 +927,17 @@ where
                         })
                         .await
                         .map_err(CenterSyncError::Transport)?;
+                }
+                () = &mut stall, if stalled_artifact.is_some() => {
+                    // The guard makes the None branch unreachable; the
+                    // reference bind keeps the extraction expect-free and
+                    // avoids moving out of the guard-borrowed option.
+                    let Some(artifact_id) = stalled_artifact.as_ref() else {
+                        continue;
+                    };
+                    return Err(CenterSyncError::ArtifactStreamStalled {
+                        artifact_id: *artifact_id,
+                    });
                 }
                 frame = session.receive() => {
                     let Some(envelope) = frame.map_err(CenterSyncError::Transport)? else {
@@ -1625,13 +1683,18 @@ where
     /// §17 per-stream cursors advance as the content is enqueued, and the
     /// durable outbox guarantees delivery — so a reconnect reports exactly
     /// what the center has not seen yet.
+    ///
+    /// Returns the artifact stream's outcome so the connection can arm the
+    /// W11-P-1 stall timer when a persistent failure stopped the stream.
     async fn report_incremental_sync(
         &self,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+    ) -> Result<
+        ArtifactStreamOutcome,
+        CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>,
+    > {
         self.report_endpoint_projection().await?;
         self.report_event_batch().await?;
-        self.report_artifacts().await?;
-        Ok(())
+        self.report_artifacts().await
     }
 
     /// Reports every endpoint whose refresh generation advanced past the
@@ -1921,20 +1984,28 @@ where
     /// [`CENTER_ARTIFACT_CHUNK_BYTES`], enqueued before the flush sends
     /// them. The cursor is the last distributed artifact id.
     ///
-    /// A persistent distribution failure — a missing file (W10-D-1) or a
-    /// byte count that contradicts the manifest (W10-D-2) — is absorbed
-    /// here: the failure cannot heal within this round, so propagating it
-    /// would only take the whole connection down with it (the flush and the
-    /// receive loop never run, and every reconnect fails at the same
-    /// artifact — the W10-D-1 storm). The artifact stream stops at the
-    /// artifact and the cursor stays before it, so the next round retries
-    /// it — the distribution heals on its own once the file is restored,
-    /// and skipping the artifact (advancing the cursor past it) would leave
-    /// the center without it permanently (W9-S-2). Transient failures keep
-    /// the historical contract: the round aborts and the reconnect retries.
+    /// A persistent distribution failure — a missing file (W10-D-1), a byte
+    /// count that contradicts the manifest (W10-D-2), a same-size file whose
+    /// bytes disagree with the declared digest (W11-D-3), or an unreadable
+    /// file (W11-F-1) — is absorbed here: the failure cannot heal within
+    /// this round, so propagating it would only take the whole connection
+    /// down with it (the flush and the receive loop never run, and every
+    /// reconnect fails at the same artifact — the W10-D-1 storm). The
+    /// artifact stream stops at the artifact and the cursor stays before
+    /// it, so the next round retries it — the distribution heals on its own
+    /// once the file is restored, and skipping the artifact (advancing the
+    /// cursor past it) would leave the center without it permanently
+    /// (W9-S-2). The absorbed round reports the stall to the connection
+    /// (W11-P-1): the connection ends itself after the reconnect period so
+    /// the retry arrives on a bounded schedule instead of waiting for a
+    /// disconnect that never comes. Transient failures keep the historical
+    /// contract: the round aborts and the reconnect retries.
     async fn report_artifacts(
         &self,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+    ) -> Result<
+        ArtifactStreamOutcome,
+        CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>,
+    > {
         let cursor = self
             .cursor
             .get(self.instance_id, SyncStream::Artifact)
@@ -1997,30 +2068,38 @@ where
             }
             if let Err(error) = self.distribute_artifact(&artifact).await {
                 match &error {
-                    // The persistent failure shapes (W10-D-1, W10-D-2): the
-                    // artifact's file is missing or its byte count
-                    // contradicts the manifest, so no retry within this
-                    // round can succeed — and propagating the error would
-                    // take the whole connection down with it: the flush and
-                    // the receive loop never run (W10-E-2), and every
-                    // reconnect fails at the same artifact forever (the
-                    // W10-D-1 storm). The failure is absorbed instead: the
-                    // repair path is logged, the artifact stream stops
-                    // here, and the cursor stays before the artifact — the
-                    // next round retries it, so it heals automatically once
-                    // the operator restores the file. Skipping the artifact
+                    // The persistent failure shapes (W10-D-1, W10-D-2,
+                    // W11-D-3, W11-F-1): the artifact's file is missing,
+                    // its byte count contradicts the manifest, its bytes
+                    // disagree with the declared digest, or the file is
+                    // unreadable — so no retry within this round can
+                    // succeed, and propagating the error would take the
+                    // whole connection down with it: the flush and the
+                    // receive loop never run (W10-E-2), and every reconnect
+                    // fails at the same artifact forever (the W10-D-1
+                    // storm). The failure is absorbed instead: the repair
+                    // path is logged, the artifact stream stops here, and
+                    // the cursor stays before the artifact — the next round
+                    // retries it, so it heals automatically once the
+                    // operator restores the file. Skipping the artifact
                     // would leave the center without it permanently while
                     // the row stays `Ready` (the W9-S-2 inconsistency), and
                     // the domain lifecycle refuses a `Failed` verdict for a
-                    // `Ready` row, so the retry is the honest state.
+                    // `Ready` row, so the retry is the honest state. The
+                    // returned stall arms the connection's W11-P-1 timer so
+                    // the retry actually arrives.
                     CenterSyncError::ArtifactFileMissing { .. }
-                    | CenterSyncError::ArtifactSizeMismatch { .. } => {
+                    | CenterSyncError::ArtifactSizeMismatch { .. }
+                    | CenterSyncError::ArtifactDigestMismatch { .. }
+                    | CenterSyncError::ArtifactFileUnreadable { .. } => {
                         tracing::error!(
                             "site {}: the artifact stream stops before artifact {}: {error}",
                             self.instance_id,
                             artifact.id()
                         );
-                        break;
+                        return Ok(ArtifactStreamOutcome::Stalled {
+                            artifact_id: artifact.id(),
+                        });
                     }
                     // A transient read error or a boundary failure keeps the
                     // historical contract: the round aborts and the
@@ -2044,7 +2123,7 @@ where
                 .await
                 .map_err(CenterSyncError::Cursor)?;
         }
-        Ok(())
+        Ok(ArtifactStreamOutcome::Complete)
     }
 
     /// Enqueues the manifest and the chunk frames of one ready artifact.
@@ -2060,18 +2139,39 @@ where
     /// before anything is enqueued — the same property as the old
     /// whole-file read.
     ///
-    /// The reader counts every byte it streams and compares the total with
-    /// the declared size at EOF: an empty or truncated file (W10-D-2) is
-    /// classified as [`CenterSyncError::ArtifactSizeMismatch`] with the
-    /// observed and declared byte counts, instead of the pre-fix behavior —
-    /// an empty file silently enqueued nothing and let the caller advance
-    /// the cursor (the artifact was lost forever), and a truncated file
-    /// silently distributed a partial set. On any failure, the manifest
-    /// and the chunks already enqueued for this artifact are retired from
-    /// the outbox again ([`Self::retire_pending_artifact_entries`]): a
-    /// half-set must never linger, or the flush would deliver a partial
-    /// artifact to the center and every reconnect would pile up another
-    /// half-set.
+    /// The reader refuses a file whose byte count contradicts the manifest
+    /// twice over: the metadata length pre-check (W11-F-3) fails fast
+    /// before a byte is read — an empty, truncated, or oversized file
+    /// never pays for a full read and never enqueues anything — and the
+    /// streamed byte count at EOF remains the authority for a file that
+    /// changed size between the pre-check and the read (the TOCTOU
+    /// window), both classified as [`CenterSyncError::ArtifactSizeMismatch`]
+    /// with the observed and declared counts. The reader also accumulates
+    /// the SHA-256 of the streamed bytes at zero extra I/O (W11-D-3) and
+    /// compares it with the declared digest at EOF: a same-size file whose
+    /// bytes disagree is refused as [`CenterSyncError::ArtifactDigestMismatch`]
+    /// instead of being silently distributed once — the pre-fix shape that
+    /// left the center holding bad content and the site row `Ready`
+    /// forever.
+    ///
+    /// The distribution begins by retiring the artifact's stale outbox
+    /// entries ([`Self::retire_pending_artifact_entries`]): a half-set a
+    /// cancelled round (W11-F-4) or a failed retire (W11-C-2) left pending
+    /// must not be delivered by the flush alongside the fresh set — or on
+    /// its own when the file is gone again. On any failure of this round,
+    /// the manifest and the chunks this round enqueued are retired by
+    /// their recorded entry ids (W11-F-2): the retire reaches the fresh
+    /// partial set even when the queue's oldest window is full of
+    /// unrelated entries, and a distribution that failed before enqueueing
+    /// anything (the W11-C-3 zero-enqueue path) retires nothing. A failed
+    /// retire is never swallowed (W11-C-2): it escalates into the round's
+    /// error, so the connection ends before the flush — the residual
+    /// half-set is never sent, and the reconnect retries the distribution,
+    /// whose pre-clean re-runs the retire.
+    // The distribution is one sequential procedure — ledger clear, chunk
+    // enqueue, and the retire on failure share a single narrative;
+    // splitting it would fragment the W11-C-2/C-3 invariant story.
+    #[allow(clippy::too_many_lines)]
     async fn distribute_artifact(
         &self,
         artifact: &rutilus_domain::Artifact,
@@ -2079,6 +2179,15 @@ where
         let path = self.store.artifact_file_path(artifact.id());
         let chunk_bytes = self.options.artifact_chunk_bytes;
         let declared_bytes = artifact.size_bytes();
+        let expected_digest: [u8; 32] = artifact.sha256().into_bytes();
+        self.distribution_entries
+            .lock()
+            .map_err(|_| CenterSyncError::ProgressTracking)?
+            .clear();
+        // W11-F-2 / W11-F-4 / W11-C-2: the stale-set cleanup before the
+        // fresh set enters the queue — a residual half-set of this artifact
+        // from a cancelled round or a failed retire must not ride the flush.
+        self.retire_pending_artifact_entries(artifact.id()).await?;
         // A bounded channel carries the chunks from the blocking reader to
         // the async enqueue side; capacity 1 caps the buffered bytes at one
         // chunk, and the reader's `blocking_send` applies backpressure to
@@ -2087,6 +2196,21 @@ where
         let reader = tokio::task::spawn_blocking(move || -> Result<(), ArtifactReadFailure> {
             use std::io::Read as _;
             let mut file = std::fs::File::open(&path).map_err(ArtifactReadFailure::Io)?;
+            // W11-F-3: the metadata length pre-check. A file whose length
+            // already disagrees with the manifest fails before a byte is
+            // read or enqueued — the fast-fail keeps an oversized or
+            // truncated error from paying for a full read and a full outbox
+            // write before the EOF check discovers it. The streamed count
+            // below remains authoritative: a file that changes size between
+            // the pre-check and the read is caught at EOF.
+            let actual_len = file.metadata().map_err(ArtifactReadFailure::Io)?.len();
+            if actual_len != declared_bytes {
+                return Err(ArtifactReadFailure::SizeMismatch {
+                    read_bytes: actual_len,
+                    declared_bytes,
+                });
+            }
+            let mut hasher = Sha256::new();
             let mut chunk = vec![0_u8; chunk_bytes];
             let mut total_read: u64 = 0;
             loop {
@@ -2105,6 +2229,10 @@ where
                     // EOF exactly at a chunk boundary: the stream is done.
                     break;
                 }
+                // The digest accumulates on the streamed bytes (W11-D-3):
+                // one extra pass over bytes already in memory, zero extra
+                // I/O.
+                hasher.update(&chunk[..filled]);
                 let last = filled < chunk_bytes;
                 chunk.truncate(filled);
                 chunk_sender.blocking_send(chunk).map_err(|_| {
@@ -2129,6 +2257,20 @@ where
                     declared_bytes,
                 });
             }
+            // W11-D-3: the declared digest must match the streamed bytes.
+            // The size check alone let a same-size file with wrong content
+            // through — the center would silently hold bad bytes while the
+            // site row stays `Ready`, and the two would diverge forever.
+            // The digest is a persistent corruption signature, so the
+            // failure is classified in the same absorbed family as a size
+            // mismatch, with both digests in the diagnosis.
+            let actual_digest: [u8; 32] = hasher.finalize().into();
+            if actual_digest != expected_digest {
+                return Err(ArtifactReadFailure::DigestMismatch {
+                    expected: Sha256Hex::from_bytes(expected_digest).as_str().to_owned(),
+                    actual: Sha256Hex::from_bytes(actual_digest).as_str().to_owned(),
+                });
+            }
             Ok(())
         });
         let outcome = async {
@@ -2144,24 +2286,36 @@ where
                     })?
                     .map_err(|source| Self::map_artifact_read_failure(artifact.id(), source));
             };
-            self.enqueue_outbox_entry(EnvelopeMessage::ArtifactManifest(ArtifactManifest {
-                artifact_id: artifact.id().to_string(),
-                name: artifact.name().as_str().to_owned(),
-                total_bytes: artifact.size_bytes(),
-                sha256: artifact.sha256().into_bytes().to_vec(),
-            }))
-            .await?;
+            let manifest = self
+                .enqueue_outbox_entry(EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+                    artifact_id: artifact.id().to_string(),
+                    name: artifact.name().as_str().to_owned(),
+                    total_bytes: artifact.size_bytes(),
+                    sha256: artifact.sha256().into_bytes().to_vec(),
+                }))
+                .await?;
+            self.distribution_entries
+                .lock()
+                .map_err(|_| CenterSyncError::ProgressTracking)?
+                .push(manifest.id());
             let mut index = 0_usize;
             let mut chunk = first_chunk;
             loop {
-                self.enqueue_outbox_entry(EnvelopeMessage::ArtifactChunk(ArtifactChunk {
-                    artifact_id: artifact.id().to_string(),
-                    index: u32::try_from(index).map_err(|_| CenterSyncError::SequenceOverflow {
-                        sequence: i64::try_from(index).unwrap_or(i64::MAX),
-                    })?,
-                    data: chunk,
-                }))
-                .await?;
+                let entry = self
+                    .enqueue_outbox_entry(EnvelopeMessage::ArtifactChunk(ArtifactChunk {
+                        artifact_id: artifact.id().to_string(),
+                        index: u32::try_from(index).map_err(|_| {
+                            CenterSyncError::SequenceOverflow {
+                                sequence: i64::try_from(index).unwrap_or(i64::MAX),
+                            }
+                        })?,
+                        data: chunk,
+                    }))
+                    .await?;
+                self.distribution_entries
+                    .lock()
+                    .map_err(|_| CenterSyncError::ProgressTracking)?
+                    .push(entry.id());
                 index += 1;
                 let Some(next) = chunk_receiver.recv().await else {
                     break;
@@ -2178,18 +2332,32 @@ where
         }
         .await;
         if outcome.is_err() {
-            // The manifest and any chunks enqueued before the failure must
-            // not linger in the outbox: the flush would deliver the half-set
-            // to the center, and the next round would enqueue another set on
-            // top of it. The retire also cleans half-sets a previous cycle
-            // left behind. The cleanup is best-effort — a failing queue must
-            // not mask the distribution error it is cleaning up after.
-            if let Err(cleanup) = self.retire_pending_artifact_entries(artifact.id()).await {
-                tracing::warn!(
-                    "site {}: could not retire the partial outbox set of artifact {}: {cleanup}",
-                    self.instance_id,
-                    artifact.id()
-                );
+            // The entries this round enqueued must not linger in the outbox:
+            // the flush would deliver the half-set to the center, and the
+            // next round would enqueue another set on top of it. The retire
+            // addresses the recorded entry ids directly (W11-F-2): no scan,
+            // no window, so a queue whose oldest window is full of unrelated
+            // entries cannot hide the fresh partial set. A distribution that
+            // failed before enqueueing anything has an empty ledger and
+            // retires nothing (W11-C-3). The cleanup is not best-effort
+            // (W11-C-2): a failing retire escalates into the round's error,
+            // so the connection ends before the flush and the residual
+            // half-set is never delivered — the reconnect retries the
+            // distribution, whose pre-clean re-runs the retire.
+            let enqueued = self
+                .distribution_entries
+                .lock()
+                .map_err(|_| CenterSyncError::ProgressTracking)?
+                .drain(..)
+                .collect::<Vec<_>>();
+            if !enqueued.is_empty() {
+                let now = self.clock.now();
+                for entry_id in enqueued {
+                    self.outbox
+                        .acknowledge(entry_id, now)
+                        .await
+                        .map_err(CenterSyncError::Outbox)?;
+                }
             }
         }
         outcome
@@ -2198,12 +2366,24 @@ where
     /// Retires every pending outbox entry of one artifact's distribution —
     /// its manifest and chunk frames — without sending it.
     ///
+    /// This is the *stale-set* cleanup of [`Self::distribute_artifact`]:
+    /// it scans the pending queue for entries of the artifact that earlier
+    /// rounds left behind (a cancelled distribution, W11-F-4; a failed
+    /// retire, W11-C-2). The fresh partial set of the current round is
+    /// retired by its recorded entry ids instead (W11-F-2), because this
+    /// scan reads the *oldest* pending window: with the window full of
+    /// unrelated entries, the artifact's own entries — enqueued more
+    /// recently — are beyond it. The stale set is always older than the
+    /// fresh window's tail, so the scan reaches the residue within the
+    /// window; a deeper residue stays for a later round, exactly like the
+    /// dispatch settle scan's bounded queue (W9-C-2), and the flush
+    /// delivers at most an idempotently-absorbed duplicate, never a
+    /// half-set on its own.
+    ///
     /// The scan repeats until a pass retires nothing or sees fewer pending
     /// entries than its bound, so one artifact's full set (whose size is
     /// bounded by the declared-size cap over the chunk size) is always
-    /// within reach; a pathological queue beyond the bound keeps its
-    /// residual like the dispatch settle scan, and the next failed round
-    /// re-runs the cleanup.
+    /// within reach.
     ///
     /// # Errors
     ///
@@ -2241,10 +2421,12 @@ where
     /// Maps one failure of the distribution reader: a byte-count mismatch
     /// against the declared manifest is the W10-D-2 corruption signature —
     /// [`CenterSyncError::ArtifactSizeMismatch`], carrying the observed and
-    /// declared counts — and every I/O failure keeps the existing
+    /// declared counts — and a same-size digest mismatch is the W11-D-3
+    /// corruption signature, [`CenterSyncError::ArtifactDigestMismatch`]
+    /// with both digests. Every I/O failure keeps the existing
     /// classification (a missing file is the W9-S-2 signature,
-    /// [`CenterSyncError::ArtifactFileMissing`]; anything else stays
-    /// [`CenterSyncError::ArtifactRead`]).
+    /// [`CenterSyncError::ArtifactFileMissing`]; anything else goes
+    /// through [`Self::classify_artifact_read_error`]).
     fn map_artifact_read_failure(
         artifact_id: ArtifactId,
         failure: ArtifactReadFailure,
@@ -2258,6 +2440,13 @@ where
                 read_bytes,
                 declared_bytes,
             },
+            ArtifactReadFailure::DigestMismatch { expected, actual } => {
+                CenterSyncError::ArtifactDigestMismatch {
+                    artifact_id,
+                    expected,
+                    actual,
+                }
+            }
             ArtifactReadFailure::Io(source) => {
                 Self::classify_artifact_read_error(artifact_id, source)
             }
@@ -2268,19 +2457,33 @@ where
     /// missing file is the W9-S-2 signature — a `Ready` row whose artifact
     /// file is not on disk — classified as
     /// [`CenterSyncError::ArtifactFileMissing`] so the run loop's warning
-    /// names the repair path; every other read error stays
-    /// [`CenterSyncError::ArtifactRead`].
+    /// names the repair path; a file the process cannot open because of its
+    /// permissions or its path shape — [`ErrorKind::PermissionDenied`] and
+    /// [`ErrorKind::IsADirectory`] (W11-F-1) — is a persistent condition
+    /// the operator must resolve (fix the file's ownership or replace the
+    /// directory placeholder), classified as
+    /// [`CenterSyncError::ArtifactFileUnreadable`] and absorbed like the
+    /// other persistent shapes instead of storming the reconnect loop. The
+    /// genuinely transient kinds — resource exhaustion (EMFILE/ENFILE),
+    /// interruption, would-block — stay [`CenterSyncError::ArtifactRead`]:
+    /// they can clear within the round, so the historical contract of
+    /// propagating and retrying keeps them moving.
     fn classify_artifact_read_error(
         artifact_id: ArtifactId,
         source: std::io::Error,
     ) -> CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail> {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            CenterSyncError::ArtifactFileMissing { artifact_id }
-        } else {
-            CenterSyncError::ArtifactRead {
+        match source.kind() {
+            std::io::ErrorKind::NotFound => CenterSyncError::ArtifactFileMissing { artifact_id },
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory => {
+                CenterSyncError::ArtifactFileUnreadable {
+                    artifact_id,
+                    source,
+                }
+            }
+            _ => CenterSyncError::ArtifactRead {
                 artifact_id,
                 source,
-            }
+            },
         }
     }
 
@@ -2310,21 +2513,41 @@ where
     }
 }
 
-/// One failure of the blocking artifact-distribution reader (W10-D-2).
+/// One failure of the blocking artifact-distribution reader (W10-D-2,
+/// W11-D-3).
 ///
 /// The reader distinguishes an I/O failure — classified like every other
 /// file error by [`CenterSync::classify_artifact_read_error`] — from a
 /// byte-count mismatch against the declared manifest, the
 /// empty/truncated-file corruption shape the pre-fix reader silently
-/// distributed or silently skipped.
+/// distributed or silently skipped, and a same-size digest mismatch, the
+/// wrong-content corruption shape the size check alone let through.
 enum ArtifactReadFailure {
     /// The file could not be opened or read.
     Io(std::io::Error),
-    /// EOF arrived with a byte count different from the declared size.
+    /// The file's byte count is different from the declared size.
     SizeMismatch {
         read_bytes: u64,
         declared_bytes: u64,
     },
+    /// The streamed bytes do not hash to the declared digest.
+    DigestMismatch { expected: String, actual: String },
+}
+
+/// The outcome of one artifact stream report (W11-P-1).
+///
+/// The report returns the outcome so the connection can arm the stall
+/// timer: an absorbed persistent failure stops the stream, and the timer
+/// ends the connection after the reconnect period so the retry actually
+/// arrives on a stable network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactStreamOutcome {
+    /// The stream distributed every ready artifact past the cursor.
+    Complete,
+    /// The stream stopped at the persistent failure of `artifact_id`: the
+    /// cursor stays before it, and the connection ends itself after the
+    /// reconnect period so the next connection retries the artifact.
+    Stalled { artifact_id: ArtifactId },
 }
 
 /// The upper bound of one artifact's distribution set: at most
@@ -2496,6 +2719,49 @@ pub enum CenterSyncError<
         read_bytes: u64,
         declared_bytes: u64,
     },
+    /// A `Ready` artifact's file holds the declared byte count but its
+    /// bytes do not hash to the declared digest (W11-D-3): the size check
+    /// alone would have distributed the bad content once and left the
+    /// center and the site row permanently divergent. The mismatch is
+    /// persistent — only a re-restore or a re-upload heals it — so
+    /// `report_artifacts` absorbs it exactly like the size mismatch (no
+    /// reconnect storm), stops the artifact stream, and keeps the cursor
+    /// before the artifact.
+    #[error(
+        "artifact {artifact_id} is ready but its bytes hash to {actual}, not the declared \
+         {expected}; the artifact stream stops before it: re-restore from a backup taken with \
+         the artifact files in place, or delete and re-upload the artifact"
+    )]
+    ArtifactDigestMismatch {
+        artifact_id: ArtifactId,
+        expected: String,
+        actual: String,
+    },
+    /// A `Ready` artifact's file is not readable — the process lacks the
+    /// permission, or the path is a directory placeholder (W11-F-1). The
+    /// condition is persistent until an operator fixes the file system, so
+    /// `report_artifacts` absorbs it exactly like the missing-file shape
+    /// (no reconnect storm), stops the artifact stream, and keeps the
+    /// cursor before the artifact.
+    #[error(
+        "artifact {artifact_id} is ready but its file is not readable: {source}; the artifact \
+         stream stops before it: fix the file's permissions or replace the path, or delete and \
+         re-upload the artifact"
+    )]
+    ArtifactFileUnreadable {
+        artifact_id: ArtifactId,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The artifact stream stopped at a persistent failure and the W11-P-1
+    /// stall timer ended the connection: the reconnect retries the
+    /// artifact, so the distribution heals on its own once the operator
+    /// fixes the file.
+    #[error(
+        "the artifact stream is stalled before artifact {artifact_id}; the connection ends \
+         so the next one retries it"
+    )]
+    ArtifactStreamStalled { artifact_id: ArtifactId },
     /// The center refused the connection as `not-bound` the configured
     /// number of consecutive times (audit follow-up F4): the site's binding
     /// is not in force on the center, so the engine stops instead of
@@ -3395,10 +3661,14 @@ mod tests {
 
     /// An in-memory [`CenterOutbox`] mirroring the persistence contract:
     /// sequences allocated as max plus one, pending listing in sequence
-    /// order, and idempotent acknowledgements. The mock never fails.
+    /// order, and idempotent acknowledgements. The mock never fails unless
+    /// the acknowledge failure is armed (W11-C-2: the retire-failure
+    /// escalation test needs an outbox whose acknowledgements fail while
+    /// its listings still work).
     struct MockOutbox {
         entries: Arc<Mutex<Vec<OutboxEntry>>>,
         instance_id: InstanceId,
+        fail_acknowledge: AtomicBool,
     }
 
     impl MockOutbox {
@@ -3406,7 +3676,14 @@ mod tests {
             Self {
                 entries: Arc::new(Mutex::new(Vec::new())),
                 instance_id,
+                fail_acknowledge: AtomicBool::new(false),
             }
+        }
+
+        /// Arms the mock so every acknowledgement fails — the outbox shape
+        /// whose listing works but whose write path does not.
+        fn set_fail_acknowledge(&self, fail: bool) {
+            self.fail_acknowledge.store(fail, Ordering::SeqCst);
         }
 
         /// Enqueues `count` heartbeat messages with sent-at times 1..=count,
@@ -3527,6 +3804,9 @@ mod tests {
             acked_at: OffsetDateTime,
         ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
             Box::pin(async move {
+                if self.fail_acknowledge.load(Ordering::SeqCst) {
+                    return Err(MockOutboxError);
+                }
                 let mut entries = self.entries.lock().map_err(|_| MockOutboxError)?;
                 for entry in &mut *entries {
                     if entry.id() == entry_id && entry.state() == OutboxEntryState::Pending {
@@ -4792,18 +5072,20 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let instance_id = InstanceId::generate();
         let store = MockEngineStore::new();
+        // W11-D-3: the digest check verifies the streamed bytes against
+        // the declared digest, so the stored bytes must hash to it.
+        let artifact_bytes = vec![0x01, 0x02, 0x03];
+        let digest = rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&artifact_bytes).into());
         let mut artifact = rutilus_domain::Artifact::new(
             rutilus_domain::ArtifactId::generate(),
             rutilus_domain::ArtifactName::parse("backup")?,
             3,
-            rutilus_domain::Sha256Hex::parse(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )?,
+            digest,
             now,
         );
         artifact.record_bytes_received(3)?;
         artifact.mark_ready()?;
-        store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
+        store.set_artifact(&artifact, artifact_bytes)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
         let cursor = MockCursor::new();
@@ -5009,13 +5291,16 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let instance_id = InstanceId::generate();
         let store = MockEngineStore::new();
+        // The digest must match the healed bytes the repair writes back
+        // (W11-D-3): the truncated interim state never reaches the digest
+        // check, but the healed file does.
+        let healed_bytes = vec![0x01, 0x02, 0x03];
+        let digest = rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&healed_bytes).into());
         let mut artifact = rutilus_domain::Artifact::new(
             rutilus_domain::ArtifactId::generate(),
             rutilus_domain::ArtifactName::parse("backup")?,
             3,
-            rutilus_domain::Sha256Hex::parse(
-                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            )?,
+            digest,
             now,
         );
         artifact.record_bytes_received(3)?;
@@ -5056,7 +5341,7 @@ mod tests {
 
         // The repair path heals automatically: the operator re-restores the
         // file, and the next round distributes it and advances the cursor.
-        std::fs::write(store.artifact_file_path(artifact.id()), [0x01, 0x02, 0x03])?;
+        std::fs::write(store.artifact_file_path(artifact.id()), &healed_bytes)?;
         engine.report_artifacts().await?;
         let messages = outbox.pending_messages()?;
         assert_eq!(
@@ -5145,12 +5430,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transient_artifact_read_error_still_aborts_the_round()
+    async fn a_failed_retire_escalates_into_the_round_error()
     -> Result<(), Box<dyn Error + Send + Sync>> {
-        // W10-D-2: only the persistent failure shapes are absorbed. A
-        // non-NotFound I/O error (here a regular file blocking the artifact
-        // path) is potentially transient, so the round keeps the historical
-        // contract: the error propagates and the reconnect retries.
+        // W11-C-2: a failed retire is never swallowed — the pre-clean
+        // retire runs before the fresh distribution, and its acknowledge
+        // failure must end the round so the residual half-set never rides
+        // the flush on this connection.
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        // The stored bytes hash to the declared digest even though the
+        // armed retire fails before the digest check runs — the invariant
+        // holds regardless of the failure order.
+        let artifact_bytes = vec![0x01, 0x02, 0x03];
+        let digest = rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&artifact_bytes).into());
+        let mut artifact = rutilus_domain::Artifact::new(
+            rutilus_domain::ArtifactId::generate(),
+            rutilus_domain::ArtifactName::parse("backup")?,
+            3,
+            digest,
+            now,
+        );
+        artifact.record_bytes_received(3)?;
+        artifact.mark_ready()?;
+        store.set_artifact(&artifact, artifact_bytes)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let mut options = engine_options();
+        options.artifact_chunk_bytes = 1;
+        let engine = CenterSync::new(
+            &ChannelTransport,
+            &store,
+            &outbox,
+            &inbox,
+            &cursor,
+            &events,
+            FixedClock(now),
+            instance_id,
+            options,
+        );
+        // A residual half-set of the artifact, the shape the pre-clean
+        // retire would acknowledge; the armed outbox turns that retire
+        // into the escalated failure under test.
+        engine
+            .enqueue_outbox_entry(EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+                artifact_id: artifact.id().to_string(),
+                name: artifact.name().as_str().to_owned(),
+                total_bytes: artifact.size_bytes(),
+                sha256: artifact.sha256().into_bytes().to_vec(),
+            }))
+            .await?;
+        outbox.set_fail_acknowledge(true);
+
+        match engine.report_artifacts().await {
+            Err(CenterSyncError::Outbox(_)) => {}
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "the failed retire must escalate the round error, got: {other:?}"
+                ))
+                .into());
+            }
+        }
+        assert_eq!(
+            outbox.pending_messages()?.len(),
+            1,
+            "the half-set must survive the failed retire, not be dropped or acknowledged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_directory_blocking_the_artifact_path_is_absorbed_without_a_storm()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        // W11-F-1: a directory placeholder on the artifact path is a
+        // persistent condition — opening it fails with `PermissionDenied`
+        // (Windows) or `IsADirectory` (Unix), and only an operator fixing
+        // the file system heals it. The pre-fix code classified it as a
+        // generic read error and propagated it: the round aborted, the
+        // reconnect failed at the same artifact, and the 120-second storm
+        // ran until an operator intervened (the W10-D-1 pathology for a
+        // shape that cannot clear on its own). Both kinds are now absorbed
+        // like the missing-file shape: the report returns cleanly, nothing
+        // is enqueued, the cursor stays put, and the row stays `Ready`.
         let now = OffsetDateTime::UNIX_EPOCH;
         let instance_id = InstanceId::generate();
         let store = MockEngineStore::new();
@@ -5166,8 +5529,8 @@ mod tests {
         artifact.record_bytes_received(3)?;
         artifact.mark_ready()?;
         store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
-        // A directory now blocks the artifact path: opening it fails with a
-        // non-NotFound I/O error.
+        // A directory now blocks the artifact path: opening it fails with
+        // `PermissionDenied` or `IsADirectory`, never `NotFound`.
         std::fs::remove_file(store.artifact_file_path(artifact.id()))?;
         std::fs::create_dir(store.artifact_file_path(artifact.id()))?;
         let outbox = MockOutbox::new(instance_id);
@@ -5186,10 +5549,23 @@ mod tests {
             engine_options(),
         );
 
-        let outcome = engine.report_artifacts().await;
-        assert!(
-            matches!(outcome, Err(CenterSyncError::ArtifactRead { .. })),
-            "a non-NotFound read error must propagate as ArtifactRead, got: {outcome:?}"
+        // The report absorbs the failure: it returns cleanly, so the flush
+        // and the receive loop of the connection still run.
+        let outcome = match engine.report_artifacts().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "the directory placeholder must be absorbed, got: {e}"
+                ))
+                .into());
+            }
+        };
+        assert_eq!(
+            outcome,
+            ArtifactStreamOutcome::Stalled {
+                artifact_id: artifact.id()
+            },
+            "the absorbed failure must arm the stall timer"
         );
         assert_eq!(
             outbox.pending_messages()?.len(),
@@ -5202,6 +5578,87 @@ mod tests {
                 .is_none(),
             "the cursor must not advance past the failed artifact"
         );
+        assert_eq!(
+            store.artifact_state(artifact.id())?,
+            Some(ArtifactState::Ready),
+            "the row must stay Ready: the condition is retried, not abandoned"
+        );
+        // A second report behaves identically: no error, no growth — the
+        // per-cycle retry is cheap and bounded, not a storm.
+        let again = engine.report_artifacts().await;
+        assert!(
+            again.is_ok(),
+            "the retried report must absorb the same condition, got: {again:?}"
+        );
+        assert_eq!(outbox.pending_messages()?.len(), 0);
+        Ok(())
+    }
+
+    /// The classification seam under test: one read error mapped through the
+    /// engine's concrete error type and reduced to its absorbed-family shape.
+    fn classify_read_error_shape(
+        source: std::io::Error,
+    ) -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+        let artifact_id = rutilus_domain::ArtifactId::generate();
+        Ok(
+            match CenterSync::<
+                ChannelTransport,
+                MockEngineStore,
+                MockOutbox,
+                MockInbox,
+                MockCursor,
+                MockEventTail,
+                FixedClock,
+            >::classify_artifact_read_error(artifact_id, source)
+            {
+                CenterSyncError::ArtifactFileMissing { .. } => "missing",
+                CenterSyncError::ArtifactFileUnreadable { .. } => "unreadable",
+                CenterSyncError::ArtifactRead { .. } => "read",
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected classification: {other:?}"
+                    ))
+                    .into());
+                }
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_read_error_classification_separates_persistent_and_transient_kinds()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        // W11-F-1: the classification is the contract's seam — the
+        // persistent kinds (missing, permission-denied, directory) map to
+        // the absorbed family, and the genuinely transient kinds keep
+        // propagating as `ArtifactRead` so the reconnect retry can clear
+        // them (EMFILE/ENFILE, interruption, would-block). The direct test
+        // pins the seam without needing the platform to produce each kind.
+        assert_eq!(
+            classify_read_error_shape(std::io::Error::from(std::io::ErrorKind::NotFound))?,
+            "missing",
+            "a missing file must classify as the missing-file shape"
+        );
+        assert_eq!(
+            classify_read_error_shape(std::io::Error::from(std::io::ErrorKind::PermissionDenied))?,
+            "unreadable",
+            "a permission denial must classify as the unreadable shape"
+        );
+        assert_eq!(
+            classify_read_error_shape(std::io::Error::from(std::io::ErrorKind::IsADirectory))?,
+            "unreadable",
+            "a directory path must classify as the unreadable shape"
+        );
+        for transient in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_read_error_shape(std::io::Error::from(transient))?,
+                "read",
+                "a transient kind ({transient:?}) must keep propagating as ArtifactRead"
+            );
+        }
         Ok(())
     }
 
@@ -5217,31 +5674,31 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let instance_id = InstanceId::generate();
         let store = MockEngineStore::new();
+        // W11-D-3: both artifacts' digests must match their stored bytes —
+        // the healed `broken` distribution reaches the digest check.
+        let broken_bytes = vec![0x01, 0x02, 0x03];
+        let later_bytes = vec![0x03, 0x02, 0x01];
         let mut broken = rutilus_domain::Artifact::new(
             rutilus_domain::ArtifactId::generate(),
             rutilus_domain::ArtifactName::parse("broken")?,
             3,
-            rutilus_domain::Sha256Hex::parse(
-                "1111111111111111111111111111111111111111111111111111111111111111",
-            )?,
+            rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&broken_bytes).into()),
             now,
         );
         broken.record_bytes_received(3)?;
         broken.mark_ready()?;
-        store.set_artifact(&broken, vec![0x01, 0x02, 0x03])?;
+        store.set_artifact(&broken, broken_bytes)?;
         std::fs::remove_file(store.artifact_file_path(broken.id()))?;
         let mut later = rutilus_domain::Artifact::new(
             rutilus_domain::ArtifactId::generate(),
             rutilus_domain::ArtifactName::parse("later")?,
             3,
-            rutilus_domain::Sha256Hex::parse(
-                "2222222222222222222222222222222222222222222222222222222222222222",
-            )?,
+            rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&later_bytes).into()),
             now + time::Duration::SECOND,
         );
         later.record_bytes_received(3)?;
         later.mark_ready()?;
-        store.set_artifact(&later, vec![0x03, 0x02, 0x01])?;
+        store.set_artifact(&later, later_bytes)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
         let cursor = MockCursor::new();
@@ -5288,18 +5745,33 @@ mod tests {
         Ok(())
     }
 
+    // The heal scenario is one contiguous script — absorb, phase-1
+    // heartbeats, restore, phase-2 reconnect; splitting it would break
+    // the single-scenario assertion continuity.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn a_missing_artifact_file_does_not_take_the_connection_down()
+    async fn an_absorbed_artifact_stall_reconnects_and_heals_after_the_file_restore()
     -> Result<(), Box<dyn Error>> {
-        // W10-D-1 end to end: the run loop stays connected while a ready
-        // artifact's file is missing. The pre-fix round aborted with the
-        // classified error, the engine reconnected after the backoff, and
-        // failed at the same artifact again — the reconnect storm. Now the
-        // report absorbs the failure, the flush and the receive loop keep
-        // running, and the heartbeats keep flowing on the same wire.
+        // W11-P-1, the full healing sequence end to end: a ready artifact's
+        // file is missing. The pre-fix round aborted with the classified
+        // error and stormed on every reconnect; the W10-D-1 fix absorbed
+        // the failure, but the report only runs once per connection — the
+        // absorption kept the connection alive, and with the heartbeat
+        // outliving every idle timeout the retry never arrived on a stable
+        // network. Now the absorption arms the stall timer: the connection
+        // stays up (heartbeats flow, the flush and the receive loop keep
+        // running) for one reconnect period, then ends itself; the connect
+        // loop's backoff schedules the next attempt, and the reconnect
+        // re-runs the report. The operator restores the file before the
+        // stall fires, so the reconnect distributes the artifact and
+        // advances the cursor — the healing sequence, no manual second
+        // call.
         let now = OffsetDateTime::UNIX_EPOCH;
         let (transport, _state, mut wires) = ScriptedTransport::new(0);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        // The restore signal: the test tells the run task to materialize
+        // the artifact file again while the engine is stalled on it.
+        let (restore_tx, restore_rx) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let mut artifact = rutilus_domain::Artifact::new(
@@ -5307,7 +5779,7 @@ mod tests {
                 rutilus_domain::ArtifactName::parse("backup")?,
                 3,
                 rutilus_domain::Sha256Hex::parse(
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
                 )?,
                 now,
             );
@@ -5315,10 +5787,26 @@ mod tests {
             artifact.mark_ready()?;
             store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
             std::fs::remove_file(store.artifact_file_path(artifact.id()))?;
-            let outbox = MockOutbox::new(InstanceId::generate());
+            // The operator's restore: a helper task that writes the file
+            // back when the test signals it.
+            let artifact_path = store.artifact_file_path(artifact.id());
+            let restore = tokio::spawn(async move {
+                let _ = restore_rx.await;
+                std::fs::write(&artifact_path, [0x01, 0x02, 0x03])?;
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            });
+            let instance_id = InstanceId::generate();
+            let outbox = MockOutbox::new(instance_id);
             let inbox = MockInbox::new();
             let cursor = MockCursor::new();
             let events = MockEventTail::new(Vec::new());
+            let mut options = engine_options();
+            // One reconnect period of 120 ms: the stall timer and the
+            // backoff both use it, so the reconnect lands around 240 ms
+            // after the absorption — the margins keep the phase-1 and
+            // phase-2 assertions deterministic.
+            options.reconnect_after = Duration::from_millis(120);
+            options.artifact_chunk_bytes = 1;
             let engine = CenterSync::new(
                 transport,
                 &store,
@@ -5327,20 +5815,21 @@ mod tests {
                 &cursor,
                 &events,
                 FixedClock(now),
-                InstanceId::generate(),
-                engine_options(),
+                instance_id,
+                options,
             );
             engine
                 .run(async move {
                     let _ = stop_rx.await;
                 })
                 .await?;
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
+            restore.abort();
+            cursor.cursor_value(instance_id, SyncStream::Artifact)
         });
 
+        // Phase 1: the absorbed failure left the connection alive — the
+        // heartbeats keep flowing on the first wire.
         let mut wire = next_wire(&mut wires).await?;
-        // The heartbeats keep flowing: the absorbed failure left the
-        // connection alive.
         let mut heartbeats_seen = 0;
         while heartbeats_seen < 2 {
             let envelope = next_frame(&mut wire).await?;
@@ -5352,23 +5841,56 @@ mod tests {
                 heartbeats_seen += 1;
             }
         }
-        // No reconnect happened: the wire the engine sits on is still the
-        // first one.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // The operator restores the file before the stall fires.
+        restore_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the restore signal failed"))?;
+        // No early reconnect: the stall period has not elapsed yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             wires.try_recv().is_err(),
-            "the engine must stay connected, not reconnect on the absorbed failure"
+            "the connection must stay up for the stall period, not reconnect immediately"
         );
-
+        // Phase 2: the stall timer fires, the backoff elapses, and the
+        // reconnect re-runs the report — the restored file distributes.
+        let mut healed = next_wire(&mut wires).await?;
+        let manifest = next_outbox_frame(&mut healed).await?;
+        let Some(EnvelopeMessage::ArtifactManifest(manifest)) = manifest.message else {
+            return Err(std::io::Error::other("the healed wire must open with a manifest").into());
+        };
+        assert_eq!(manifest.total_bytes, 3);
+        for _ in 0..3 {
+            let envelope = next_outbox_frame(&mut healed).await?;
+            let Some(EnvelopeMessage::ArtifactChunk(_)) = envelope.message else {
+                return Err(std::io::Error::other("the healed wire must carry the chunks").into());
+            };
+        }
+        // The healed report advanced the artifact cursor.
         stop_tx
             .send(())
             .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
-        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
-            .await
-            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
-        assert!(
-            stopped.is_ok(),
-            "the engine must stop cleanly, got {stopped:?}"
+        let cursor_value = match tokio::time::timeout(Duration::from_secs(5), run).await {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => {
+                return Err(std::io::Error::other(format!(
+                    "the engine failed after the stall stop: {e}"
+                ))
+                .into());
+            }
+            Ok(Err(join_err)) => {
+                return Err(std::io::Error::other(format!(
+                    "the engine task joined with an error: {join_err}"
+                ))
+                .into());
+            }
+            Err(_) => {
+                return Err(std::io::Error::other("the engine did not stop in time").into());
+            }
+        };
+        assert_eq!(
+            cursor_value.as_deref(),
+            Some(manifest.artifact_id.as_str()),
+            "the healed report must advance the artifact cursor"
         );
         Ok(())
     }
@@ -5709,18 +6231,19 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let instance_id = InstanceId::generate();
         let store = MockEngineStore::new();
+        // W11-D-3: the redistributed bytes must hash to the declared digest.
+        let artifact_bytes = vec![0x01, 0x02, 0x03];
+        let digest = rutilus_domain::Sha256Hex::from_bytes(Sha256::digest(&artifact_bytes).into());
         let mut artifact = rutilus_domain::Artifact::new(
             rutilus_domain::ArtifactId::generate(),
             rutilus_domain::ArtifactName::parse("backup")?,
             3,
-            rutilus_domain::Sha256Hex::parse(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )?,
+            digest,
             now,
         );
         artifact.record_bytes_received(3)?;
         artifact.mark_ready()?;
-        store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
+        store.set_artifact(&artifact, artifact_bytes)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
         let cursor = MockCursor::new();
