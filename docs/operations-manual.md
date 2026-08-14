@@ -184,7 +184,12 @@ rutilus backup restore [--portable] PATH
 - 离线进行：**实例必须已停止**（运行时锁强制）；
 - 流程（§20.2）：验证完整性 → 解密 → 检查产品版本（版本不同报 `ProductVersionMismatch`）→
   检查 Schema 兼容（备份 Schema 更新时报 `NewerSchema` 拒绝）→ 恢复数据库、密钥信封、实例标记、TLS 对、制品文件 →
-  只读校验恢复后的数据库与备份快照字节一致 → 报告剩余待执行迁移数（下次启动应用）。
+  只读校验恢复后的数据库与备份快照字节一致 → **制品一致性检查**（wave-nine 起，`app/src/backup.rs`
+  `verify_restored_artifact_consistency`：把恢复后的数据库经临时副本核对「Ready 制品行有文件在 +
+  已恢复文件有行在」，不一致报 `RestoreArtifactConsistency { missing, orphan }`——缺失文件时修复指引为
+  「re-restore from a backup taken with the artifact files in place, or delete and re-upload」，
+  注意产品面无制品删除 API，需手工处置或重新恢复；检查只验存在性、不验内容摘要——内容由备份包
+  AEAD 认证与中心侧完成时摘要校验兜底）→ 报告剩余待执行迁移数（下次启动应用）。
 
 ### 6.3 跨机器恢复（重要注意事项）
 

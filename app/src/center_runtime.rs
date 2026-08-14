@@ -893,6 +893,15 @@ where
             // The console stopped on its own (a serving failure): stop the
             // accept loop too, and wait for the connection engines before
             // closing the store.
+            //
+            // W10-C-1: under axum 0.8.9 the serve future cannot resolve
+            // with an error — it always returns `Ok` — so this branch is
+            // unreachable in practice; the alignment with the stop branch
+            // below is branch consistency only, so a future dependency
+            // upgrade that introduces a failing serve path inherits the
+            // stop branch's order. A resolved serve means no in-flight
+            // handler exists, so the final drain's order is trivially
+            // correct either way — the console drained before it resolved.
             stop_signal.signal();
             if let Err(error) = accept_loop.await {
                 tracing::error!("the center accept loop task failed: {error}");

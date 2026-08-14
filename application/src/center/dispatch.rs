@@ -571,7 +571,22 @@ where
                 .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
-                CandidateVerdict::Resolved(dispatched) => return Ok(Some(dispatched)),
+                CandidateVerdict::Resolved(dispatched) => {
+                    // W10-F-2: the settlement re-runs once more,
+                    // defensively, before the retry reports the offer in
+                    // flight. `deliver_retry` settles the fresh path, but a
+                    // resolved retry never re-enters it, so duplicate rows
+                    // that ever exist for this id (an unexpected in-process
+                    // interleaving, or a crash between an enqueue and its
+                    // settlement) would otherwise persist un-converged here
+                    // forever. The settlement is idempotent — it retires
+                    // nothing while the one-pending-row invariant holds, and
+                    // the newest row it keeps is exactly the row whose
+                    // expiry this verdict reports.
+                    self.settle_duplicate_offers(request, operation_id, now)
+                        .await?;
+                    return Ok(Some(dispatched));
+                }
                 // W8-E-2: the never-enqueued judgment itself is
                 // cross-instance. A different-target offer *anywhere*
                 // (this site's queue, or another site's queue after a
@@ -617,7 +632,18 @@ where
                 .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
-                CandidateVerdict::Resolved(dispatched) => return Ok(Some(dispatched)),
+                CandidateVerdict::Resolved(dispatched) => {
+                    // W10-F-2: the defensive re-settlement of the single
+                    // candidate — a resolved retry never re-enters
+                    // `deliver_retry`, so the settlement would otherwise
+                    // skip this path entirely and any duplicate rows for
+                    // the id would persist un-converged. Idempotent: it
+                    // retires nothing while the one-pending-row invariant
+                    // holds.
+                    self.settle_duplicate_offers(request, operation_id, now)
+                        .await?;
+                    return Ok(Some(dispatched));
+                }
                 CandidateVerdict::NeverEnqueued | CandidateVerdict::DifferentTarget => {}
             }
         }
@@ -811,10 +837,17 @@ where
         let expires_at = now + CENTER_OFFER_TTL;
         self.enqueue_offer(request, operation_id, expires_at, now)
             .await?;
-        // W9-C-2: the never-enqueued judgment that led here was a read, and
-        // another center instance's same-key enqueue can commit between the
-        // read and this write — the offer is then delivered twice under the
-        // same id. The settlement converges the duplicates.
+        // W9-C-2 / W10-F-1: the never-enqueued judgment that led here was a
+        // read, and a same-key enqueue landing between the read and this
+        // write would deliver the offer twice under the same id. Under the
+        // product's single-active-instance model (operations-manual §4.2 —
+        // one center process per data directory, enforced by the exclusive
+        // `RuntimeLock` at startup) and the R6-C-1 per-site dispatch gate
+        // (which serializes same-key dispatches inside the process), no
+        // concurrent enqueue can actually land in that gap; the settlement
+        // below is defense-in-depth for any unexpected in-process
+        // interleaving or a future model change, and it converges the
+        // duplicates if they ever appear.
         self.settle_duplicate_offers(request, operation_id, now)
             .await?;
         Ok(DispatchedOperation::new(operation_id, expires_at))
@@ -824,27 +857,31 @@ where
     /// (W9-C-2).
     ///
     /// The never-enqueued judgment and the TTL retirement are reads
-    /// followed by an enqueue, and no lock spans the gap: a concurrent
-    /// same-key dispatch on another center instance can commit its offer
-    /// between the judgment and this instance's enqueue, leaving two
-    /// pending rows under the same operation id. The site's §17.5
-    /// idempotency dedups by operation id, so the duplicate cannot
-    /// double-execute — but the retry scan's documented invariant is at
-    /// most one pending offer per undecided operation, and the duplicate
-    /// would surface as a second row in every subsequent scan. The recheck
-    /// retires every pending row of the id but the newest, so any number
-    /// of racing instances converge on the newest row: each racer's
-    /// recheck leaves exactly the newest row it sees, the last recheck in
-    /// the timeline runs after the last enqueue, and no recheck can retire
-    /// the row that is newest at the final recheck — exactly one pending
-    /// offer survives and no interleaving empties the queue.
+    /// followed by an enqueue; a same-key enqueue landing between the
+    /// judgment and this instance's enqueue would leave two pending rows
+    /// under the same operation id. Under the product's deployment model
+    /// that interleaving cannot occur — the center is a single active
+    /// instance (operations-manual §4.2; `RuntimeLock` in
+    /// `platform/src/runtime_lock.rs` holds an exclusive lease on the data
+    /// directory, so a second process is refused at startup), and the
+    /// R6-C-1 per-site dispatch gate serializes same-key dispatches
+    /// within the process — so this settlement is defense-in-depth for an
+    /// unexpected in-process interleaving or a future model change, not a
+    /// live race. If duplicates ever appear, the recheck retires every
+    /// pending row of the id but the newest, so any number of racers
+    /// converge on the newest row: each racer's recheck leaves exactly
+    /// the newest row it sees, the last recheck in the timeline runs
+    /// after the last enqueue, and no recheck can retire the row that is
+    /// newest at the final recheck — exactly one pending offer survives,
+    /// no interleaving empties the queue, and the site's §17.5 idempotency
+    /// keeps the duplicate from double-executing.
     ///
-    /// The race surface is the addressed site's queue: a concurrent
-    /// enqueue of the same id addresses the same site (the same §17.5
-    /// key), so the bounded pending scan is the complete surface; a
-    /// re-home that moves the endpoint between the judgment and the
-    /// enqueue is outside the scan (the pre-existing cross-site pair,
-    /// whose rows the re-home model's old-site revocation retires).
+    /// The convergence surface is the addressed site's queue: a
+    /// concurrent enqueue of the same id addresses the same site (the
+    /// same §17.5 key), so the bounded pending scan is the complete
+    /// surface; a re-home that moves the endpoint between the judgment
+    /// and the enqueue is outside the scan (the pre-existing cross-site
+    /// pair, whose rows the re-home model's old-site revocation retires).
     async fn settle_duplicate_offers(
         &self,
         request: &CenterOperationRequest,
@@ -1757,6 +1794,17 @@ mod tests {
         // instance's same-key enqueue landing between the never-enqueued
         // judgment and this instance's enqueue.
         concurrent_offer_on_enqueue: Arc<Mutex<Option<OperationOffer>>>,
+        // W10-E-5 injection: one offer the first `list_pending` after a
+        // successful `enqueue` commits *before* listing — the deterministic
+        // stand-in for a racing same-key enqueue landing between this
+        // dispatch's own enqueue and its settlement (the reverse of the
+        // W9-C-2 before-enqueue injection). The row's creation time is
+        // carried with it, so the racing row is written as the later one.
+        concurrent_offer_after_enqueue: Arc<Mutex<Option<(OperationOffer, OffsetDateTime)>>>,
+        // W10-E-5: the successful enqueues so far, the trigger for the
+        // after-enqueue injection (the retry's own enqueue must have
+        // committed before the racing row lands).
+        enqueues: Arc<Mutex<u64>>,
         // W9-E-3: how many times the mock cross-instance read has been
         // issued, for the single-read assertions of the retry paths.
         cross_instance_reads: Arc<Mutex<u64>>,
@@ -1776,6 +1824,8 @@ mod tests {
                 roles: Arc::new(Mutex::new(None)),
                 enqueue_failures: Arc::new(Mutex::new(0)),
                 concurrent_offer_on_enqueue: Arc::new(Mutex::new(None)),
+                concurrent_offer_after_enqueue: Arc::new(Mutex::new(None)),
+                enqueues: Arc::new(Mutex::new(0)),
                 cross_instance_reads: Arc::new(Mutex::new(0)),
             }
         }
@@ -1795,6 +1845,25 @@ mod tests {
                 .concurrent_offer_on_enqueue
                 .lock()
                 .map_err(|_| MockStoreError)? = Some(offer);
+            Ok(())
+        }
+
+        /// Arms the W10-E-5 injection: the first `list_pending` call after
+        /// at least one successful `enqueue` commits one concurrent offer
+        /// row — with the given creation time — before listing. The
+        /// deterministic stand-in for a racing same-key enqueue landing
+        /// between this dispatch's own enqueue and its settlement, the
+        /// reverse of the W9-C-2 before-enqueue injection; the armed offer
+        /// is consumed (one shot).
+        fn inject_concurrent_offer_after_enqueue(
+            &self,
+            offer: OperationOffer,
+            created_at: OffsetDateTime,
+        ) -> Result<(), MockStoreError> {
+            *self
+                .concurrent_offer_after_enqueue
+                .lock()
+                .map_err(|_| MockStoreError)? = Some((offer, created_at));
             Ok(())
         }
 
@@ -2265,6 +2334,10 @@ mod tests {
                         .push(offer.clone());
                 }
                 entries.push(entry.clone());
+                // W10-E-5: the after-enqueue injection's trigger — the
+                // racing row must land only once this dispatch's own
+                // enqueue has committed.
+                *self.state.enqueues.lock().map_err(|_| MockStoreError)? += 1;
                 Ok(entry)
             })
         }
@@ -2275,6 +2348,45 @@ mod tests {
             limit: u64,
         ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
             Box::pin(async move {
+                // W10-E-5: when armed and the dispatch's own enqueue has
+                // already committed, commit the racing offer row before
+                // listing — the reverse interleaving the settlement must
+                // converge: the racing row is the newest by sequence, so
+                // the settlement retires this dispatch's own row instead.
+                let injected = if *self.state.enqueues.lock().map_err(|_| MockStoreError)? > 0 {
+                    self.state
+                        .concurrent_offer_after_enqueue
+                        .lock()
+                        .map_err(|_| MockStoreError)?
+                        .take()
+                } else {
+                    None
+                };
+                if let Some((offer, created_at)) = injected {
+                    let mut entries = self.state.entries.lock().map_err(|_| MockStoreError)?;
+                    let sequence = i64::try_from(entries.len())
+                        .unwrap_or(i64::MAX)
+                        .saturating_add(1);
+                    let envelope = Envelope {
+                        sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
+                        acked_sequence: 0,
+                        message: Some(EnvelopeMessage::OperationOffer(offer.clone())),
+                    };
+                    let payload_json =
+                        serde_json::to_string(&envelope).map_err(|_| MockStoreError)?;
+                    entries.push(OutboxEntry::new(
+                        OutboxEntryId::generate(),
+                        instance_id,
+                        sequence,
+                        payload_json,
+                        created_at,
+                    ));
+                    self.state
+                        .offers
+                        .lock()
+                        .map_err(|_| MockStoreError)?
+                        .push(offer);
+                }
                 let mut rows = self
                     .state
                     .entries
@@ -3314,6 +3426,104 @@ mod tests {
                 .count(),
             1,
             "the concurrent row is retired as acked history"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no fresh operation record may be minted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_same_key_enqueue_between_the_enqueue_and_the_settlement_converges()
+    -> Result<(), Box<dyn Error>> {
+        // W10-E-5: the reverse interleaving of the W9-C-2 race — the
+        // racing same-key enqueue lands after this dispatch's own enqueue
+        // but before its settlement, so the settlement retires this
+        // dispatch's own row (older by sequence) and the concurrent row
+        // survives. The convergence argument holds either way: exactly one
+        // pending row remains — the survivor is the newest by sequence,
+        // whichever side it is — and the site's §17.5 idempotency binds
+        // the duplicates under one operation id, so the write is executed
+        // at most once.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state.fail_enqueues(1)?;
+        assert!(matches!(
+            dispatch
+                .dispatch(
+                    &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                    now
+                )
+                .await,
+            Err(CenterDispatchError::Outbox(_))
+        ));
+        let stranded = state
+            .operations
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .values()
+            .next()
+            .cloned()
+            .ok_or("the stranded operation is missing")?;
+
+        // Arm the reverse injection: the first `list_pending` after the
+        // retry's own enqueue commits the racing same-key offer row
+        // (created later, so it is the newest by sequence) before listing.
+        state.inject_concurrent_offer_after_enqueue(
+            OperationOffer {
+                operation_id: stranded.id().to_string(),
+                endpoint_id: endpoint_id.to_string(),
+                site_id: site.to_string(),
+                command_json: serde_json::to_vec(&RedfishCommand::System(SystemCommand::Reset(
+                    ResetType::GracefulShutdown,
+                )))?,
+                target: String::from("/redfish/v1/Systems/1"),
+                expires_at_unix: (now + Duration::SECOND + CENTER_OFFER_TTL).unix_timestamp(),
+                actor_context: actor.to_string(),
+            },
+            now + Duration::seconds(2),
+        )?;
+
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            stranded.id(),
+            "the racing retry must converge on the existing operation id, never mint a fresh one"
+        );
+        let entries = state.entries_owned();
+        let pending = entries
+            .iter()
+            .filter(|entry| entry.state() == OutboxEntryState::Pending)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the reverse interleaving must converge on exactly one pending offer"
+        );
+        assert_eq!(
+            pending[0].created_at(),
+            now + Duration::seconds(2),
+            "the settlement retired this dispatch's own row; the concurrent row survives"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "this dispatch's own row is retired as acked history"
         );
         assert_eq!(
             state.operations.lock().map_err(|_| MockStoreError)?.len(),

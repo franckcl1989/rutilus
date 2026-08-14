@@ -152,9 +152,10 @@ jobs:
       # count at HEAD e85560a (`cargo test --locked --workspace -- --list`:
       # lib/integration 1912 + doc 1 = 1913, matching the 2026-08-14 门禁复跑
       # in release-readiness.md §五; re-measured locally on the same commit).
-      # W9-CI-2 re-sync (2026-08-14): the master-measured count is now 2016
+      # W9-CI-2 re-sync (2026-08-14): the master-measured count is now 2029
       # (`cargo test --locked --workspace -- --list`, measured after the
-      # wave-nine test additions; wave-seven/eight had pushed it to 2013).
+      # wave-nine test additions; wave-seven/eight had pushed it to 2013;
+      # 2016 was a mid-landing intermediate, superseded at integration).
       # The pin stays at 1913 on purpose: floor semantics, not an exact
       # count — the step fails only when the total dips below the pin, and
       # the --expect-tests list (R6-W-7) anchors six gate-critical names
@@ -611,15 +612,15 @@ jobs:
       # the step unless the number of tests that actually ran and passed
       # is >= 50. The pin is the master-measured count (2026-08-14 gate
       # re-run, W9-T-3 re-sync: `cargo test --locked -p rutilus-migration
-      # -- --list` reports 71 passed — 19 down_order_gate + 8 bare_sql_gate
-      # + 44 other migration tests). Floor semantics, not
+      # -- --list` reports 74 passed — 19 down_order_gate + 8 bare_sql_gate
+      # + 44 other migration tests + 3 initial transaction round-trips).
+      # Floor semantics, not
       # exact count: the step fails only when the count dips below the
       # pin — deleting a non-gate test file that still leaves 49 passing
       # tests passes, and only a dip below 50 (whole-suite deletion,
       # #[ignore], or cfg-emptying) fails. The pin is the lower bound of
       # the measured baseline; the test total grows with the product
-      # (the wave-nine gate self-check additions were still landing when
-      # this comment was re-synced — re-measure at integration).
+      # (re-measured at wave-ten integration: 74 = 19 + 8 + 44 + 3).
       #
       # R6-W-7 (2026-08-14): the --expect-tests list adds a NAME-level
       # assertion on top of the count — six core down_order_gate test names

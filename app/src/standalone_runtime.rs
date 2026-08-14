@@ -2517,11 +2517,21 @@ where
             // close happens after this function returns), so the task never
             // touches a closed store.
             drain_compensation(&mut compensation).await;
+            // W10-C-1: the console's shutdown chain fires BEFORE the
+            // bounded final drain, matching the stop branch's order below.
+            // Under axum 0.8.9 the serve future cannot resolve with an
+            // error — it always returns `Ok` — so this branch is
+            // unreachable in practice and the alignment is branch
+            // consistency only: a future dependency upgrade that
+            // introduces a failing serve path inherits the stop branch's
+            // tested order instead of this divergent one. (The send is a
+            // no-op here anyway: a serve future that resolved on its own
+            // has already dropped the channel receiver.)
+            let _ = scheduler_done_sender.send(());
             // R6-C-3: the queued audit appends are replayed in a bounded
             // final drain after the drain task has fully stopped, so the
             // stop does not discard the whole compensation queue.
             drain_audit_compensation_final(&services).await;
-            let _ = scheduler_done_sender.send(());
             result.map_err(StandaloneRunError::Serve)
         }
         signal = stop => {

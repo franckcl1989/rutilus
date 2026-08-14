@@ -520,7 +520,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | W9-F-4 Unicode 大小写与无效转义边界（LOW 声称 → 登记） | partial | ✅ 已登记（本行）：ASCII-only 小写使 `%C3%89`/`%C3%A9` 键不同（DSP0266 未明言非 ASCII）；`%FF` 经 from_utf8_lossy 变 U+FFFD 与合法拼写同键（fail-closed 方向）——两者均受 has_resource 精确匹配约束。登记为条件性边界 | `application/src/center/dispatch.rs:854-855` |
 | W9-P-2 停滞场景登记措辞落差（LOW 声称 → 登记措辞修正） | partial | ✅ 已登记（本行）：W8-P-1 的「id 集收窄为在飞操作数」在站点停滞场景退化（Queued 无上限累积时行查询/解密/N+1 回到全历史量级）——W8-P-1 行与 A1 未竟项 3 对扫描面诚实，本行补「在飞集本身无界时收窄为空话」的措辞精确化；缓解是策略性选择（在飞上限/停滞拒绝），非查询优化 | `persistence/src/operation_repository.rs:663-748` |
 | W9-E-4 mock 与生产保真缺口（观察项） | NOTE | ✅ 已登记（本行）：mock 跨实例读逐行解码全部条目（生产索引先行只解命中行）——mock 严格更 fail-closed，方向单向（mock ⊇ 生产），任何 mock 绿的测试在生产也绿；对齐会降低 mock 严格性，登记不修 | `application/src/center/dispatch.rs:2171-2189` |
-| W9-D-4 第八波块「459→513」自引（refuted） | — | **refuted**（按「历史点-时登记保留原文」惯例：该行是修复动作的点-时记录，「459→513」是历史事实描述非现行引用；security-review:199 的 533 是现行锚——两文档角色不同） | `docs/known-limitations.md` 第八波块 |
+| W9-D-4 第八波块「459→513」自引（refuted） | — | **refuted**（按「历史点-时登记保留原文」惯例：该行是修复动作的点-时记录，「459→513」是历史事实描述非现行引用；security-review:199 的现行锚为 553——两文档角色不同；本行行文中的「533」系 wave-ten 修正的笔误） | `docs/known-limitations.md` 第八波块 |
 | W9-F-3 恢复延迟语义变化（NOTE → 并入 E-1 行与 T-1 测试） | — | 行为变化真实（修复前立即重投 → 修复后 TTL 有界），A1.md 的「同 id 返回」已隐含该语义（批评部分成立略有夸大）；测试缺口已由 W9-T-1 两测试钉住——并入上两行，不单独成条 | — |
 
 > 以上偏差均为当前 master 的真实状态；对应设计条款见仓库根目录
