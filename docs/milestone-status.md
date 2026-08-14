@@ -319,6 +319,21 @@
 > 2013→2029（+16）；per-crate：rutilus 187→191 / application 387→393 / migration 68→74 /
 > persistence 237 / ui 145，其余不变），fmt / clippy `-D warnings` 干净；逐项登记见
 > `known-limitations.md` §九（第九波块）与 `docs/r9-findings/`（A1-A4 区域登记）。
+> **迭代二十四已落地（2026-08-14，HEAD = 57617bb，1 个提交）——wave-ten 对抗修复批次**：
+> 第十波对抗审查（7 透镜）并行攻击 wave-nine 状态，约 25 条发现 → 去重约 19 条交 3 个独立
+> 怀疑者核验 → **13 项确认修复 + 2 项建议并入既有登记 + 派发族 3 项经部署模型仲裁降注释
+> 修正**。本轮实质收获 = **制品条件族**（D-1 缺文件楔死整同步面 / D-2 空截断静默丢失 /
+> E-2 半套无界累积，三项 MEDIUM 全 CONFIRMED）：持久失败在 report_artifacts 内**吸收**
+> （error 日志带修复路径、游标停在制品前、offer 通道存活、文件恢复自动愈合）、EOF 字节
+> 与声明 size 比对（`ArtifactSizeMismatch` 带诊断）、outbox 半套按 artifact_id 退休收敛；
+> 「置 Failed 终态」经三层证据机械不可行（domain 拒绝终态覆写 + store TerminalConflict），
+> 替代语义如实论证登记。核验员的重要推翻：C-1 自败分支机制被 axum 0.8.9 依赖源码推翻
+> （serve 不可报错、resolve ⟹ 连接任务已排空，分支不可达）——修复理由改为分支一致性；
+> F-1 派发族经部署模型仲裁（单活动实例 + RuntimeLock + R6-C-1 闸门）降为 settle 注释修正 +
+> 幂等 re-settle 防御性补强。**2036 测试 0 失败**（2026-08-14 实测，增量 2029→2036（+7）；
+> per-crate：application 393→400 / rutilus 191 / migration 74，其余不变），fmt / clippy
+> `-D warnings` 干净；逐项登记见 `known-limitations.md` §九（第十波块）与
+> `docs/r10-findings/`（A1-A2 区域登记）。
 > 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-13 复核，wave-one
@@ -833,3 +848,11 @@ known-limitations §八 events 存储增长（§14.4 展示有界/存储无界�
 > CI-1/2 注释、D-1/D-2 锚点、D-3 手册限定、T-2/T-3 测试补缺；**2029 测试 0 失败（+16）**；
 > 逐项状态见 `known-limitations.md` §九（第九波块）；区域修复登记见 `docs/r9-findings/`
 > （A1-A4）。
+> **第十波对抗审查（wave-ten，2026-08-14，HEAD = 57617bb，1 个提交）**：7 透镜并行攻击
+> wave-nine 状态，约 25 条发现 → 去重约 19 条交 3 个独立怀疑者 → **13 项确认修复 + 2 项
+> 并入既有登记 + 3 项部署模型仲裁降注释修正**——本轮实质收获为制品条件族（D-1 缺文件
+> 楔死 / D-2 空截断静默丢失 / E-2 半套累积，全部 MEDIUM CONFIRMED，统一吸收 + EOF 比对 +
+> outbox 退休修复，置 Failed 经三层证据机械不可行）；核验员的重要推翻：C-1 自败分支机制
+> 被 axum 0.8.9 依赖源码推翻（分支不可达）→ 修复理由改分支一致性；F-1 派发族经部署模型
+> 仲裁降 settle 注释修正 + 幂等 re-settle；**2036 测试 0 失败（+7）**；逐项状态见
+> `known-limitations.md` §九（第十波块）；区域修复登记见 `docs/r10-findings/`（A1-A2）。

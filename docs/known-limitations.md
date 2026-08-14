@@ -351,6 +351,11 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 > （ba110ce）——落地前全部门禁复跑（fmt / clippy `-D warnings` 零警告、**2029 测试 0 失败**
 > （增量 2013→2029 +16）），逐项状态见下表「第九波块」；refuted/partial 与 NOTE 级未修项
 > 如实登记于下。
+> **第十波对抗审查（wave-ten，2026-08-14，HEAD = 57617bb，1 个提交）**：7 透镜并行攻击
+> wave-nine 状态，约 25 条发现 → 去重约 19 条交 3 个独立怀疑者 → **13 项确认修复 + 2 项
+> 并入既有登记 + 派发族 3 项部署模型仲裁降注释修正**。13 项修复落地（57617bb）——落地前
+> 全部门禁复跑（fmt / clippy `-D warnings` 零警告、**2036 测试 0 失败**（增量 2029→2036
+> +7）），逐项状态见下表「第十波块」；NOTE 级未修项如实登记于下。
 
 | 遗留项 | 级别 | 现状 / 后续方案 | 事实来源 |
 |---|---|---|---|
@@ -522,6 +527,29 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | W9-E-4 mock 与生产保真缺口（观察项） | NOTE | ✅ 已登记（本行）：mock 跨实例读逐行解码全部条目（生产索引先行只解命中行）——mock 严格更 fail-closed，方向单向（mock ⊇ 生产），任何 mock 绿的测试在生产也绿；对齐会降低 mock 严格性，登记不修 | `application/src/center/dispatch.rs:2171-2189` |
 | W9-D-4 第八波块「459→513」自引（refuted） | — | **refuted**（按「历史点-时登记保留原文」惯例：该行是修复动作的点-时记录，「459→513」是历史事实描述非现行引用；security-review:199 的现行锚为 553——两文档角色不同；本行行文中的「533」系 wave-ten 修正的笔误） | `docs/known-limitations.md` 第八波块 |
 | W9-F-3 恢复延迟语义变化（NOTE → 并入 E-1 行与 T-1 测试） | — | 行为变化真实（修复前立即重投 → 修复后 TTL 有界），A1.md 的「同 id 返回」已隐含该语义（批评部分成立略有夸大）；测试缺口已由 W9-T-1 两测试钉住——并入上两行，不单独成条 | — |
+| **第十波块（wave-ten 对抗发现，2026-08-14，13 修复 + 2 并入 + 3 仲裁降级）** | | | |
+| W10-D-1 Ready 制品文件缺失 → 站点↔中心同步整体永久卡死 | MEDIUM | ✅ **已修复**（57617bb）：ArtifactFileMissing 经 `?` 传播使 flush 与 receive 均不可达 → 永久重连风暴全通道停服。修复：持久失败在 report_artifacts 内**吸收**（`tracing::error!` 带修复路径、游标停在制品之前、flush/receive 照常运行），文件恢复后下轮自动愈合；「跳过」方向被 W9-S-2 论证为永久不一致不可选，「置 Failed」机械不可行（见 A1 登记）。测试 `a_missing_artifact_file_does_not_take_the_connection_down`（run 级端到端，还原旧行为必败的判别力验证） | `application/src/center_sync.rs:1997-2031, 2273-2283` |
+| W10-D-2 Ready 制品文件为空/截断 → 静默跳过 + 游标前移永久丢失 | MEDIUM | ✅ **已修复**（57617bb）：reader 累计已读字节、EOF 与声明 size 比对——空/截断/超长 → `ArtifactSizeMismatch { read_bytes, declared_bytes }` 诊断错误（不再 Ok 放行 + 游标前移），同走吸收 + 游标不动 + 下轮重试。附带佐证：W9-S-2 的 restore 检查只验存在性不验长度，截断文件能通过校验（触发面比缺文件更宽）。测试 `an_empty_artifact_file_is_absorbed_and_never_silently_skipped`、`a_truncated_artifact_file_leaves_no_half_set_and_heals` | `application/src/center_sync.rs:2075-2206, 2494-2513` |
+| W10-E-2 制品条件使 offer 通道停服 + 未冲刷半套无界累积 | LOW | ✅ **已修复**（57617bb）：①D-1 的吸收使通道存活；②`retire_pending_artifact_entries` 在任一分发失败后按 artifact_id 退休该制品全部 pending 条目（含历史周期残留半套），outbox 收敛回零（扫描界 = 单制品全集字节上限 2049，bounded-scan 残余按 settle 先例登记）。测试 `a_stale_half_set_of_a_failed_artifact_is_retired_from_the_outbox` | `application/src/center_sync.rs:2212-2240, 2333-2357` |
+| W10-C-1 = W10-F-7 自败分支与 stop 分支顺序分歧 | LOW/MED→NOTE | ✅ **已修复（分支一致性）**（57617bb）：核验员经 axum 0.8.9 依赖源码推翻核心机制——serve future 恒返回 Ok(()) 不可报错、resolve ⟹ 全部连接任务已结束——自败分支是不可达的防御性死代码，「在飞 handler 竞速」不成立。修复：Edge 自败分支 sender 前移与 stop 分支同序（理由 = 分支一致性 + 未来依赖升级防护），Center 自败分支补注释。不加测试（分支不可达） | `app/src/standalone_runtime.rs:2520-2530`；`app/src/center_runtime.rs:897-905` |
+| W10-F-1 = W10-C-2② fresh 路径多进程双铸 | MEDIUM 声称→NOTE | ✅ **已处置（注释修正）**（57617bb）：机制属实但部署模型使多进程不可达——单活动实例（operations-manual §4.2）+ RuntimeLock（同主机第二进程启动即拒）+ R6-C-1 per-site 闸门。settle 注释从「另一中心实例并发」模型改写为单实例下的纵深防御定位 | `application/src/center/dispatch.rs:840-886` |
+| W10-F-2 settle 崩溃缝隙 | LOW 声称→NOTE | ✅ **已处置（廉价补强）**（57617bb）：单进程下崩溃只留自己一行（正常 in-flight），双 pending 需并发同 key（不可达）；两个 Resolved 分支补幂等 re-settle 防御性复核 | `application/src/center/dispatch.rs:575-588, 636-648` |
+| W10-E-5 settle 测试只钉一个交错 | NOTE | ✅ **已修复**（57617bb）：mock 新增 `concurrent_offer_after_enqueue` 注入点 + 反向交错测试——断言「恰一行 pending」（与收敛性论证一致，不断言存活哪行） | `application/src/center/dispatch.rs:3439-3526` |
+| W10-CI-1 / W10-CI-2 ci.yml 注释计数过时 | LOW | ✅ **已修复**（57617bb）：Migration 注释 71→74（19+8+44+3 往返）；workspace 注释 2016→2029（注明 2016 为落地中途中间值）；known-limitations 的修复自述与文件不符的问题一并修正 | `.github/workflows/ci.yml:155-165, 610-622` |
+| W10-D-1（W10-W 编号）refuted 行证据引用笔误 | NOTE | ✅ **已修复**（57617bb）：W9-D-4 refuted 行的「security-review:199 的 533」修正为 553（git 证明 123b67e 重锚后现行锚为 553） | `docs/known-limitations.md` 第九波块 |
+| W10-M-1 手册 §6.2 未记录制品一致性检查 | NOTE | ✅ **已修复**（57617bb）：§6.2 流程补制品一致性检查步骤 + 失败模式说明（含「删行重传无 API 需手工处置」提示与「只验存在性不验摘要、内容由 AEAD + 中心摘要校验兜底」） | `docs/operations-manual.md` §6.2 |
+| W10-T-1 流式分发内存性质零钉扎 | NOTE | ✅ 已登记（本行）：distribute 测试全是可观察输出性质（旧 fs::read 实现下同样全绿），「峰值 = 1 块 + outbox 条目」零钉扎；可行的代理钉扎（channel 容量断言 / 注入阻塞 reader）价值中等偏下；「缺文件零入队」已由 A1 补强的 outbox 空断言覆盖 | `application/src/center_sync.rs` 测试区 |
+| W10-S-3 中心侧半制品行永久化无治理 | LOW | ✅ 已登记（本行）：站点永久中断/吊销后中心制品行恒滞留 Uploading、部分文件永久留盘；中心侧无制品 reaper/清扫（W7-E-6 只登记 operations）、无删除/管理 API、控制台无制品视图；每制品占用受 cap 与实发字节双重界住——W7-E-6 操作族缺口的制品侧镜像，未来引入制品生命周期治理时一并处理 | `web/src/lib.rs:995-1017`；`app/src/center_runtime.rs` |
+| W10-P-1 settle 每 deliver_retry +1 次 256 行扫描 | LOW | ✅ 已登记（本行）：settle 与 find_undecided 的 pending 扫描重复（扫描 + 逐行解密 + serde 重建 ×2，≈0.5-2ms/次）；TTL 门控下每 op 每 15 分钟至多一次；复用需穿透函数边界传参、收益小——登记成本 | `application/src/center/dispatch.rs:848-872` |
+| W10-P-2 = W10-F-5 restore 一致性检查成本链 + 内容校验缺口 | LOW/NOTE | ✅ 已登记（本行）：检查新增整库副本写 + 副本跑迁移 + 3 次无界枚举——db 写 3 次（+50% 而非 2×，pre-restore 快照是既有主导成本）、SSD 2-8s；副本与无界枚举均有正当理由（无迁移只读打开与真实 open 不一致、限行假阴性放毒）；内容校验缺口（只验存在性不验摘要）被备份包 AEAD 认证 + 中心完成时摘要校验双重兜底，窗口极窄 | `app/src/backup.rs:426-496` |
+| W10-P-7 / W10-P-8 restore 检查的无界枚举与同步 I/O | NOTE | ✅ 已登记（本行）：3 次 list_artifacts_by_state 无界单查询（有界于磁盘、恢复时一次）；同步 GB 级 I/O 在 async worker 上（restore 持 runtime lock 无并发任务——无实际影响面，既存模式延伸） | `app/src/backup.rs:448-460` |
+| W10-S-1 / W10-S-2 restore 副本残留与 reader 脱离 | NOTE | ✅ 已登记（本行）：硬崩溃下临时副本（含凭据密文）残留 %TEMP%/tmp——同用户、密文、纯取证面（启动清理策略成本/收益低）；spawn_blocking reader 取消脱离——channel 关闭自终止无挂死，唯一无界路径 = 挂起文件系统（环境故障非攻击面） | `app/src/backup.rs:432-443`；`application/src/center_sync.rs:2026-2054` |
+| W10-E-1 黑窗内操作员视角完全静默 | NOTE | ✅ 已登记（本行）：吸收返回 Ok（同 id + 原 expiry）但 UI 成功文案与全新派发逐字相同、列表不渲染 id/expiry——操作员无法区分「新派发」与「被既有在飞操作吸收」；响应已带 id/expiry，修复成本低（吸收标志或 UI 比对），未来 UX 迭代时处理 | `ui/src/lib.rs:11433-11435` |
+| W10-E-3 持久中途失败下中心零感知 | NOTE | ✅ 已登记（本行）：协议无「站点读失败」帧——中心永远不知道缺文件/读错；与 W7-S-2 无删除 API 叠加无收敛路径；「delete and re-upload」指引无 API 可执行、re-restore 需停实例。与 S-3（治理切片）互补 | `center-protocol/proto/rutilus/center/v1/center.proto` |
+| W10-E-4 站点自停机 drain 窗口仍可接受 offer | NOTE | ✅ 已登记（本行）：引擎 stop 信号在 run_background_services 返回后才触发——窗口内 offer 被接受（持久化 + Accepted 回执）但执行延迟到下次启动（scheduler 每 2s 扫 Queued 重启必执行，操作不丢失仅延迟）；与「站点接受后崩溃」同形（一般属性非窗口特有） | `app/src/site_runtime.rs:784-790` |
+| W10-T-2 Center 停机窗口测试 200ms 睡眠确定性 | NOTE | ✅ 已登记（本行）：睡眠覆盖「handler 抵达 derivation gate」的派发竞态——CI 负载下 200ms 不足则 handler 未在飞 → remaining=4 断言假失败（flake，低概率）；Edge 孪生测试纯事件驱动零墙钟；事件化改造成本中等 | `app/src/center_runtime.rs:2372-2374` |
+| W10-S-T-1 = W10-F-6 互检 lockstep 削弱与提取器脆性 | NOTE | ✅ 已登记（本行）：互检覆盖 strip+split 两函数体（比声称更全）；残余 = 两份拷贝被同一错误语义同时修改时互检通过（仅自检兜底）；fn_body 括号计数不识别字面量内括号——单侧错切导致响亮失败（安全方向），两侧同错回到 lockstep 残余 | `migration/tests/down_order_gate.rs:2473-2509` |
+| W10-F-4 并入 W9-E-4（mock fail-closed 面宽于生产） | NOTE | 已并入 W9-E-4 行：增量仅「W9-F-6 测试无法区分同行/他行 corrupt 形状」；另修正 W9-E-4 行的锚点漂移（2171-2189 → 2315-2354） | 第九波块 W9-E-4 行 |
 
 > 以上偏差均为当前 master 的真实状态；对应设计条款见仓库根目录
 > `redfish-management-product-final-design.md`。
