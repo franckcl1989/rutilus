@@ -21828,6 +21828,21 @@ mod tests {
             failed.is_failed(),
             "a failed load-earlier must surface the error hint"
         );
+        // W9-T-2: both visible hint states are pinned on the catalog copy —
+        // a failed load-earlier names the earlier page, a hard failure the
+        // unavailable log (the sibling W8-W-5 test pins the in-flight
+        // `Loading` states; the `Ready`/`Failed` arms were untested).
+        assert_eq!(
+            failed.error_hint_text(),
+            AUDIT_LOAD_EARLIER_ERROR_HINT,
+            "a kept window with a failed load-earlier names the older page, \
+             not the unavailable log"
+        );
+        assert_eq!(
+            AuditListState::Failed.error_hint_text(),
+            Lang::En.strings().unavailable_audit,
+            "a hard audit failure stays on the unavailable copy"
+        );
         assert_eq!(
             failed.event_cards().len(),
             1,

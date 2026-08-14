@@ -930,8 +930,19 @@ where
             // requeues bypass the budget and be dropped without a replay
             // attempt).
             drain_compensation(&mut compensation).await;
+            // W9-C-1: the console's graceful drain is awaited BEFORE the
+            // bounded final drain. The console shutdown future resolves on
+            // the stop signal alone, so hyper's graceful drain (bounded by
+            // `GRACEFUL_DRAIN_TIMEOUT`) runs concurrently with the joins
+            // above; awaiting the server here guarantees no in-flight
+            // handler is left when the final drain runs, so an audit append
+            // that fails in the last handler lands in the queue before the
+            // final drain instead of being silently dropped on exit. The
+            // serving result is captured (not `?`-propagated) so the final
+            // drain still runs when the console errored.
+            let serve_result = server.await.map_err(CenterRunError::Serve);
             drain_audit_compensation_final(&state).await;
-            server.await.map_err(CenterRunError::Serve)
+            serve_result
         }
     }
 }
@@ -1314,7 +1325,10 @@ mod tests {
     // dev-dependency.
     use sea_orm::sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
     use time::{Duration, OffsetDateTime};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::AsyncWriteExt as _,
+        net::{TcpListener, TcpStream},
+    };
 
     use super::*;
     use crate::standalone_runtime::{
@@ -2256,6 +2270,143 @@ mod tests {
         assert!(
             captured.contains("remaining=2"),
             "both requeued events must reach the bounded final drain (remaining=2), captured: \
+             {captured}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_center_drain_window_enqueue_reaches_the_final_drain() -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W9-C-1: the center stop path awaits the console's graceful drain
+        // BEFORE the bounded final drain. The console shutdown future
+        // resolves on the stop signal alone, so the graceful drain runs
+        // concurrently with the background joins — an in-flight handler's
+        // failed audit append can land in the compensation queue while the
+        // drain is still running, and the final drain must run after the
+        // console has fully drained to see it.
+        //
+        // The observable: a sign-in request whose handler is held in flight
+        // (its password verification waits on the derivation gate the test
+        // holds) keeps the console drain waiting; an event enqueued during
+        // that window must reach the final drain — the budget-exhausted
+        // warning reports `remaining=4` (the sabotaged append queued before
+        // the stop, the sign-in handler's `started`+`failed` pair, and the
+        // drain-window event). Under the pre-fix order the final drain ran
+        // before the console drain and exhausted its budget against the one
+        // event already queued, so the handler's pair and the drain-window
+        // event were silently dropped — the warning reported `remaining=1`.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let binding = bind_console(&paths).await?;
+        let console_address = binding.address();
+        let acceptor = bind_acceptor(&paths).await?;
+        let gateway = Arc::new(RedfishGateway::from_system_roots().await?);
+
+        let now = OffsetDateTime::now_utc();
+        let first = AuditEvent::started(audit_context()?, now);
+        let drain_window = AuditEvent::started(audit_context()?, now + Duration::seconds(1));
+        queue_audit_compensation_events(std::slice::from_ref(&first))?;
+
+        // Sabotage the store before the runtime starts: every audit append
+        // now fails with a transient database condition, so the queued
+        // event stays in the queue through the run and reaches the shutdown
+        // final drain.
+        let writer = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(paths.database_path())
+                .create_if_missing(false),
+        )
+        .await?;
+        sea_orm::sqlx::query("DROP TABLE audit_events")
+            .execute(&writer)
+            .await?;
+        writer.close().await;
+
+        // The derivation gate is held from before the login: the sign-in
+        // handler's dummy password verification waits on the slots, so the
+        // handler — and with it the console's graceful drain — stays in
+        // flight for as long as the test chooses, with no dependence on the
+        // Argon2id duration. The store write gate stays free, so the
+        // compensation drain task and the shutdown final drain run
+        // unblocked: under the pre-fix order the bounded final drain then
+        // runs before the console drain and exhausts its budget against
+        // `first` alone.
+        let derivation_permits = crate::standalone_runtime::hold_derivation_gate_for_test().await?;
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = stop_receiver.await;
+            Ok::<(), io::Error>(())
+        };
+        let runtime = tokio::spawn(run_center_services(
+            Arc::clone(&state),
+            binding,
+            acceptor,
+            gateway,
+            stop,
+        ));
+
+        // A sign-in for an unknown user: the public handler runs its dummy
+        // password verification — blocked on the held derivation gate — and
+        // would then append its `started`+`failed` audit pair. The handler
+        // is in flight from the moment the request reaches it, so the
+        // console drain waits for it. The connection is kept open so the
+        // drain keeps waiting until the gate is released.
+        let mut console = TcpStream::connect(console_address).await?;
+        let login_body =
+            br#"{"username":"admin","password":"correct horse battery staple","totp_code":null}"#;
+        let mut login_request = Vec::new();
+        login_request.extend_from_slice(
+            b"POST /api/v1/auth/login HTTP/1.1\r\n\
+              Host: center\r\n\
+              Content-Type: application/json\r\n\
+              Content-Length: ",
+        );
+        login_request.extend_from_slice(login_body.len().to_string().as_bytes());
+        login_request.extend_from_slice(b"\r\nConnection: keep-alive\r\n\r\n");
+        login_request.extend_from_slice(login_body);
+        console.write_all(&login_request).await?;
+        console.flush().await?;
+        // Let the handler reach the verification gate before the stop; it
+        // is in flight either way.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (dispatch, buffer) = capture_warn_diagnostics();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        stop_sender
+            .send(())
+            .map_err(|()| io::Error::other("the test stop receiver was dropped"))?;
+        // Wait out the final drain's whole budget: under the pre-fix order
+        // the final drain has run (and exhausted its budget against `first`)
+        // by now, so the handler's pair and the enqueue below land after it
+        // and are dropped; under the fixed order the console drain is still
+        // waiting on the in-flight sign-in handler and the final drain has
+        // not run yet.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        queue_audit_compensation_events(std::slice::from_ref(&drain_window))?;
+        // Release the derivation gate: the sign-in handler's verification
+        // runs, its appends fail and enqueue, the handler completes, the
+        // console drain finishes, and only then does the final drain run.
+        // The console connection stays open until the run completes —
+        // dropping it early would cancel the in-flight handler mid-append
+        // and lose its queued events.
+        drop(derivation_permits);
+        drop(state);
+        let result = runtime
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        drop(console);
+
+        assert!(
+            result.is_ok(),
+            "the shutdown run must complete, got: {result:?}"
+        );
+        let captured = captured_text(&buffer)?;
+        assert!(
+            captured.contains("remaining=4"),
+            "the drain-window event must reach the bounded final drain (remaining=4), captured: \
              {captured}"
         );
         Ok(())

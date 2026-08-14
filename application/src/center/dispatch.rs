@@ -309,6 +309,33 @@ type DispatchErrorOf<Store, Outbox, Roles> = CenterDispatchError<
     <Roles as CenterRoleRepository>::Error,
 >;
 
+/// The verdict of one candidate resolution against the request's dispatch
+/// key (W9-E-3).
+///
+/// `resolve_candidate` decides the candidate from the offer facts alone —
+/// including the cross-instance directed read when the pending scan cannot
+/// see the operation — and hands the distinction to `find_undecided`
+/// instead of re-issuing the read: the old single-candidate path re-read
+/// across instances to separate "never enqueued" from "different target",
+/// a second read that also raced with a concurrent enqueue of the same key
+/// (the second read could mistake the fresh row for a different target and
+/// mint a new id, double-executing the write).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CandidateVerdict {
+    /// The candidate is the same dispatch as the request — in flight with
+    /// the newest offer's expiry, or retired and re-delivered under the
+    /// same id.
+    Resolved(DispatchedOperation),
+    /// No instance's queue knows the operation at all — its offer was
+    /// never enqueued, and the retry delivers the stranded offer under
+    /// the same id (the single-candidate repair).
+    NeverEnqueued,
+    /// The candidate's newest offer targets a different resource — a
+    /// different operation on the same endpoint and command, and the
+    /// retry of this request starts fresh below.
+    DifferentTarget,
+}
+
 impl<Store, Outbox, Roles> CenterOperationDispatch<Store, Outbox, Roles>
 where
     Store: CenterProjectionRepository + OperationStore,
@@ -448,7 +475,12 @@ where
     ///   candidate, so a different-target dispatch is never blind-merged
     ///   into its id (F1, W3F-1) and an in-flight or scan-truncated offer
     ///   returns in flight or re-delivers under the same id exactly like
-    ///   the multi-candidate path (W3F-5).
+    ///   the multi-candidate path (W3F-5). The directed read's judgment is
+    ///   carried out of [`Self::resolve_candidate`] as the three-way
+    ///   [`CandidateVerdict`] (W9-E-3) — the old code re-issued the
+    ///   cross-instance read after a `None` to separate "never enqueued"
+    ///   from "different target", a duplicate read that raced a concurrent
+    ///   same-key enqueue.
     ///
     /// The tracking scan queries every candidate state scoped to the
     /// endpoint (W7-P-1: the SQL rides the endpoint index first, so the
@@ -527,39 +559,40 @@ where
             // `operation_id` column value) are backfilled by the directed
             // read itself, so an acknowledged pre-migration offer is never
             // mistaken for a never-enqueued record.
-            if let Some(dispatched) = self
+            //
+            // W9-E-3: the verdict carries the never-enqueued /
+            // different-target distinction the old code re-derived with a
+            // second cross-instance read after `resolve_candidate`
+            // returned `None` — the directed read decides it once, so the
+            // single-candidate path issues exactly one cross-instance
+            // read, and no second read can race a concurrent same-key
+            // enqueue into a fresh id.
+            match self
                 .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
-                return Ok(Some(dispatched));
+                CandidateVerdict::Resolved(dispatched) => return Ok(Some(dispatched)),
+                // W8-E-2: the never-enqueued judgment itself is
+                // cross-instance. A different-target offer *anywhere*
+                // (this site's queue, or another site's queue after a
+                // re-home) proves the id was already delivered for a
+                // different key and must not be reused — the retry starts
+                // fresh below. Only an id no instance's queue knows at all
+                // was never enqueued, and its stranded offer is delivered
+                // now.
+                CandidateVerdict::DifferentTarget => return Ok(None),
+                CandidateVerdict::NeverEnqueued => {
+                    tracing::warn!(
+                        "site {}: delivering the offer a failed dispatch stranded for \
+                         operation {operation_id}",
+                        request.site_id
+                    );
+                    return self
+                        .deliver_retry(request, operation_id, now)
+                        .await
+                        .map(Some);
+                }
             }
-            // W8-E-2: the never-enqueued judgment itself is cross-instance.
-            // `resolve_candidate` returned `None` either because no
-            // instance's queue knows the operation or because its newest
-            // offer targets a different resource; an offer *anywhere*
-            // (this site's queue, or another site's queue after a re-home)
-            // proves the id was already delivered for a different key and
-            // must not be reused — the retry starts fresh below. Only an
-            // id no instance's queue knows at all was never enqueued, and
-            // its stranded offer is delivered now.
-            if self
-                .outbox
-                .find_offer_by_operation_across_instances(request.site_id, operation_id)
-                .await
-                .map_err(CenterDispatchError::Outbox)?
-                .is_some()
-            {
-                return Ok(None);
-            }
-            tracing::warn!(
-                "site {}: delivering the offer a failed dispatch stranded for operation \
-                 {operation_id}",
-                request.site_id
-            );
-            return self
-                .deliver_retry(request, operation_id, now)
-                .await
-                .map(Some);
         }
         // The fall-through repair read: the pending scan is bounded by
         // [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] and skips the acknowledged
@@ -574,23 +607,33 @@ where
         // operation's offers would start fresh under a new id and
         // double-execute the write at the site.
         for operation_id in candidates {
-            if let Some(dispatched) = self
+            // W9-E-3: the verdict's `NeverEnqueued` and `DifferentTarget`
+            // branches both skip the candidate (the multi-candidate repair
+            // runs only for a single candidate, and a different-target
+            // offer is a different operation), so the fall-through loop
+            // reuses the directed read's judgment exactly like the
+            // single-candidate path.
+            match self
                 .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
-                return Ok(Some(dispatched));
+                CandidateVerdict::Resolved(dispatched) => return Ok(Some(dispatched)),
+                CandidateVerdict::NeverEnqueued | CandidateVerdict::DifferentTarget => {}
             }
         }
         Ok(None)
     }
 
     /// Resolves one candidate against its offer facts with the §15.6
-    /// judgment: `Some` when the candidate is the same dispatch as the
-    /// request — in flight with the newest offer's expiry, or retired and
-    /// re-delivered under the same id — and `None` when the candidate
-    /// carries no facts or its offers target a different resource (a
-    /// different operation on the same endpoint and command; the retry
-    /// starts fresh below).
+    /// judgment, returned as the three-way [`CandidateVerdict`] (W9-E-3):
+    /// [`CandidateVerdict::Resolved`] when the candidate is the same
+    /// dispatch as the request — in flight with the newest offer's expiry,
+    /// or retired and re-delivered under the same id —
+    /// [`CandidateVerdict::DifferentTarget`] when its offers target a
+    /// different resource (a different operation on the same endpoint and
+    /// command; the retry starts fresh below), and
+    /// [`CandidateVerdict::NeverEnqueued`] when no instance's queue knows
+    /// the operation at all.
     ///
     /// The candidate's pending facts are the primary source — the bounded
     /// scan of [`Self::find_undecided`]. When the pending scan cannot see
@@ -609,14 +652,18 @@ where
     /// neither source knows — in no instance's queue — was never enqueued:
     /// nothing was ever delivered for it, so the fresh start below cannot
     /// double-execute anything (the single-candidate repair in
-    /// `find_undecided` is the repair path for such a record alone).
+    /// `find_undecided` is the repair path for such a record alone). The
+    /// verdict lets the caller act on the directed read's judgment
+    /// directly — the old code re-issued the cross-instance read to
+    /// separate the two `None` cases, a duplicate read that raced a
+    /// concurrent same-key enqueue (W9-E-3).
     async fn resolve_candidate(
         &self,
         request: &CenterOperationRequest,
         operation_id: OperationId,
         pending: &[OfferFact],
         now: OffsetDateTime,
-    ) -> Result<Option<DispatchedOperation>, DispatchErrorOf<Store, Outbox, Roles>> {
+    ) -> Result<CandidateVerdict, DispatchErrorOf<Store, Outbox, Roles>> {
         let rows = pending
             .iter()
             .filter(|fact| fact.operation_id == operation_id)
@@ -645,7 +692,7 @@ where
             newest = directed.as_ref();
         }
         let Some(newest) = newest else {
-            return Ok(None);
+            return Ok(CandidateVerdict::NeverEnqueued);
         };
         if canonical_target_key(&newest.target)
             != canonical_target_key(request.target_odata_id.as_str())
@@ -655,7 +702,7 @@ where
             // run through the same target normalization (W8-F-2), so a
             // spelling variant of the same URI never looks like a
             // different operation.
-            return Ok(None);
+            return Ok(CandidateVerdict::DifferentTarget);
         }
         if now > newest.expires_at {
             // The offer's §15.6 TTL passed: retire the stale rows and
@@ -677,9 +724,9 @@ where
             return self
                 .deliver_retry(request, operation_id, now)
                 .await
-                .map(Some);
+                .map(CandidateVerdict::Resolved);
         }
-        Ok(Some(DispatchedOperation::new(
+        Ok(CandidateVerdict::Resolved(DispatchedOperation::new(
             operation_id,
             newest.expires_at,
         )))
@@ -764,19 +811,77 @@ where
         let expires_at = now + CENTER_OFFER_TTL;
         self.enqueue_offer(request, operation_id, expires_at, now)
             .await?;
+        // W9-C-2: the never-enqueued judgment that led here was a read, and
+        // another center instance's same-key enqueue can commit between the
+        // read and this write — the offer is then delivered twice under the
+        // same id. The settlement converges the duplicates.
+        self.settle_duplicate_offers(request, operation_id, now)
+            .await?;
         Ok(DispatchedOperation::new(operation_id, expires_at))
+    }
+
+    /// Retires every pending row of the operation except the newest
+    /// (W9-C-2).
+    ///
+    /// The never-enqueued judgment and the TTL retirement are reads
+    /// followed by an enqueue, and no lock spans the gap: a concurrent
+    /// same-key dispatch on another center instance can commit its offer
+    /// between the judgment and this instance's enqueue, leaving two
+    /// pending rows under the same operation id. The site's §17.5
+    /// idempotency dedups by operation id, so the duplicate cannot
+    /// double-execute — but the retry scan's documented invariant is at
+    /// most one pending offer per undecided operation, and the duplicate
+    /// would surface as a second row in every subsequent scan. The recheck
+    /// retires every pending row of the id but the newest, so any number
+    /// of racing instances converge on the newest row: each racer's
+    /// recheck leaves exactly the newest row it sees, the last recheck in
+    /// the timeline runs after the last enqueue, and no recheck can retire
+    /// the row that is newest at the final recheck — exactly one pending
+    /// offer survives and no interleaving empties the queue.
+    ///
+    /// The race surface is the addressed site's queue: a concurrent
+    /// enqueue of the same id addresses the same site (the same §17.5
+    /// key), so the bounded pending scan is the complete surface; a
+    /// re-home that moves the endpoint between the judgment and the
+    /// enqueue is outside the scan (the pre-existing cross-site pair,
+    /// whose rows the re-home model's old-site revocation retires).
+    async fn settle_duplicate_offers(
+        &self,
+        request: &CenterOperationRequest,
+        operation_id: OperationId,
+        now: OffsetDateTime,
+    ) -> Result<(), DispatchErrorOf<Store, Outbox, Roles>> {
+        let pending = self
+            .outbox
+            .list_pending(request.site_id, CENTER_DISPATCH_OFFER_SCAN_LIMIT)
+            .await
+            .map_err(CenterDispatchError::Outbox)?;
+        let mut rows = pending
+            .iter()
+            .filter_map(offer_facts)
+            .filter(|fact| fact.operation_id == operation_id)
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|fact| fact.sequence);
+        for fact in rows.iter().rev().skip(1) {
+            self.outbox
+                .acknowledge(fact.entry_id, now)
+                .await
+                .map_err(CenterDispatchError::Outbox)?;
+        }
+        Ok(())
     }
 
     /// Enqueues the §15.6 offer of one operation: the typed command as the
     /// §9.4 payload, plus the target, the stable ids, the expiry, and the
     /// actor context — never URL, method, headers, body, or script.
+    /// Returns the queued entry.
     async fn enqueue_offer(
         &self,
         request: &CenterOperationRequest,
         operation_id: OperationId,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
-    ) -> Result<(), DispatchErrorOf<Store, Outbox, Roles>> {
+    ) -> Result<OutboxEntry, DispatchErrorOf<Store, Outbox, Roles>> {
         let command_json = serde_json::to_vec(&request.command)
             .map_err(CenterDispatchError::CommandSerialization)?;
         let offer = OperationOffer {
@@ -795,8 +900,7 @@ where
                 now,
             )
             .await
-            .map_err(CenterDispatchError::Outbox)?;
-        Ok(())
+            .map_err(CenterDispatchError::Outbox)
     }
 }
 
@@ -1648,6 +1752,14 @@ mod tests {
         entries: Arc<Mutex<Vec<OutboxEntry>>>,
         roles: Arc<Mutex<Option<RoleAssignment>>>,
         enqueue_failures: Arc<Mutex<u64>>,
+        // W9-C-2 injection: one offer the next `enqueue` commits *before*
+        // the requested row — the deterministic stand-in for another center
+        // instance's same-key enqueue landing between the never-enqueued
+        // judgment and this instance's enqueue.
+        concurrent_offer_on_enqueue: Arc<Mutex<Option<OperationOffer>>>,
+        // W9-E-3: how many times the mock cross-instance read has been
+        // issued, for the single-read assertions of the retry paths.
+        cross_instance_reads: Arc<Mutex<u64>>,
     }
 
     impl MockDispatchState {
@@ -1663,6 +1775,8 @@ mod tests {
                 entries: Arc::new(Mutex::new(Vec::new())),
                 roles: Arc::new(Mutex::new(None)),
                 enqueue_failures: Arc::new(Mutex::new(0)),
+                concurrent_offer_on_enqueue: Arc::new(Mutex::new(None)),
+                cross_instance_reads: Arc::new(Mutex::new(0)),
             }
         }
 
@@ -1671,6 +1785,22 @@ mod tests {
         fn fail_enqueues(&self, count: u64) -> Result<(), MockStoreError> {
             *self.enqueue_failures.lock().map_err(|_| MockStoreError)? = count;
             Ok(())
+        }
+
+        /// Arms the W9-C-2 injection: the next `enqueue` commits one
+        /// concurrent offer row before the requested row, and the armed
+        /// offer is consumed (one shot).
+        fn inject_concurrent_offer(&self, offer: OperationOffer) -> Result<(), MockStoreError> {
+            *self
+                .concurrent_offer_on_enqueue
+                .lock()
+                .map_err(|_| MockStoreError)? = Some(offer);
+            Ok(())
+        }
+
+        /// The number of cross-instance reads issued so far (W9-E-3).
+        fn cross_instance_reads_owned(&self) -> u64 {
+            self.cross_instance_reads.lock().map_or(0, |count| *count)
         }
 
         fn entries_owned(&self) -> Vec<OutboxEntry> {
@@ -2079,10 +2209,41 @@ mod tests {
                     *failures -= 1;
                     return Err(MockStoreError);
                 }
+                // W9-C-2: when armed, commit the concurrent offer row
+                // first — the earlier sequence and creation time of a racer
+                // whose enqueue landed between the judgment read and ours.
+                let injected = self
+                    .state
+                    .concurrent_offer_on_enqueue
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .take();
                 let mut entries = self.state.entries.lock().map_err(|_| MockStoreError)?;
-                let sequence = i64::try_from(entries.len())
+                let mut sequence = i64::try_from(entries.len())
                     .unwrap_or(i64::MAX)
                     .saturating_add(1);
+                if let Some(offer) = injected {
+                    let envelope = Envelope {
+                        sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
+                        acked_sequence: 0,
+                        message: Some(EnvelopeMessage::OperationOffer(offer.clone())),
+                    };
+                    let payload_json =
+                        serde_json::to_string(&envelope).map_err(|_| MockStoreError)?;
+                    entries.push(OutboxEntry::new(
+                        OutboxEntryId::generate(),
+                        instance_id,
+                        sequence,
+                        payload_json,
+                        created_at - Duration::SECOND,
+                    ));
+                    sequence = sequence.saturating_add(1);
+                    self.state
+                        .offers
+                        .lock()
+                        .map_err(|_| MockStoreError)?
+                        .push(offer);
+                }
                 let envelope = Envelope {
                     sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
                     acked_sequence: 0,
@@ -2168,6 +2329,11 @@ mod tests {
             // production `Corrupt` refusal) instead of a skipped row, so
             // the tests exercise the production fail direction.
             Box::pin(async move {
+                *self
+                    .state
+                    .cross_instance_reads
+                    .lock()
+                    .map_err(|_| MockStoreError)? += 1;
                 let rows = self.state.entries.lock().map_err(|_| MockStoreError)?;
                 let mut newest: Option<OutboxEntry> = None;
                 for entry in rows.iter() {
@@ -3059,6 +3225,184 @@ mod tests {
             state.operations.lock().map_err(|_| MockStoreError)?.len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_same_key_enqueue_between_the_judgment_and_the_enqueue_converges()
+    -> Result<(), Box<dyn Error>> {
+        // W9-C-2: the never-enqueued judgment is a read, and another
+        // center instance's same-key enqueue can commit between the
+        // judgment and this instance's enqueue. The retry's duplicate
+        // settlement retires every pending row of the id but the newest,
+        // so the racing rows converge on one pending offer under the
+        // existing operation id — never a fresh id (which would
+        // double-execute the write under two ids).
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state.fail_enqueues(1)?;
+        assert!(matches!(
+            dispatch
+                .dispatch(
+                    &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                    now
+                )
+                .await,
+            Err(CenterDispatchError::Outbox(_))
+        ));
+        let stranded = state
+            .operations
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .values()
+            .next()
+            .cloned()
+            .ok_or("the stranded operation is missing")?;
+
+        // Arm the injection: the next enqueue commits a concurrent
+        // same-key offer first — the row the racing instance's enqueue
+        // landed between the retry's never-enqueued judgment and its own
+        // enqueue (deterministic mock stand-in, not a real concurrency
+        // race).
+        state.inject_concurrent_offer(OperationOffer {
+            operation_id: stranded.id().to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            site_id: site.to_string(),
+            command_json: serde_json::to_vec(&RedfishCommand::System(SystemCommand::Reset(
+                ResetType::GracefulShutdown,
+            )))?,
+            target: String::from("/redfish/v1/Systems/1"),
+            expires_at_unix: (now + CENTER_OFFER_TTL).unix_timestamp(),
+            actor_context: actor.to_string(),
+        })?;
+
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            stranded.id(),
+            "the racing retry must converge on the existing operation id, never mint a fresh one"
+        );
+        let entries = state.entries_owned();
+        let pending = entries
+            .iter()
+            .filter(|entry| entry.state() == OutboxEntryState::Pending)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the racing duplicate rows must converge on exactly one pending offer"
+        );
+        assert_eq!(
+            pending[0].created_at(),
+            now + Duration::SECOND,
+            "the surviving row is this retry's own offer; the concurrent row is retired"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "the concurrent row is retired as acked history"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no fresh operation record may be minted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_single_candidate_paths_issue_exactly_one_cross_instance_read()
+    -> Result<(), Box<dyn Error>> {
+        // W9-E-3: `resolve_candidate` returns the directed-read verdict,
+        // so the single-candidate retry paths issue exactly one
+        // cross-instance read — the old code re-issued the read after a
+        // `None` to separate "never enqueued" from "different target", and
+        // the second read raced a concurrent same-key enqueue into a fresh
+        // id.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state.fail_enqueues(1)?;
+        assert!(matches!(
+            dispatch
+                .dispatch(
+                    &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                    now
+                )
+                .await,
+            Err(CenterDispatchError::Outbox(_))
+        ));
+        assert_eq!(state.cross_instance_reads_owned(), 0);
+
+        // The never-enqueued repair: one directed read decides the
+        // stranded-offer verdict, and the repair delivers under the same
+        // id.
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            state.cross_instance_reads_owned(),
+            1,
+            "the never-enqueued repair must issue exactly one cross-instance read"
+        );
+        let stranded = state
+            .operations
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .values()
+            .next()
+            .cloned()
+            .ok_or("the stranded operation is missing")?;
+        assert_eq!(retry.operation_id(), stranded.id());
+
+        // The re-homed in-flight retry: the pending scan of the addressed
+        // site sees nothing (the offer lives in the original site's queue),
+        // and the single directed read resolves it in flight.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        assert_eq!(state.cross_instance_reads_owned(), 0);
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            state.cross_instance_reads_owned(),
+            1,
+            "the re-homed in-flight retry must issue exactly one cross-instance read"
+        );
+        assert_eq!(retry.operation_id(), first.operation_id());
         Ok(())
     }
 
@@ -4816,6 +5160,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_acked_re_homed_retry_within_the_ttl_returns_the_id_with_the_original_expiry()
+    -> Result<(), Box<dyn Error>> {
+        // W9-T-1: the acknowledged keeper absorbs the re-delivery for the
+        // rest of its §15.6 TTL — a retry within the TTL after the offer
+        // was acknowledged and the endpoint re-homed returns the existing
+        // operation with the *original* expiry and enqueues nothing: the
+        // bounded TTL black window of W9-E-1, pinned end to end.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        // The site accepted the offer: the row is acknowledged.
+        let entry = state
+            .entries_owned()
+            .into_iter()
+            .next()
+            .ok_or("the offer row is missing")?;
+        store
+            .acknowledge(entry.id(), now + Duration::SECOND)
+            .await?;
+
+        // The endpoint re-homes; the retry within the TTL is absorbed by
+        // the acked keeper.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the acked retry must return the existing operation id"
+        );
+        assert_eq!(
+            retry.expires_at(),
+            first.expires_at(),
+            "the acked keeper's original expiry is returned, not a fresh TTL"
+        );
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "no new offer is enqueued: the keeper absorbs the retry within its TTL"
+        );
+        let entries = state.entries_owned();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Pending)
+                .count(),
+            0,
+            "the acked keeper stays retired history, nothing is re-delivered"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "the keeper remains the sole row of the operation"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no fresh operation record may be minted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_acked_re_homed_retry_past_the_ttl_retires_the_keeper_and_re_delivers_under_the_same_id()
+    -> Result<(), Box<dyn Error>> {
+        // W9-T-1, post-TTL variant (the W9-F-3 test gap): once the acked
+        // keeper's §15.6 TTL passed, the retry retires the keeper
+        // (idempotently — it is already acked history) and delivers a
+        // fresh offer under the same id, never a fresh identity.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let entry = state
+            .entries_owned()
+            .into_iter()
+            .next()
+            .ok_or("the offer row is missing")?;
+        store
+            .acknowledge(entry.id(), now + Duration::SECOND)
+            .await?;
+
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry_at = now + CENTER_OFFER_TTL + Duration::SECOND;
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                retry_at,
+            )
+            .await?;
+        assert_eq!(
+            retry.operation_id(),
+            first.operation_id(),
+            "the post-TTL retry re-delivers under the same operation id"
+        );
+        assert_eq!(
+            retry.expires_at(),
+            retry_at + CENTER_OFFER_TTL,
+            "the fresh offer carries a fresh expiry"
+        );
+        let entries = state.entries_owned();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "the acked keeper stays retired history"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Pending)
+                .count(),
+            1,
+            "the fresh offer is pending at the re-homed site"
+        );
+        let offers = state.offers_owned();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(
+            offers[1].site_id,
+            site_b.to_string(),
+            "the fresh offer is addressed to the re-homed site"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no fresh operation record may be minted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_unknown_outcome_on_one_target_does_not_block_another_targets_dispatch()
     -> Result<(), Box<dyn Error>> {
         // W7-F-3: the R6-E-01 refusal is per dispatch key — a terminal
@@ -5135,6 +5641,64 @@ mod tests {
                 Err(MockStoreError)
             ),
             "a corrupt row must fail the read closed, like production's Corrupt refusal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_row_fails_the_dispatch_through_the_outbox_error()
+    -> Result<(), Box<dyn Error>> {
+        // W9-F-6: the corrupt-row refusal propagates through the dispatch —
+        // the mock's cross-instance read fails closed on a row whose
+        // payload cannot be decoded, and the dispatch surfaces it as
+        // `CenterDispatchError::Outbox`, exactly the production
+        // `Corrupt` → `CenterOperationRefusal::Store` → 503 path
+        // (center_runtime.rs maps `Outbox` to `Store`; the HTTP-status
+        // assertion itself lives in the web layer's harness, out of this
+        // crate's tests).
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state.fail_enqueues(1)?;
+        assert!(matches!(
+            dispatch
+                .dispatch(
+                    &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                    now
+                )
+                .await,
+            Err(CenterDispatchError::Outbox(_))
+        ));
+
+        // Plant a corrupt pending row in the site's queue: the pending scan
+        // skips it (an unparseable payload yields no facts), and the
+        // candidate's directed read hits it and fails closed.
+        state
+            .entries
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push(OutboxEntry::new(
+                OutboxEntryId::generate(),
+                site,
+                1,
+                String::from("this is not an envelope"),
+                now + Duration::SECOND,
+            ));
+        assert!(
+            matches!(
+                dispatch
+                    .dispatch(
+                        &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                        now + Duration::seconds(2)
+                    )
+                    .await,
+                Err(CenterDispatchError::Outbox(_))
+            ),
+            "the corrupt row must fail the dispatch closed through the Outbox variant"
         );
         Ok(())
     }

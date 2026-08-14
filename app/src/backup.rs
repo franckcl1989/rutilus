@@ -381,11 +381,118 @@ async fn restore_data_phase(
     restore_compatibility(&restored_database, restored_wal.as_deref())
         .await
         .map_err(BackupError::RestoreCheck)?;
+    // W9-S-2: the artifact consistency check closes the §20.2 crash window
+    // between the database restore and the artifact-file restore — a crash
+    // in that window leaves a new database whose `Ready` rows have no
+    // artifact files, and the artifact stream would then fail on every
+    // connection. A backup taken from such a poisoned instance (the backup
+    // side silently skipped the missing files) would reproduce the poison;
+    // the check refuses it with a named error instead.
+    verify_restored_artifact_consistency(
+        paths,
+        backup,
+        &restored_database,
+        restored_wal.as_deref(),
+    )
+    .await?;
 
     Ok(RestoreOutcome {
         restored_entries: restored,
         pending_migrations,
     })
+}
+
+/// Verifies the restored artifact set (W9-S-2): every `Ready` artifact row
+/// of the restored database has its artifact file in place, and every
+/// restored artifact file has a database row.
+///
+/// The check runs after the restore's own verification, when every file is
+/// in place; a failure reports [`BackupError::RestoreArtifactConsistency`]
+/// with the offending artifact ids and the repair path (re-restore from a
+/// backup taken with the artifact files in place, or delete and re-upload
+/// the artifacts) — the restore is already complete by then, so the
+/// pre-restore snapshot the caller preserves is the rollback path.
+///
+/// The restored database is inspected through a temporary copy: the store
+/// open applies the pending migrations, which the restore deliberately
+/// leaves to the next real open, and the copy keeps the restored files
+/// byte-identical to the verified snapshot.
+///
+/// # Errors
+///
+/// Returns [`BackupError::RestoreArtifactConsistency`] when any `Ready`
+/// row lacks its artifact file or any restored artifact file lacks a row,
+/// and a staging/opening/inspection error for the temporary copy itself.
+async fn verify_restored_artifact_consistency(
+    paths: &RuntimePaths,
+    backup: &DecryptedBackup,
+    restored_database: &[u8],
+    restored_wal: Option<&[u8]>,
+) -> Result<(), BackupError> {
+    let directory = tempfile::tempdir().map_err(|source| {
+        BackupError::ArtifactConsistencyStage(io::Error::other(source.to_string()))
+    })?;
+    let copy_path = directory.path().join("restored.db");
+    fs::write(&copy_path, restored_database).map_err(BackupError::ArtifactConsistencyStage)?;
+    if let Some(wal) = restored_wal {
+        fs::write(copy_path.with_extension("db-wal"), wal)
+            .map_err(BackupError::ArtifactConsistencyStage)?;
+    }
+    let store = SqliteStore::open(&copy_path)
+        .await
+        .map_err(BackupError::ArtifactConsistencyOpen)?;
+    // The rows of every artifact state: the forward check demands a file
+    // for each `Ready` row, and the reverse check accepts a row in any
+    // state for each restored file (an interrupted upload legitimately has
+    // an `Uploading` row with or without bytes).
+    let mut rows = Vec::new();
+    for state in [
+        ArtifactState::Uploading,
+        ArtifactState::Ready,
+        ArtifactState::Failed,
+    ] {
+        rows.extend(
+            store
+                .list_artifacts_by_state(state)
+                .await
+                .map_err(BackupError::ArtifactConsistencyInspect)?,
+        );
+    }
+    let mut missing = Vec::new();
+    for artifact in rows
+        .iter()
+        .filter(|artifact| artifact.state() == ArtifactState::Ready)
+    {
+        let path = artifact_file_path(paths.database_path(), artifact.id());
+        if !path.is_file() {
+            missing.push(artifact.id());
+        }
+    }
+    let row_ids: HashSet<ArtifactId> = rows.iter().map(rutilus_domain::Artifact::id).collect();
+    let mut orphan = Vec::new();
+    for entry in backup.entries() {
+        if entry.kind() != BackupEntryKind::ArtifactFile {
+            continue;
+        }
+        let artifact_id = entry
+            .name()
+            .strip_prefix(ARTIFACT_ENTRY_PREFIX)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| BackupError::InvalidArtifactEntryName {
+                name: entry.name().to_owned(),
+            })?;
+        if !row_ids.contains(&ArtifactId::from_uuid(artifact_id)) {
+            orphan.push(ArtifactId::from_uuid(artifact_id));
+        }
+    }
+    store
+        .close()
+        .await
+        .map_err(BackupError::ArtifactConsistencyClose)?;
+    if !missing.is_empty() || !orphan.is_empty() {
+        return Err(BackupError::RestoreArtifactConsistency { missing, orphan });
+    }
+    Ok(())
 }
 
 /// Acquires the runtime lock and requires a completed instance.
@@ -555,7 +662,24 @@ async fn collect_artifact_entries(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // A declared artifact may legitimately have no bytes yet
                     // (an interrupted upload); its metadata row is restored
-                    // through the database entry.
+                    // through the database entry. A `Ready` artifact without
+                    // its file is not legitimate — the §20.2 restore-crash
+                    // signature (W9-S-2): the backup would restore the row
+                    // without the file, and the artifact stream would fail
+                    // on every connection until the file is restored. The
+                    // skip is kept (the package still authenticates and the
+                    // operator may want the rest), but the poison is named
+                    // loudly, and the restore-time consistency check then
+                    // refuses such a package.
+                    if artifact.state() == ArtifactState::Ready {
+                        tracing::warn!(
+                            "artifact {artifact_id} is ready but its file is missing at {}; \
+                             the backup carries the row without the file, and a restore would \
+                             be refused by the artifact consistency check until the file is \
+                             restored or the artifact is re-uploaded",
+                            path.display()
+                        );
+                    }
                 }
                 Err(source) => {
                     return Err(BackupError::ReadArtifact {
@@ -977,6 +1101,25 @@ pub enum BackupError {
         "restore verification failed: the restored database differs from the verified backup snapshot"
     )]
     RestoredDatabaseDiffers,
+    #[error("failed to stage the restored database copy for the artifact consistency check: {0}")]
+    ArtifactConsistencyStage(#[source] io::Error),
+    #[error("failed to open the restored database copy for the artifact consistency check: {0}")]
+    ArtifactConsistencyOpen(#[source] OpenStoreError),
+    #[error("failed to inspect the restored artifact rows for the consistency check: {0}")]
+    ArtifactConsistencyInspect(#[source] ArtifactRepositoryError),
+    #[error("failed to close the restored database copy after the artifact consistency check: {0}")]
+    ArtifactConsistencyClose(#[source] CloseStoreError),
+    #[error(
+        "the restored artifact set is inconsistent: {missing:?} `Ready` artifact row(s) have no \
+         artifact file on disk and {orphan:?} restored artifact file(s) have no database row. The \
+         restore completed, but the artifact stream would fail on every connection until the \
+         artifact files are restored: re-restore from a backup taken with the artifact files in \
+         place, or delete and re-upload the affected artifacts"
+    )]
+    RestoreArtifactConsistency {
+        missing: Vec<ArtifactId>,
+        orphan: Vec<ArtifactId>,
+    },
     #[error(
         "the backup package could not be authenticated with this instance's master key: the \
          passphrase is wrong, or the backup was created by another instance — a cross-machine \
@@ -1001,9 +1144,13 @@ pub enum BackupError {
 mod tests {
     use std::{error::Error, path::Path};
 
-    use rutilus_domain::{CredentialId, CredentialName, CredentialUsername, CredentialVersionId};
+    use rutilus_domain::{
+        Artifact, ArtifactId, ArtifactName, CredentialId, CredentialName, CredentialUsername,
+        CredentialVersionId, Sha256Hex,
+    };
     use rutilus_persistence::SqliteStore;
     use secrecy::{ExposeSecret as _, SecretString};
+    use time::OffsetDateTime;
 
     use super::*;
 
@@ -1064,6 +1211,55 @@ mod tests {
         Ok(names)
     }
 
+    /// One ready artifact (row and file) for the consistency-check tests.
+    fn ready_artifact() -> Result<Artifact, Box<dyn Error>> {
+        let mut artifact = Artifact::new(
+            ArtifactId::generate(),
+            ArtifactName::parse("firmware")?,
+            3,
+            Sha256Hex::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?,
+            OffsetDateTime::now_utc(),
+        );
+        artifact.record_bytes_received(3)?;
+        artifact.mark_ready()?;
+        Ok(artifact)
+    }
+
+    /// Adds one ready artifact — row and file — to the instance's store.
+    async fn store_ready_artifact(paths: &RuntimePaths) -> Result<Artifact, Box<dyn Error>> {
+        let artifact = ready_artifact()?;
+        let store = SqliteStore::open(paths.database_path()).await?;
+        store
+            .create_artifact(&artifact)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        // The upload use case creates the artifacts directory; the test
+        // helper mirrors it.
+        let path = artifact_file_path(paths.database_path(), artifact.id());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, [0x01, 0x02, 0x03])?;
+        store.close().await?;
+        Ok(artifact)
+    }
+
+    /// Adds one ready artifact row without its file — the §20.2
+    /// restore-crash signature (W9-S-2): a new database whose `Ready` rows
+    /// have no artifact files on disk.
+    async fn store_ready_artifact_row_only(
+        paths: &RuntimePaths,
+    ) -> Result<Artifact, Box<dyn Error>> {
+        let artifact = ready_artifact()?;
+        let store = SqliteStore::open(paths.database_path()).await?;
+        store
+            .create_artifact(&artifact)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        store.close().await?;
+        Ok(artifact)
+    }
+
     #[tokio::test]
     async fn create_and_restore_round_trip_preserves_the_data() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
@@ -1105,6 +1301,64 @@ mod tests {
         assert_eq!(names, vec!["first-seed"]);
         assert_eq!(std::fs::read(paths.master_key_path())?, original_key_bytes);
         assert!(paths.instance_marker_path().is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_with_a_ready_artifact_keeps_row_and_file_consistent()
+    -> Result<(), Box<dyn Error>> {
+        // W9-S-2: the restore-time consistency check must accept a
+        // legitimate backup — every `Ready` artifact row has its file, and
+        // every restored artifact file has its row.
+        let directory = tempfile::tempdir()?;
+        let (paths, unlock) = initialized_instance(directory.path()).await?;
+        let artifact = store_ready_artifact(&paths).await?;
+        let output = directory.path().join("backups").join("with-artifact.rut");
+        create_backup(&paths, &unlock, Some(&output)).await?;
+
+        let restored = restore_backup(&paths, &unlock, &output).await?;
+        assert_eq!(restored.pending_migrations(), 0);
+        assert!(
+            artifact_file_path(paths.database_path(), artifact.id()).is_file(),
+            "the restored artifact file must be in place next to its `Ready` row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_backup_whose_ready_artifact_has_no_file()
+    -> Result<(), Box<dyn Error>> {
+        // W9-S-2: a backup taken from the poisoned state — a `Ready` row
+        // whose artifact file is missing on disk (the §20.2 crash window;
+        // the backup side skips the missing file with a warning) —
+        // reproduces the poison on restore, so the restore-time consistency
+        // check refuses it with a named error instead of handing the
+        // operator an instance whose artifact stream fails on every
+        // connection.
+        let directory = tempfile::tempdir()?;
+        let (paths, unlock) = initialized_instance(directory.path()).await?;
+        let artifact = store_ready_artifact_row_only(&paths).await?;
+        let output = directory.path().join("backups").join("poisoned.rut");
+        create_backup(&paths, &unlock, Some(&output)).await?;
+
+        let Err(error) = restore_backup(&paths, &unlock, &output).await else {
+            return Err(std::io::Error::other(
+                "the poisoned restore must be refused by the artifact consistency check",
+            )
+            .into());
+        };
+        assert!(
+            matches!(
+                &error,
+                BackupError::RestoreFailedPreservingSnapshot { source, .. }
+                    if matches!(
+                        &**source,
+                        BackupError::RestoreArtifactConsistency { missing, orphan }
+                            if missing == &[artifact.id()] && orphan.is_empty()
+                    )
+            ),
+            "the restore must refuse the poisoned artifact set, got: {error}"
+        );
         Ok(())
     }
 

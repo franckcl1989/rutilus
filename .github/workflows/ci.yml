@@ -152,10 +152,17 @@ jobs:
       # count at HEAD e85560a (`cargo test --locked --workspace -- --list`:
       # lib/integration 1912 + doc 1 = 1913, matching the 2026-08-14 门禁复跑
       # in release-readiness.md §五; re-measured locally on the same commit).
-      # Floor semantics as elsewhere: the step fails only when the total dips
-      # below the pin, and the --expect-tests list (R6-W-7) anchors six
-      # gate-critical names across six crates — a deleted or cfg-emptied
-      # suite fails even when the remaining count still clears the floor.
+      # W9-CI-2 re-sync (2026-08-14): the master-measured count is now 2016
+      # (`cargo test --locked --workspace -- --list`, measured after the
+      # wave-nine test additions; wave-seven/eight had pushed it to 2013).
+      # The pin stays at 1913 on purpose: floor semantics, not an exact
+      # count — the step fails only when the total dips below the pin, and
+      # the --expect-tests list (R6-W-7) anchors six gate-critical names
+      # across six crates, so a deleted or cfg-emptied suite fails even
+      # when the remaining count still clears the floor (see the Migration
+      # step comment below for the same floor explanation). The pin is the
+      # point-in-time lower bound, not a growth tracker — re-measure at
+      # integration.
       - name: Test (full workspace)
         if: matrix.is_default
         run: bash scripts/assert-tests-ran.sh 1913 --expect-tests version_reports_product_and_upstream_baseline,json_log_format_is_accepted_and_keeps_user_visible_output,refresh_capture_flows_into_the_diagnostics_response,links_the_complete_development_capability_surface,migration_down_drops_children_before_parents,workspace_sources_have_no_hardcoded_secrets_or_plaintext_disclosure --locked --workspace
@@ -603,15 +610,15 @@ jobs:
       # W6-1 ran-assertion (2026-08-13): scripts/assert-tests-ran.sh fails
       # the step unless the number of tests that actually ran and passed
       # is >= 50. The pin is the master-measured count (2026-08-14 gate
-      # re-run, W8-W-4 re-sync: `cargo test --locked -p rutilus-migration
-      # -- --list` reports 67 passed — 17 down_order_gate + 7 bare_sql_gate
-      # + 43 other migration tests). Floor semantics, not
+      # re-run, W9-T-3 re-sync: `cargo test --locked -p rutilus-migration
+      # -- --list` reports 71 passed — 19 down_order_gate + 8 bare_sql_gate
+      # + 44 other migration tests). Floor semantics, not
       # exact count: the step fails only when the count dips below the
       # pin — deleting a non-gate test file that still leaves 49 passing
       # tests passes, and only a dip below 50 (whole-suite deletion,
       # #[ignore], or cfg-emptying) fails. The pin is the lower bound of
       # the measured baseline; the test total grows with the product
-      # (the wave-eight gate self-check additions were still landing when
+      # (the wave-nine gate self-check additions were still landing when
       # this comment was re-synced — re-measure at integration).
       #
       # R6-W-7 (2026-08-14): the --expect-tests list adds a NAME-level

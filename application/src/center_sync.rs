@@ -2001,22 +2001,69 @@ where
     }
 
     /// Enqueues the manifest and the chunk frames of one ready artifact.
-    /// The artifact bytes are read under `spawn_blocking` (design §7.8).
+    ///
+    /// The artifact bytes stream from disk chunk by chunk (W9-S-3) instead
+    /// of being read whole into memory: the blocking reader task (design
+    /// §7.8) reads one chunk at a time into a bounded channel, and each
+    /// chunk is enqueued into the durable outbox as it arrives and
+    /// released — the peak memory is one chunk plus the outbox entry,
+    /// never the whole artifact (the pre-fix `fs::read` peaked at roughly
+    /// twice the artifact size). The manifest is enqueued only after the
+    /// first chunk was read, so a missing file aborts the distribution
+    /// before anything is enqueued — the same property as the old
+    /// whole-file read.
     async fn distribute_artifact(
         &self,
         artifact: &rutilus_domain::Artifact,
     ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
         let path = self.store.artifact_file_path(artifact.id());
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-            .await
-            .map_err(|source| CenterSyncError::ArtifactRead {
-                artifact_id: artifact.id(),
-                source: std::io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| CenterSyncError::ArtifactRead {
-                artifact_id: artifact.id(),
-                source,
-            })?;
+        let chunk_bytes = self.options.artifact_chunk_bytes;
+        // A bounded channel carries the chunks from the blocking reader to
+        // the async enqueue side; capacity 1 caps the buffered bytes at one
+        // chunk, and the reader's `blocking_send` applies backpressure to
+        // the disk reads.
+        let (chunk_sender, mut chunk_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let reader = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            use std::io::Read as _;
+            let mut file = std::fs::File::open(&path)?;
+            let mut chunk = vec![0_u8; chunk_bytes];
+            loop {
+                let mut filled = 0_usize;
+                while filled < chunk_bytes {
+                    match file.read(&mut chunk[filled..]) {
+                        Ok(0) => break,
+                        Ok(read) => filled += read,
+                        Err(source) => return Err(source),
+                    }
+                }
+                if filled == 0 {
+                    // EOF exactly at a chunk boundary: the stream is done.
+                    break;
+                }
+                let last = filled < chunk_bytes;
+                chunk.truncate(filled);
+                chunk_sender
+                    .blocking_send(chunk)
+                    .map_err(|_| std::io::Error::other("the artifact reader was cancelled"))?;
+                if last {
+                    break;
+                }
+                chunk = vec![0_u8; chunk_bytes];
+            }
+            Ok(())
+        });
+        // The manifest is enqueued only after the first chunk was read: a
+        // missing file (the W9-S-2 restore-crash signature) surfaces its
+        // classified error here, before anything entered the outbox.
+        let Some(first_chunk) = chunk_receiver.recv().await else {
+            return reader
+                .await
+                .map_err(|source| CenterSyncError::ArtifactRead {
+                    artifact_id: artifact.id(),
+                    source: std::io::Error::other(source.to_string()),
+                })?
+                .map_err(|source| Self::classify_artifact_read_error(artifact.id(), source));
+        };
         self.enqueue_outbox_entry(EnvelopeMessage::ArtifactManifest(ArtifactManifest {
             artifact_id: artifact.id().to_string(),
             name: artifact.name().as_str().to_owned(),
@@ -2024,18 +2071,50 @@ where
             sha256: artifact.sha256().into_bytes().to_vec(),
         }))
         .await?;
-        let chunk_bytes = self.options.artifact_chunk_bytes;
-        for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+        let mut index = 0_usize;
+        let mut chunk = first_chunk;
+        loop {
             self.enqueue_outbox_entry(EnvelopeMessage::ArtifactChunk(ArtifactChunk {
                 artifact_id: artifact.id().to_string(),
                 index: u32::try_from(index).map_err(|_| CenterSyncError::SequenceOverflow {
                     sequence: i64::try_from(index).unwrap_or(i64::MAX),
                 })?,
-                data: chunk.to_vec(),
+                data: chunk,
             }))
             .await?;
+            index += 1;
+            let Some(next) = chunk_receiver.recv().await else {
+                break;
+            };
+            chunk = next;
         }
-        Ok(())
+        reader
+            .await
+            .map_err(|source| CenterSyncError::ArtifactRead {
+                artifact_id: artifact.id(),
+                source: std::io::Error::other(source.to_string()),
+            })?
+            .map_err(|source| Self::classify_artifact_read_error(artifact.id(), source))
+    }
+
+    /// Maps one artifact-file read error of the distribution reader: a
+    /// missing file is the W9-S-2 signature — a `Ready` row whose artifact
+    /// file is not on disk — classified as
+    /// [`CenterSyncError::ArtifactFileMissing`] so the run loop's warning
+    /// names the repair path; every other read error stays
+    /// [`CenterSyncError::ArtifactRead`].
+    fn classify_artifact_read_error(
+        artifact_id: ArtifactId,
+        source: std::io::Error,
+    ) -> CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail> {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            CenterSyncError::ArtifactFileMissing { artifact_id }
+        } else {
+            CenterSyncError::ArtifactRead {
+                artifact_id,
+                source,
+            }
+        }
     }
 
     /// Handles one inbound envelope from the center. The reliable outbox
@@ -2171,6 +2250,19 @@ pub enum CenterSyncError<
         #[source]
         source: std::io::Error,
     },
+    /// A `Ready` artifact's file is missing on disk (W9-S-2): the §20.2
+    /// restore-crash signature — a new database whose `Ready` rows have no
+    /// artifact files. The round aborts so the artifact stream cursor never
+    /// advances past the artifact; skipping the artifact would leave the
+    /// center without it permanently while the site row stays `Ready`. The
+    /// operator re-restores from a backup taken with the artifact files in
+    /// place, or deletes and re-uploads the artifact.
+    #[error(
+        "artifact {artifact_id} is ready but its file is missing on disk; the artifact stream \
+         stops before it: re-restore from a backup taken with the artifact files in place, or \
+         delete and re-upload the artifact"
+    )]
+    ArtifactFileMissing { artifact_id: ArtifactId },
     /// The center refused the connection as `not-bound` the configured
     /// number of consecutive times (audit follow-up F4): the site's binding
     /// is not in force on the center, so the engine stops instead of
@@ -4515,6 +4607,75 @@ mod tests {
         assert_eq!(outbox.pending_messages()?.len(), 4);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_ready_artifact_without_its_file_is_classified_as_missing()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        // W9-S-2: the §20.2 restore-crash window leaves a `Ready` artifact
+        // row without its file on disk. The distribution must classify the
+        // missing file explicitly (instead of a generic read error) so the
+        // run loop's warning names the repair path, and must not advance
+        // the cursor past the artifact — skipping it would leave the center
+        // without the artifact permanently while the row stays `Ready`.
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let mut artifact = rutilus_domain::Artifact::new(
+            rutilus_domain::ArtifactId::generate(),
+            rutilus_domain::ArtifactName::parse("backup")?,
+            3,
+            rutilus_domain::Sha256Hex::parse(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )?,
+            now,
+        );
+        artifact.record_bytes_received(3)?;
+        artifact.mark_ready()?;
+        // The row exists but its file does not: remove the materialized
+        // file right after `set_artifact` to simulate the restore-crash
+        // window.
+        store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
+        std::fs::remove_file(store.artifact_file_path(artifact.id()))?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = CenterSync::new(
+            &ChannelTransport,
+            &store,
+            &outbox,
+            &inbox,
+            &cursor,
+            &events,
+            FixedClock(now),
+            instance_id,
+            engine_options(),
+        );
+        let outcome = engine.report_artifacts().await;
+        assert!(
+            matches!(
+                outcome,
+                Err(CenterSyncError::ArtifactFileMissing { artifact_id })
+                    if artifact_id == artifact.id()
+            ),
+            "the missing file must be classified explicitly, got: {outcome:?}"
+        );
+        // The round aborted before anything was enqueued and the cursor
+        // did not advance past the artifact.
+        assert_eq!(
+            outbox.pending_messages()?.len(),
+            0,
+            "a missing file must abort the distribution before the manifest enters the outbox"
+        );
+        assert!(
+            cursor
+                .cursor_value(instance_id, SyncStream::Artifact)?
+                .is_none(),
+            "the cursor must not advance past the missing artifact"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_partial_batch_flushes_again_after_each_acknowledgement() -> Result<(), Box<dyn Error>>
     {

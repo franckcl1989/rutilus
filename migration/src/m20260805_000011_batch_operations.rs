@@ -22,11 +22,33 @@ use sea_orm_migration::prelude::*;
 /// nullable column is added with its `REFERENCES` clause inline in one raw
 /// `ALTER TABLE ... ADD COLUMN` statement; the index is added with the
 /// regular schema API afterwards.
+///
+/// # Why the whole migration commits atomically
+///
+/// The migration overrides [`MigrationTrait::use_transaction`] so the whole
+/// `up` — and the symmetric `down` — commits as one unit on `SQLite`, where
+/// the sea-orm-migration runner wraps only `Postgres` by default (W9-D-1: the
+/// W8-D-1 defect's third recurrence surface). `up` runs three statements (one
+/// `CREATE TABLE`, the raw `ALTER TABLE ... ADD COLUMN` with its inline
+/// `REFERENCES`, one `CREATE INDEX`) and `down` three (one `DROP INDEX`, the
+/// `ALTER TABLE` column drop, one `DROP TABLE`) that `SQLite` would otherwise
+/// auto-commit one by one: a crash between them would leave the migration
+/// half-applied while it still records as applied, and the retried run would
+/// then fail — `up` with "table already exists" (no `IF NOT EXISTS`), `down`
+/// with "no such table" forever, blocking the whole rollback chain. These
+/// statements are all legal `SQLite` DDL inside a transaction, so the
+/// override costs nothing but the crash-resume guarantee — the same
+/// discipline the `m20260814_000003` slice (W8-D-1) and the rebuild
+/// migrations already follow.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(

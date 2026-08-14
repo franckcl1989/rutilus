@@ -1043,6 +1043,39 @@ fn strip_sql_comments_removes_comment_text_and_keeps_literals() {
     );
 }
 
+/// The W9-T-3 unterminated-quote shape: a quote that never closes runs to
+/// the end of the string in both directions — the stripper keeps every
+/// character past the opening quote (a `--` or `/*` there is identifier
+/// text, not a comment) and the splitter never terminates the statement on
+/// a `;` inside the unclosed region. Unreachable in the tree (every
+/// `execute_unprepared` string is well-formed DDL), but the documented
+/// "run to end of string" semantics are pinned here so the two quote
+/// states cannot silently change — the same shape is pinned in
+/// `down_order_gate.rs`, and the sister-gate comparison test asserts the
+/// two implementations agree on it.
+#[test]
+fn unterminated_quotes_run_to_the_end_of_the_string() {
+    // ① Stripping: a comment marker past the unclosed quote is identifier
+    // text, never a comment — the stripped result is the input verbatim.
+    assert_eq!(
+        strip_sql_comments(r#"DROP TABLE "unterminated -- not a comment"#),
+        r#"DROP TABLE "unterminated -- not a comment"#,
+        "a line-comment marker inside an unterminated quote is text"
+    );
+    assert_eq!(
+        strip_sql_comments(r#"DROP TABLE "unterminated /* not a comment */"#),
+        r#"DROP TABLE "unterminated /* not a comment */"#,
+        "a block-comment marker inside an unterminated quote is text"
+    );
+    // ② Splitting: the `;` inside the unclosed region is not a terminator —
+    // the whole string is one statement.
+    assert_eq!(
+        split_sql_statements(r#"DROP TABLE "unterminated; DROP TABLE x"#),
+        vec![r#"DROP TABLE "unterminated; DROP TABLE x"#],
+        "a `;` inside an unterminated quote is not a terminator"
+    );
+}
+
 /// The W8-S-2 blind spot: the stripper used to protect only single-quoted
 /// literals, so a comment marker inside a quoted identifier (`"a--b"`,
 /// `` `a--b` ``, `[a--b]`) was read as a comment start and the rest of the

@@ -1834,6 +1834,44 @@ impl MigrationTrait for Migration {
     Ok(())
 }
 
+/// The W9-T-3 unterminated-quote shape: a quote that never closes runs to
+/// the end of the string — the stripper keeps every character past the
+/// opening quote (a `--` or `/*` there is identifier text, not a comment)
+/// and the splitter never terminates the statement on a `;` inside the
+/// unclosed region, so a raw `DROP TABLE` is never cut short into a
+/// fictional drop. Unreachable in the tree (every raw statement is
+/// well-formed DDL), but the documented "run to end of string" semantics
+/// are pinned here — the same shape is pinned in `bare_sql_gate.rs`, and
+/// the sister-gate comparison test asserts the two implementations agree
+/// on it.
+#[test]
+fn gate_runs_unterminated_quotes_to_the_end_of_the_string() {
+    // ① The statement split: the `;` inside the unclosed region is not a
+    // terminator — one statement holding every following word, not two.
+    assert_eq!(
+        split_sql_statements(r#"DROP TABLE "unterminated; DROP TABLE children"#),
+        vec![r#"DROP TABLE "unterminated; DROP TABLE children"#],
+        "a `;` inside an unterminated quote is not a terminator"
+    );
+    // ② The stripper: a `--` past the unclosed quote is identifier text,
+    // never a comment — the stripped result is the input verbatim.
+    assert_eq!(
+        strip_sql_comments(r#"DROP TABLE "unterminated -- not a comment"#),
+        r#"DROP TABLE "unterminated -- not a comment"#,
+        "a comment marker inside an unterminated quote is text"
+    );
+    // ③ End to end: the unclosed fragment yields one drop whose name is
+    // the whole swallowed text — the trailing `;` is identifier
+    // punctuation, stripped from the name, and the following `DROP TABLE`
+    // is part of the same statement, not a second drop.
+    assert_eq!(
+        drop_table_names(r#"DROP TABLE "unterminated; DROP TABLE children"#),
+        vec!["unterminated", "children"],
+        "the unclosed quote swallows the `;` and the following drop into \
+         one statement"
+    );
+}
+
 /// The W8-W-1 blind spot: the stripper used to protect only single-quoted
 /// literals, so a comment marker inside a quoted identifier (`"a--b"`,
 /// `` `a--b` ``, `[a--b]`) was read as a comment start. `DROP TABLE
@@ -2419,4 +2457,53 @@ fn scanned_sources_walk_is_recursive() -> Result<(), Box<dyn Error>> {
         "the source walk must cover `.rs` files in subdirectories, name-sorted"
     );
     Ok(())
+}
+
+/// W9-T-3 (2026-08-14): sister-gate stripper parity, enforced statically.
+/// `bare_sql_gate.rs` carries its own copy of the strip-then-split
+/// implementation (each gate is self-contained by design), and both file
+/// headers claim the copies cannot disagree about what a comment or a
+/// quoted region is. Compiling the sister file into this binary is not
+/// possible as-is — its `//!` crate doc is only legal at file scope and
+/// its own tests would re-run here — so parity is asserted on the source
+/// text instead: the two stripper function bodies must be identical
+/// character for character. That is a stronger claim than output equality
+/// on a sample set: it cannot drift on inputs the sample misses.
+#[test]
+fn the_sister_gate_stripper_bodies_are_identical() -> Result<(), Box<dyn Error>> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ours = fs::read_to_string(manifest.join("tests/down_order_gate.rs"))?;
+    let sister = fs::read_to_string(manifest.join("tests/bare_sql_gate.rs"))?;
+    for name in ["strip_sql_comments", "split_sql_statements"] {
+        let ours_body =
+            fn_body(&ours, name).ok_or_else(|| format!("this gate no longer defines {name}"))?;
+        let sister_body = fn_body(&sister, name)
+            .ok_or_else(|| format!("the sister gate no longer defines {name}"))?;
+        assert_eq!(
+            ours_body, sister_body,
+            "the two gates' {name} implementations must stay identical"
+        );
+    }
+    Ok(())
+}
+
+/// The text of one `fn name(...) { ... }` definition — from the `fn`
+/// keyword to the brace-matched closing `}` of its body.
+fn fn_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let start = source.find(&format!("fn {name}("))?;
+    let brace = source[start..].find('{')? + start;
+    let mut depth = 0usize;
+    for (i, ch) in source[brace..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[start..=(brace + i)]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

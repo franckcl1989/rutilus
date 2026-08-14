@@ -16,11 +16,31 @@ use sea_orm_migration::prelude::*;
 /// cannot classify, mirroring the `operations.state` and
 /// `endpoint_capabilities.state` precedents, so a restart recovery scan can
 /// never hand an unknown code to the engine's `RemoteTaskState`.
+///
+/// # Why the whole migration commits atomically
+///
+/// The migration overrides [`MigrationTrait::use_transaction`] so the whole
+/// `up` — and the symmetric `down` — commits as one unit on `SQLite`, where
+/// the sea-orm-migration runner wraps only `Postgres` by default (W9-D-1: the
+/// W8-D-1 defect's third recurrence surface). `up` runs two statements (one
+/// `CREATE TABLE`, one `CREATE INDEX`) and `down` one `DROP TABLE` that
+/// `SQLite` would otherwise auto-commit one by one: a crash between them
+/// would leave the migration half-applied while it still records as applied,
+/// and the retried run would then fail — `up` with "table already exists"
+/// (no `IF NOT EXISTS`), `down` with "no such table" forever, blocking the
+/// whole rollback chain. These statements are all legal `SQLite` DDL inside a
+/// transaction, so the override costs nothing but the crash-resume guarantee
+/// — the same discipline the `m20260814_000003` slice (W8-D-1) and the
+/// rebuild migrations already follow.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(

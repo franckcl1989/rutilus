@@ -829,6 +829,21 @@ fn enqueue_audit_compensation(event: &AuditEvent, source: &AuditRepositoryError)
     );
 }
 
+/// Acquires every derivation slot of the process-wide gate — a test hook
+/// for the W9-C-1 shutdown tests: the sign-in handler's password
+/// verification then waits on the gate, holding the handler in flight for
+/// as long as the test chooses (independent of the Argon2id duration). The
+/// permits release when the returned vector drops.
+#[cfg(test)]
+pub(crate) async fn hold_derivation_gate_for_test()
+-> Result<Vec<SemaphorePermit<'static>>, tokio::sync::AcquireError> {
+    let mut permits = Vec::new();
+    for _ in 0..MAX_CONCURRENT_PASSWORD_DERIVATIONS {
+        permits.push(PASSWORD_DERIVATION_SLOTS.acquire().await?);
+    }
+    Ok(permits)
+}
+
 /// Drops the oldest queued entry of a full compensation queue (R6-5): the
 /// drop is warned about with the lost event's identity — the queue is
 /// in-memory, so the evicted event is never retried — and counted in
@@ -2532,15 +2547,27 @@ where
             // close happens after this function returns), so the task never
             // touches a closed store.
             drain_compensation(&mut compensation).await;
+            // W9-C-1: the console's shutdown chain is fired and its full
+            // drain is awaited BEFORE the bounded final drain. The graceful
+            // drain (bounded by `GRACEFUL_DRAIN_TIMEOUT`) then overlaps
+            // nothing, and the final drain runs with no in-flight handler
+            // left — an audit append that fails in the last console handler
+            // lands in the queue before the final drain instead of being
+            // silently dropped on exit. Under the pre-fix order the sender
+            // fired after the final drain, so the console kept serving —
+            // accepting new requests — through the final drain, and events
+            // enqueued during its graceful drain were dropped. The serving
+            // result is captured (not `?`-propagated) so the final drain
+            // still runs when the console errored.
+            let _ = scheduler_done_sender.send(());
+            let serve_result = server.await.map_err(StandaloneRunError::Serve);
             // R6-C-3: the queued audit appends are replayed in a bounded
             // final drain after the drain task has fully stopped, so the
             // stop does not discard the whole compensation queue; the
             // remaining budget is the honest line between a best-effort
             // replay and an unbounded shutdown stall.
             drain_audit_compensation_final(&services).await;
-            let _ = scheduler_done_sender.send(());
-            // The server's shutdown future resolves now; await its drain.
-            server.await.map_err(StandaloneRunError::Serve)
+            serve_result
         }
     }
 }
@@ -4922,6 +4949,105 @@ mod tests {
                 .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
             assert_eq!(queue.len(), 2);
         }
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_drain_window_enqueue_reaches_the_final_drain_after_the_server_join()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W9-C-1: the shutdown path fires the console's shutdown chain and
+        // awaits the server's full drain BEFORE the bounded final drain.
+        // The mock server enqueues a compensation event at the first
+        // instant of the console-drain window — the exact moment an
+        // in-flight console handler's failed audit append would land — and
+        // the assertion is that the final drain still sees it. Under the
+        // pre-fix order the bounded final drain ran first and the sender
+        // fired after it, so an event enqueued at this instant bypassed the
+        // final drain and was silently dropped on exit. The store is
+        // healthy here, so the final drain persists the event durably and
+        // the in-memory queue ends empty.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        let now = OffsetDateTime::now_utc();
+        let drain_window = AuditEvent::started(import_context()?, now);
+        let drain_window_for_server = drain_window.clone();
+        let make_server =
+            move |_policy: AuthPolicy,
+                  mut stop_watch: scheduler::StopWatch,
+                  scheduler_done_receiver: oneshot::Receiver<()>| async move {
+                // The minimal server shape of the real `serve_until` shutdown
+                // future: wait for the stop watch, then for the background
+                // tasks' completion signal, then report success. The enqueue
+                // is the console-drain window's first instant: the moment the
+                // graceful drain begins (or, under the pre-fix order, the
+                // moment it would have begun after the final drain).
+                stop_watch.stopped().await;
+                let _ = scheduler_done_receiver.await;
+                AUDIT_COMPENSATION
+                    .get_or_init(|| Mutex::new(VecDeque::new()))
+                    .lock()
+                    .map_err(|_| io::Error::other("the compensation queue is poisoned"))?
+                    .push_back(drain_window_for_server.clone());
+                Ok::<(), io::Error>(())
+            };
+        let (stop_sender, stop_receiver) = oneshot::channel();
+        let stop = async move {
+            stop_receiver
+                .await
+                .map_err(|_| io::Error::other("the test stop signal was dropped"))
+        };
+        let run_task = tokio::spawn(run_background_services(
+            Arc::clone(&instance.state),
+            Arc::new(RedfishGateway::from_system_roots().await?),
+            TelemetryRetention::default(),
+            DeploymentPosture::Standalone,
+            AuditActor::LocalOperator,
+            make_server,
+            stop,
+        ));
+        stop_sender
+            .send(())
+            .map_err(|()| io::Error::other("the test stop receiver was dropped"))?;
+        let result = run_task
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+        assert!(
+            result.is_ok(),
+            "the shutdown run must complete, got: {result:?}"
+        );
+        // The drain-window event must have reached the bounded final drain:
+        // it is durably persisted and the in-memory queue ends empty. Under
+        // the pre-fix order the enqueue landed after the final drain and the
+        // event was dropped — the queue would still hold it.
+        {
+            let queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            assert!(
+                queue.is_empty(),
+                "the drain-window event must be finally drained, queue: {queue:?}"
+            );
+        }
+        let persisted = instance
+            .state()
+            .store
+            .find_audit_operation(drain_window.context().operation_id())
+            .await?;
+        assert_eq!(
+            persisted,
+            [drain_window],
+            "the drain-window event must be durably persisted by the final drain"
+        );
         instance.close().await?;
         drop(directory);
         Ok(())
