@@ -427,7 +427,7 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 
 **对账步骤**：
 
-1. 在中心操作视图按返回的 operation_id 定位该操作，确认命令与目标；
+1. 在中心操作视图按返回的 operation_id 定位该操作，确认命令与目标；site-scoped 角色（Operator/Viewer，`role_assignments.site_id` 有分配）仅能查看其分配站点的操作——命中的是他站操作时，需全局 Administrator 或对应站点作用域账号查看（`view_scope_allows`：Administrator 全站；Operator/Viewer 无作用域分配则全站、有分配则仅分配站；`center_operations` 列表对无权他站操作静默过滤，带 `site_id` 查询无权站时返回 403）；
 2. 人工核验 BMC 实际状态（如更新是否已生效）：
    - **效果已发生** → Unknown 是如实记录，无需重试；409 拒绝是正确行为；
    - **效果未发生** → 见下方已知边界；

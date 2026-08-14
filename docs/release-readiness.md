@@ -12,7 +12,7 @@
 > 状态标记沿用仓库文档：✅ 达成（结构或实测，表中注明性质）；🟡 部分（有结构证据，演练/
 > 评估/发布级验证未做）；⏳ 待做（无代码或文档证据）。
 >
-> 修订说明：本版为 **迭代二十二（wave-eight 对抗修复）后复核版**（HEAD = 6d5e90e，2026-08-14）。
+> 修订说明：本版为 **迭代二十三（wave-nine 对抗修复）后复核版**（HEAD = ba110ce，2026-08-14）。
 > 迭代六（H4/H5）已合入：
 > **UI 本地化完整落地**（H5 d3f7769：`strings_catalog!` 目录扩至 827 键 En/Zh 双语、
 > `Lang::{En, Zh}` 运行时语言选择器、URL fragment 持久化（`#lang=`，纯函数 `ui/src/i18n.rs:1915-1936`
@@ -220,6 +220,20 @@
 > / persistence 236→237 / ui 144→145，其余不变；逐项登记见 `known-limitations.md` §九
 > （第八波块）与 `docs/r8-findings/`（A1-A4 区域登记）；本轮登记对 milestone-status 的
 > 推偏（+20 行）已同步重锚本文件与 security-review 的全部交叉引用。
+> **迭代二十三已落地（2026-08-14，HEAD = ba110ce，1 个提交）——wave-nine 对抗修复批次**：
+> 第九波对抗审查（7 透镜）并行攻击 wave-eight 状态，约 22 条发现 → 去重约 14 条交 3 个
+> 独立怀疑者 → **13 confirmed + 1 refuted + 多条 partial 降级——本轮无一条按声称的
+> HIGH/MEDIUM 成立**（收敛信号：C-2 两条承重前提被代码证伪降加固、点段族被 has_resource
+> 精确匹配门阻断降登记、acked keeper TTL 黑窗判为必要代价降登记）；13 项修复（ba110ce，
+> 24 文件 +2231/-78）：W9-C-1 三姿态停机窗口（server drain 前移 + 双向测试）、C-2 settle
+> 加固、E-3 三态穿出、D-1 十个建表迁移事务化（26/26 多语句迁移全覆盖）、S-2 restore
+> 一致性检查 + ArtifactFileMissing、S-3 流式分发、T-1 acked 测试、F-6 贯通测试、CI-1/2
+> 注释、D-1/D-2 锚点、D-3 手册限定、T-2/T-3 测试补缺；**测试计数复核（2026-08-14，
+> `cargo test --workspace -- --list` 实测）：总数 2029（lib/集成 2028 + doc 1）**，增量
+> 2013→2029（+16）；per-crate：rutilus 187→191 / application 387→393 / migration 68→74
+> / persistence 237 / ui 145，其余不变；逐项登记见 `known-limitations.md` §九（第九波块）
+> 与 `docs/r9-findings/`（A1-A4 区域登记）；本轮头注对 milestone-status 的推偏（+20 行）
+> 已同步重锚本文件与 security-review 的全部交叉引用。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
 
@@ -243,15 +257,15 @@
 
 | 内容项 | 状态 | 关键证据位置 |
 |---|---|---|
-| 五厂商实验室 | ⏳ | `milestone-status.md:526`（§7.1 行）；§四-B |
+| 五厂商实验室 | ⏳ | `milestone-status.md:546`（§7.1 行）；§四-B |
 | 所有 Fixture 回归 | 🟡 | 合成 mock 回归齐备，脱敏真实响应 fixture 目录尚无（`known-limitations.md:77-79`） |
-| 故障注入 | 🟡 | §19.3 多数场景单进程覆盖（`milestone-status.md:528`，§7.1 行）；**Windows 侧进程级演练套件已落地（`scripts/drills/` 7 脚本 + RESULTS.md，2026-08-12，覆盖 §19.3 剩余 4 项中的 3 项 + §20.1/§20.2 备份恢复 + §0.4.0 大文件中断）**，首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP、挂起防护修复后快速 FAIL 路径已验证，功能验证待真实交互控制台会话复跑；磁盘空间不足未覆盖；Linux/macOS 等价脚本未编写（ps1 为 Windows 专属）；详见 §四-B |
+| 故障注入 | 🟡 | §19.3 多数场景单进程覆盖（`milestone-status.md:548`，§7.1 行）；**Windows 侧进程级演练套件已落地（`scripts/drills/` 7 脚本 + RESULTS.md，2026-08-12，覆盖 §19.3 剩余 4 项中的 3 项 + §20.1/§20.2 备份恢复 + §0.4.0 大文件中断）**，首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP、挂起防护修复后快速 FAIL 路径已验证，功能验证待真实交互控制台会话复跑；磁盘空间不足未覆盖；Linux/macOS 等价脚本未编写（ps1 为 Windows 专属）；详见 §四-B |
 | 跨平台 E2E | ✅ | `ci.yml:169-185`（windows/macos 任务，web/tests 9 个路径套件 + `app/tests/version.rs`） |
 | 数据库压力 | ✅ | `persistence/tests/stress_capacity.rs` 3 测试（`:338, :587, :834`），规模常量对齐设计最低验证规模（`:47-52`） |
 | 中心重连风暴 | ✅ | `center_sync.rs` 42 测试（风暴 4 + 重发 1 + 单连接语义 32 + wave-two 5，见上表） |
-| 大文件更新 | 🟡 | 分块机制全链路覆盖（`milestone-status.md:532`，§7.1 行）；真实固件端到端演练未做（§四-B） |
-| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:533`，§7.1 行）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、10 测试（V4I-3 重测）、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）、wave-one 73d480d 补间接赋值盲区 `:836`、wave-two e59b14a 补跨字面量 PEM 片段盲区、V4I-3 重测 10 测试；CI 独立步骤 `ci.yml:307-309` Secret leak gate，`bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
-| 权限测试 | ✅ | 角色掩码/中心站点作用域/限速/BMC 写权限拒绝（`milestone-status.md:534`，§7.1 行） |
+| 大文件更新 | 🟡 | 分块机制全链路覆盖（`milestone-status.md:552`，§7.1 行）；真实固件端到端演练未做（§四-B） |
+| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:553`，§7.1 行）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、10 测试（V4I-3 重测）、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）、wave-one 73d480d 补间接赋值盲区 `:836`、wave-two e59b14a 补跨字面量 PEM 片段盲区、V4I-3 重测 10 测试；CI 独立步骤 `ci.yml:307-309` Secret leak gate，`bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
+| 权限测试 | ✅ | 角色掩码/中心站点作用域/限速/BMC 写权限拒绝（`milestone-status.md:554`，§7.1 行） |
 | 安全审查 | 🟡 | `docs/security-review.md` 已交付（8 范围 + §7.7 扫描，无 BLOCKER）；MINOR-1 已修复（`web/src/auth.rs:1594, 1601, 1626`（`DUMMY_SALT`/`DUMMY_HASH`/`dummy_password_verification`）、未知用户名分支调用 `:1766`）；N5 已关闭（E3c 编译期 const assert，`web/src/lib.rs:1511`）；深度审查批次补认证边界硬化（B1-B4，commit 8147bc9：密码策略 API 边界 / 429 不写审计 / 撤销信号 / M1 残留面证反关闭，见 §三 B1-B4 行）；**迭代七**：N3 限速器桶键淘汰已实现（T-D e7aef53，web 147 全过），§九 8 项遗留全部落地/处置（`milestone-status.md` §7.5）；**迭代十五（wave-one）**：对抗第一波发现 2 HIGH（S3-1/S3-2）均已修复（d3b966a，见 `security-review.md` §三 S3-1/S3-2 行）；**迭代十七~十九（wave-three/four/five）**：第三波 S 类（W3S-1..10，改密预算/派生队列有界/审计具名/bidi 净化/呈现场地址计数等）与第四波（V4R-2/3/5/7、V4S-2/3/5）及第五波认证面（V5C-1/2/4/5/6）全部修复（e768473 / 3a23b9b / e85560a，见 `security-review.md` §三新增行），**当前 master 无 HIGH 残留**（wave-five 的 5 HIGH 为审计可问责/中心协议面，非认证面，见 `known-limitations.md` §九第五波块） |
 | Migration 回归 | ✅ | `migration/tests/` 25 个测试文件（含 E4 防回归 `resource_feature_lists.rs`、wave-one 新增 `audit_center_actions.rs`/`endpoint_health_checks.rs`、wave-four/five 新增 `audit_failure_vocabulary.rs`/`audit_operation_vocabulary.rs`）；迁移总数 27；CI 门禁 `ci.yml:547`（W6-1 ran-断言 floor 50，V4I-4 重测后同步） |
 | 备份恢复演练 | 🟡 | 自动化往返 10 测试（见上表证据，含迭代七 T-E 预快照三态 3 测试）；三平台演练未执行（§四-B） |
@@ -279,12 +293,12 @@
 
 | # | 发布条件 | 状态 | 性质 | 证据（file:line） | 差距说明 |
 |---|---|---|---|---|---|
-| 1 | 能力账本 100% | ✅ | 结构性 | 账本 47 条 = 0.13.0 全部公开能力（`domain/src/capability.rs:401` 47 条、`:462` 14 OEM）；账本缺口为空（`milestone-status.md:358`〔§1.5〕，`release_baseline.rs:1236`）；账本 Hash 与协商 golden 钉死（`release_baseline.rs:1049-1052, 1577`；`center-protocol/src/negotiation.rs:178, 287`） | 无。0.8.0 验收达成（`milestone-status.md` §二 验收 1） |
-| 2 | 标准 feature 全覆盖 | ✅ | 结构性 | 编译完整面 58 个 = 0.13.0 全集 59 减 `default`；显式 17 个与 workspace 清单双向校验（`milestone-status.md:316`〔§1.1〕；`release_baseline.rs:79, 111`）；33 个标准账本条目全部落在编译面 | 「全覆盖」= 编译面完全覆盖，已由门禁钉死；设备侧实际暴露面是条件 8 的实测范围 |
-| 3 | OEM feature 全覆盖 | ✅ | 结构性 | 14 个 `oem-*` 全编译（根 `Cargo.toml:35`；`domain/src/capability.rs:462`）；编译面与领域 OEM 账本同序逐一相等（`infra-redfish/src/lib.rs:158` 测试） | 无。probe-only 的 2 项（cper/fabrics）读取面如实登记（`milestone-status.md:448`〔§五〕） |
+| 1 | 能力账本 100% | ✅ | 结构性 | 账本 47 条 = 0.13.0 全部公开能力（`domain/src/capability.rs:401` 47 条、`:462` 14 OEM）；账本缺口为空（`milestone-status.md:378`〔§1.5〕，`release_baseline.rs:1236`）；账本 Hash 与协商 golden 钉死（`release_baseline.rs:1049-1052, 1577`；`center-protocol/src/negotiation.rs:178, 287`） | 无。0.8.0 验收达成（`milestone-status.md` §二 验收 1） |
+| 2 | 标准 feature 全覆盖 | ✅ | 结构性 | 编译完整面 58 个 = 0.13.0 全集 59 减 `default`；显式 17 个与 workspace 清单双向校验（`milestone-status.md:336`〔§1.1〕；`release_baseline.rs:79, 111`）；33 个标准账本条目全部落在编译面 | 「全覆盖」= 编译面完全覆盖，已由门禁钉死；设备侧实际暴露面是条件 8 的实测范围 |
+| 3 | OEM feature 全覆盖 | ✅ | 结构性 | 14 个 `oem-*` 全编译（根 `Cargo.toml:35`；`domain/src/capability.rs:462`）；编译面与领域 OEM 账本同序逐一相等（`infra-redfish/src/lib.rs:158` 测试） | 无。probe-only 的 2 项（cper/fabrics）读取面如实登记（`milestone-status.md:468`〔§五〕） |
 | 4 | 所有写操作均类型化 | ✅ | 结构性 | 43 个公开写操作全部经 `nv-redfish` 类型化面（`release_baseline.rs:677`；`milestone-status.md` §1.4）；NVIDIA 9 个 OEM action 均类型化（`support-matrix.md:124-130`） | 无 |
 | 5 | 不存在原始 BMC 写请求 | ✅ | 结构性 | 唯一 `nv-redfish` 依赖 crate = infra-redfish（`infra-redfish/Cargo.toml:14`）；`UpstreamBmc = HttpBmc<NvHttpClient>` 传输注入（`redfish_gateway.rs:338, 1115`）；0.8.0 验收 4 达成（`milestone-status.md` §二 验收 4） | 无 |
-| 6 | 不存在裸 SQL | ✅ | 结构性 | 机械门禁：迁移 crate 只允许 DDL 裸语句、DML 词全禁（`migration/tests/bare_sql_gate.rs:35, 40, 445, 456`；wave-one 73d480d 补 CTAS/TRIGGER 内嵌 DML 扫描；wave-three W3F-3 补括号/CTE 拼写）；表重建数据复制全部 SeaQuery（`milestone-status.md:413`〔§二 验收 5〕） | 无 |
+| 6 | 不存在裸 SQL | ✅ | 结构性 | 机械门禁：迁移 crate 只允许 DDL 裸语句、DML 词全禁（`migration/tests/bare_sql_gate.rs:35, 40, 445, 456`；wave-one 73d480d 补 CTAS/TRIGGER 内嵌 DML 扫描；wave-three W3F-3 补括号/CTE 拼写）；表重建数据复制全部 SeaQuery（`milestone-status.md:433`〔§二 验收 5〕） | 无 |
 | 7 | 三平台单二进制发布 | 🟡 | 结构性（构建矩阵）+ 实测缺位 | 构建矩阵入 CI：x86_64 musl（`ci.yml:538-543`）、aarch64 musl cargo-zigbuild（`ci.yml:550-554`）、macOS Universal 2 lipo 合并 + `lipo -verify_arch x86_64 arm64` 校验（`ci.yml:565-598`）；三平台编译 + wasm32 UI 产物 diff（`ci.yml:85-101, 406-521`）；Windows ARM64 明确不入 CI（`ci.yml:558-564` 注释：hosted x64 runner 无 ARM64 MSVC 链接器与 SDK 导入库）；发布配置与 §5.4 一致（`Cargo.toml:110-116`；`rust-toolchain.toml` 已固定；Cargo.lock 已提交）；单二进制自包含边界（`support-matrix.md:85-88`） | ① Windows ARM64 发布目标无 CI 构建、无安装验证（§四-B，前置：原生 ARM64 runner 或本地 ARM64 主机）；② 三平台**发布包级**安装/运行验证并入条件 15 演练（§四-B）；③ 签名（条件 17）前置 |
 | 8 | 五厂商标准能力验证 | ⏳ | 实测 | Mock 层已覆盖五厂商 profile（`test-support/src/mock_bmc/profile.rs:47-133`）；§19.1 Physical Device Test「五厂商至少各一台真实设备进入 1.0.0 认证矩阵」未达成（`design:2320-2322`；`known-limitations.md:79`） | 前置条件：五厂商真实设备实验室（§四-B）。当前结论只能是「基于上游类型面与 mock/fixture 验证」，不是实测认证（`known-limitations.md:80`） |
 | 9 | Dell、HPE、Lenovo 上游 OEM 能力验证 | ⏳ | 实测 | Dell/HPE/Lenovo OEM 读取面已编译并映射（`support-matrix.md:113-118`）；真实设备验证未达成（同上） | 前置条件：Dell/HPE/Lenovo 设备各一台（§四-B）；验证范围限标准 feature + 上游已有 OEM feature，不声称覆盖全部 OEM API（`design:2326-2334`） |
@@ -310,7 +324,7 @@
 |---|---|---|---|---|
 | §12.4 诊断解码失败**生产捕获点**（gateway 捕获 + SQLite 持久化） | ✅ 已合入（E1，commit ce2b8b3） | 全组评审复验（证据链见下） | 无（已合并，全部门禁复跑通过） | 网关捕获：`DecodeFailureObservation`（`infra-redfish/src/redfish_gateway.rs:8811`），捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure`（`:8995, :9022, :9068`），刷新结果经 `outcome.decode_failures()` 流出（`:8922`）；同代事务提交：`persistence/src/resource_snapshot_repository.rs:81-147`（`commit_resource_generation` 在快照同一事务内写 `resource_decode_failures`），生产链路 `application/src/endpoint_refresh.rs:350-355` 直连；新表 + entity（`entity/src/lib.rs:28`、`entity/src/resource_decode_failure.rs:13`）+ 迁移 `m20260812_000001`（E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；web 端到端 7 测试（`web/tests/diagnostics_path.rs:848-1185`，含 `refresh_capture_flows_into_the_diagnostics_response` `:1008`）；现状登记见 `known-limitations.md` §八「§12.4」行 |
 | 独立 Secret 泄漏扫描（仓库级自动扫描 + 运行时抓包/日志复核） | ✅ 仓库级已落地（E3b）/ 运行时复核待做 | 安全评审 + CI | 无（仓库级部分）；运行时复核需三平台演示环境（可并入 B） | `security/tests/secret_leak_gate.rs`：3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM / R3 明文输出宏泄露）、10 测试（`:1427, :1439, :1450, :1460, :1485, :1588, :1637, :1669, :1716, :1760`，e59b14a 后实测——wave-two T1-4 补跨字面量拆分 PEM 私钥盲区）、白名单 = `ALLOWED_CONSTANT_HITS` 2 处（path+line+name+literal 四元组绑定，`app/src/backup.rs:88, 89` 备份条目名）、`test-support` crate 目录级豁免（fixture scope，`:96-101, 1258`，E3b 原始提交 eefde7e）+ `strings_catalog!` 宏体结构豁免（深度审查批次 commit e8424df：CATALOG_MACRO 帧识别 `:575, 1038-1043`，新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）+ wave-one 间接赋值盲区（73d480d：`wrapper_or_indirect` `:836`）+ wave-two 跨字面量拆分 PEM 私钥盲区（e59b14a，T1-4，`pem_fragment_violation` `:886`）；门禁为 CI 独立步骤（`ci.yml:307-309` Secret leak gate，`bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前；header 注记 `ci.yml:15-17`）；运行时抓包/日志复核仍为 §四-B 项（`security-review.md:183`） |
-| UI 本地化 | ✅ 已完整落地（H5 d3f7769 + 0f91c17 + T-H c4dd335：`strings_catalog!` 目录 827 键 En/Zh 双语（`i18n.rs:163-1858`）、`Lang::{En, Zh}` 运行时语言选择（`thread_local!` `i18n.rs:1938-1942` + `L()` `i18n.rs:1968-1973`）、lib.rs `LanguageSelector` 组件（`lib.rs:11725`）与 URL fragment 持久化（**迭代七 T-H 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`、wasm 封装 `lib.rs:11692-11724`、启动恢复 `start()` `lib.rs:11746`）；ui 144 测试全过；深度审查批次补 `format_catalog` 槽位硬化与本地化（fb660d5 + a4950fc，`i18n.rs:1984-2006`，见 `milestone-status.md` §7.4）） | 前端组 | 后续触点：localStorage 持久化（需扩展 web-sys feature）与更多语言；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:132`；`milestone-status.md:578` |
+| UI 本地化 | ✅ 已完整落地（H5 d3f7769 + 0f91c17 + T-H c4dd335：`strings_catalog!` 目录 827 键 En/Zh 双语（`i18n.rs:163-1858`）、`Lang::{En, Zh}` 运行时语言选择（`thread_local!` `i18n.rs:1938-1942` + `L()` `i18n.rs:1968-1973`）、lib.rs `LanguageSelector` 组件（`lib.rs:11751`）与 URL fragment 持久化（**迭代七 T-H 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`、wasm 封装 `lib.rs:11718-11746`、启动恢复 `start()` `lib.rs:11772`）；ui 144 测试全过；深度审查批次补 `format_catalog` 槽位硬化与本地化（fb660d5 + a4950fc，`i18n.rs:1984-2006`，见 `milestone-status.md` §7.4）） | 前端组 | 后续触点：localStorage 持久化（需扩展 web-sys feature）与更多语言；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:132`；`milestone-status.md:598` |
 | N5 `unreachable!` 处置（可选，NOTE 级） | ✅ 已完成（E3c） | — | 无 | `security-review.md` §三 N5 已关闭：`web/src/lib.rs:1511` 编译期 `const _: () = assert!(rutilus_api::OVERVIEW_RECENT_EVENTS > 0);` 钉死常量正性（注释 `:1505-1510`），运行时 guard 保留为已被断言证明不可达的防御分支（`:1512-1514`） |
 | 发布级 CI 扩展（Windows ARM64 原生 runner） | ✅ 移交 §三-B（依赖原生 runner，非 A 类可做） | — | 原生 ARM64 Windows runner 或本地 ARM64 主机验证后另行处理 | `ci.yml:558-564` 注释；§三-B「Windows ARM64 发布验证」行 |
 
