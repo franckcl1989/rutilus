@@ -202,6 +202,11 @@ impl SqliteStore {
         settings: SqliteSettings,
     ) -> Result<Self, OpenStoreError> {
         validate_database_path(database_path)?;
+        // A surviving restore-pending marker means a restore was interrupted
+        // mid-overwrite: the live pair is verified against the recorded
+        // snapshot and pre-restore fingerprints before anything else touches
+        // the files (R6-D-5).
+        backup_snapshot::verify_restore_marker(database_path)?;
         let database_exists = existing_regular_database(database_path)?;
         let migration_backup = if database_exists && migrations_are_pending(database_path).await? {
             Some(
@@ -306,6 +311,11 @@ pub enum OpenStoreError {
         #[source]
         source: DbErr,
     },
+    #[error(
+        "an interrupted restore left the database files inconsistent with the recorded \
+         snapshot (marker: {marker}): {reason}"
+    )]
+    RestoreInterrupted { marker: PathBuf, reason: String },
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -23,6 +23,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::standalone_runtime::{MasterKeyMigrationError, migrate_legacy_master_key_envelope};
+
 const MINIMUM_PASSPHRASE_CHARACTERS: usize = 12;
 const MAXIMUM_PASSPHRASE_BYTES: usize = 1024;
 
@@ -130,6 +132,14 @@ pub async fn initialize_standalone(
             .map_err(InitializationError::MasterKeyFile)?;
         let _master_key = recover_master_key(&protected, unlock.passphrase())
             .map_err(InitializationError::MasterKeyProtection)?;
+        if protected.is_legacy() {
+            // R6-S-11: the resumed unlock migrates a legacy RUTMK001
+            // envelope to the current format, exactly like the Standalone
+            // open path.
+            migrate_legacy_master_key_envelope(paths, unlock.passphrase(), &protected)
+                .await
+                .map_err(InitializationError::MasterKeyMigration)?;
+        }
         InitializationOutcome::Resumed
     } else {
         if database_exists {
@@ -285,6 +295,8 @@ pub enum InitializationError {
     MasterKeyProtection(#[source] MasterKeyProtectionError),
     #[error("failed to persist or load the protected instance master key: {0}")]
     MasterKeyFile(#[source] MasterKeyFileError),
+    #[error("failed to migrate the legacy instance master-key envelope: {0}")]
+    MasterKeyMigration(#[source] MasterKeyMigrationError),
     #[error("failed to open and migrate the instance database: {0}")]
     OpenStore(#[source] OpenStoreError),
     #[error("failed to close the initialized instance database: {0}")]

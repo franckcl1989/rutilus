@@ -172,6 +172,43 @@ pub trait CenterOutbox: Send + Sync {
         })
     }
 
+    /// Finds the newest durable outbox row of one operation — the directed
+    /// repair read of the dispatch retry's fall-through and the V5E-1
+    /// reply-site fallback (R6-E-04).
+    ///
+    /// The center's durable outbox holds exactly the §15.6 offers, and the
+    /// ack-time pruning keeps at most the newest acknowledged row per
+    /// operation beside its pending row, so the newest row of the operation
+    /// carries the offer facts — the target, the expiry, and the addressed
+    /// site — the repair reads need, and no read has to decrypt the site's
+    /// whole queue to find it.
+    ///
+    /// The default implementation reads through [`Self::list_offers`] and
+    /// keeps the newest matching row — correct on every store — while the
+    /// production repository overrides it with a directed read over the
+    /// plaintext `operation_id` column (the pre-migration rows are
+    /// backfilled lazily by that read).
+    fn find_offer_by_operation(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Box::pin(async move {
+            let mut rows = self.list_offers(instance_id).await?;
+            rows.retain(|entry| {
+                let Ok(envelope) = serde_json::from_str::<Envelope>(entry.payload_json()) else {
+                    return false;
+                };
+                matches!(
+                    envelope.message.as_ref(),
+                    Some(EnvelopeMessage::OperationOffer(offer))
+                        if offer.operation_id == operation_id.to_string()
+                )
+            });
+            Ok(rows.into_iter().max_by_key(OutboxEntry::sequence))
+        })
+    }
+
     /// Marks one entry acknowledged. The write is idempotent: a repeated
     /// acknowledgement (the center may deliver its `Ack` more than once) is
     /// a successful no-op.

@@ -68,9 +68,23 @@ deny = [
     { crate = "redis", reason = "Rutilus does not use an external cache or queue" },
     { crate = "tokio-postgres", reason = "Rutilus uses embedded SQLite only" },
 ]
+# R6-8 (2026-08-14): the eight skip entries ahash@0.7.8/0.8.12, getrandom@0.3.4,
+# hashbrown@0.12.3, rand@0.10.2, r-efi@5.3.0/6.0.0, sha2@0.11.0 were DELETED.
+# Their old reasons claimed "不可达（optional 图排除），可达即需复核" — each was
+# reachable only through an unactivated optional feature chain (rkyv 0.7.46 for
+# rust_decimal, sea-orm-arrow 2.0.0-rc.4, sqlx mysql/postgres, reqwest http3,
+# uefi-target-only getrandom cfg) and absent from the cargo-deny graph on every
+# [graph] target. Deletion was verified with `cargo tree --workspace --target all
+# --all-features -i <crate>@<version>` (7 of 8 absent from the resolution
+# entirely; r-efi@6.0.0 present only under cfg(target_os = "uefi"), a target not
+# in [graph].targets). cargo-deny has no per-entry unmatched-skip tolerance
+# (checked against the official bans config docs), so with the ci.yml Deny step
+# now passing `--deny warnings` (command-arguments) the entries could not stay:
+# keep them and the unmatched-skip warnings fail the gate; delete them and the
+# same "可达即需复核" guarantee is enforced NATURALLY — if any of these versions
+# ever becomes reachable, it appears in the deny graph and the multiple-versions
+# check flags it for review.
 skip = [
-    { crate = "ahash@0.7.8", reason = "不可达（optional 图排除），可达即需复核: reachable only through rkyv 0.7.46, the unactivated optional dependency of rust_decimal 1.42.1 (the RUSTSEC-2026-0235 chain); absent from the cargo-deny graph on every [graph] target" },
-    { crate = "ahash@0.8.12", reason = "不可达（optional 图排除），可达即需复核: reachable only through arrow-array/arrow-select 58.4.0, pulled by sea-orm's unactivated arrow feature (sea-orm-arrow 2.0.0-rc.4); absent from the cargo-deny graph on every [graph] target" },
     { crate = "block-buffer@0.10.4", reason = "SQLx 0.9 and the audited encryption stack use different digest generations" },
     { crate = "convert_case@0.6.0", reason = "Leptos configuration and current Leptos macros use incompatible case-conversion generations" },
     { crate = "cpufeatures@0.2.17", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
@@ -78,16 +92,10 @@ skip = [
     { crate = "digest@0.10.7", reason = "SQLx 0.9 and the audited digest stack (argon2, chacha20poly1305) use different digest generations; hmac/sha1 (TOTP) resolve the 0.11 generation already present for SQLx" },
     { crate = "foldhash@0.1.5", reason = "prost-build's petgraph resolves hashbrown 0.15 (foldhash 0.1) while the 0.16/0.17 generations (foldhash 0.2) come from SQLx's hashlink and petgraph's own indexmap; this is build-time only" },
     { crate = "getrandom@0.2.17", reason = "ring 0.17 uses its audited legacy RNG API while Rutilus and UUID use getrandom 0.4" },
-    { crate = "getrandom@0.3.4", reason = "不可达（optional 图排除），可达即需复核: reachable only through ahash 0.8.12 (the sea-orm-arrow chain above); absent from the cargo-deny graph on every [graph] target" },
-    { crate = "hashbrown@0.12.3", reason = "不可达（optional 图排除），可达即需复核: reachable only through rkyv 0.7.46, the unactivated optional dependency of rust_decimal (the RUSTSEC-2026-0235 chain); absent from the cargo-deny graph. The reachable 0.17.1 (prost-build's petgraph -> indexmap) stays the unsanctioned anchor version" },
     { crate = "hashbrown@0.15.5", reason = "prost-build's petgraph pins the 0.15 generation while SQLx's hashlink carries 0.16 and petgraph's own indexmap carries 0.17 (the graph anchor); this is build-time only" },
     { crate = "hashbrown@0.16.1", reason = "SQLx 0.9's hashlink resolves the 0.16 generation while the prost-build build chain carries 0.15 (skipped) and 0.17 (anchor)" },
     { crate = "heck@0.4.1", reason = "SeaORM 2.0 macros have not fully converged on heck 0.5" },
-    { crate = "rand@0.10.2", reason = "不可达（optional 图排除），可达即需复核: reachable only through quinn-proto 0.11.16 (reqwest's unactivated http3 feature) and sqlx-postgres 0.9.0 (sqlx's unactivated mysql/postgres features); absent from the cargo-deny graph on every [graph] target" },
-    { crate = "r-efi@5.3.0", reason = "不可达（optional 图排除），可达即需复核: uefi-target-only dependency of getrandom 0.3.4 ([target.'cfg(all(target_os = \"uefi\", getrandom_backend = \"efi_rng\"))']); no uefi target in [graph].targets" },
-    { crate = "r-efi@6.0.0", reason = "不可达（optional 图排除），可达即需复核: uefi-target-only dependency of the reachable getrandom 0.4.3 ([target.'cfg(all(target_os = \"uefi\", getrandom_backend = \"efi_rng\"))']); no uefi target in [graph].targets" },
     { crate = "sha1@0.10.7", reason = "tokio-tungstenite 0.24 pins sha1 0.10 (via tungstenite 0.24, used by the app and test-support WebSocket stack) while rutilus-domain TOTP uses the 0.11 generation; the tokio-tungstenite 0.30 upgrade removes this" },
-    { crate = "sha2@0.11.0", reason = "不可达（optional 图排除），可达即需复核: reachable only through sqlx-mysql/sqlx-postgres 0.9.0 (sqlx's unactivated mysql/postgres features; the workspace uses sqlx-sqlite); absent from the cargo-deny graph on every [graph] target" },
     { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
     { crate = "thiserror@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },
     { crate = "thiserror-impl@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },

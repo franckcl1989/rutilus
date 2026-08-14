@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::MasterKey;
 
-/// The versioned magic framing the package, following the `RUTMK001` and
+/// The versioned magic framing the package, following the `RUTMK002` and
 /// `RUTOSK001` envelope precedents.
 pub const BACKUP_PACKAGE_MAGIC: [u8; 8] = *b"RUTBK001";
 /// The format version carried after the magic; the only supported version.
@@ -62,7 +62,7 @@ pub enum BackupEntryKind {
     Database,
     /// The durable `SQLite` write-ahead-log sidecar, when present.
     DatabaseWal,
-    /// The passphrase-protected master-key envelope (`RUTMK001`).
+    /// The passphrase-protected master-key envelope (`RUTMK002`).
     MasterKey,
     /// The OS-protected master-key envelope (`RUTOSK001`).
     SystemMasterKey,

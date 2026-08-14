@@ -82,6 +82,55 @@ impl MasterKeyFile {
         Ok(())
     }
 
+    /// Replaces the key file with a re-protected envelope — the legacy
+    /// (`RUTMK001` → `RUTMK002`) format migration: the migrated envelope is
+    /// written to a securely created sibling temporary file, synchronized,
+    /// and renamed over the existing file. Unlike [`Self::create`] this
+    /// overwrites on purpose; it is meant to run under the runtime lock the
+    /// unlock path already holds, so the load → re-protect → replace
+    /// sequence cannot interleave with a concurrent writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MasterKeyFileError`] when the path has no parent directory
+    /// or any write, synchronize, or rename stage fails.
+    pub fn replace(&self, protected: &ProtectedMasterKey) -> Result<(), MasterKeyFileError> {
+        let parent = self.parent_directory()?;
+        let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
+            MasterKeyFileError::CreateTemporary {
+                directory: parent.to_path_buf(),
+                source,
+            }
+        })?;
+        temporary
+            .write_all(protected.as_bytes())
+            .map_err(|source| MasterKeyFileError::WriteTemporary {
+                directory: parent.to_path_buf(),
+                source,
+            })?;
+        temporary.as_file().sync_all().map_err(|source| {
+            MasterKeyFileError::SynchronizeTemporary {
+                directory: parent.to_path_buf(),
+                source,
+            }
+        })?;
+
+        let persisted =
+            temporary
+                .persist(&self.path)
+                .map_err(|error| MasterKeyFileError::Persist {
+                    path: self.path.clone(),
+                    source: error.error,
+                })?;
+        persisted
+            .sync_all()
+            .map_err(|source| MasterKeyFileError::SynchronizePersisted {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
+    }
+
     /// Loads one exact, regular, non-symlink envelope without unbounded reads.
     ///
     /// # Errors
@@ -258,6 +307,28 @@ mod tests {
             !fs::read(key_file.path())?
                 .windows("local unlock phrase".len())
                 .any(|window| window == b"local unlock phrase")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_rewrites_the_existing_key_file_with_the_migrated_envelope()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let key_file = MasterKeyFile::new(directory.path().join("master-key.rut"));
+        let passphrase: SecretString = String::from("local unlock phrase").into();
+        let first = protected_key(0x45, &passphrase)?;
+        let migrated = protected_key(0x46, &passphrase)?;
+
+        key_file.create(&first)?;
+        key_file.replace(&migrated)?;
+
+        let loaded = key_file.load()?;
+        assert_eq!(loaded, migrated);
+        let _recovered = recover_master_key(&loaded, &passphrase)?;
+        assert_eq!(
+            fs::metadata(key_file.path())?.len(),
+            MASTER_KEY_ENVELOPE_LENGTH as u64
         );
         Ok(())
     }

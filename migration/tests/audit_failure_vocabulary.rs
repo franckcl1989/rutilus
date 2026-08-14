@@ -222,13 +222,19 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
             .is_some()
     );
 
-    // Two rollbacks reach the 000003 down: the 000004 rollback in front
+    // The rollbacks reaching the 000003 down: the 000004 rollback in front
     // succeeds — the rows are representable in the 000003 shape, which keeps
     // the target column and the thirteen failure codes — and the 000003 down
     // then refuses the target-principal row: the restored 000001 shape has
     // no column for it, and silently dropping the target would falsify the
-    // audit record rather than refuse it.
-    let refused_target = Migrator::down(&database, Some(2)).await;
+    // audit record rather than refuse it. The framework's `down(Some(n))`
+    // rolls back the n newest applied migrations (a count, not a target
+    // version), so the call derives its count from the registration
+    // position — every migration added after the 000003 extends the list
+    // and the count follows, the down-side twin of the `migrations_before`
+    // discipline above.
+    let steps = rollback_steps_to(AUDIT_FAILURE_VOCABULARY_MIGRATION)?;
+    let refused_target = Migrator::down(&database, Some(steps)).await;
     assert!(
         refused_target.is_err(),
         "the down must refuse rows carrying a target principal"
@@ -240,7 +246,10 @@ async fn down_refuses_unrepresentable_rows_and_restores_the_000001_shapes()
 
     // Without the target row, the two new failure codes still refuse the
     // down: the restored eleven-code CHECK rejects them during the copy,
-    // exactly like the 000001 down refuses its center rows.
+    // exactly like the 000001 down refuses its center rows. The refused
+    // call above already rolled back every migration newer than the 000003,
+    // so two more steps — the 000003 and the 000002 — reach the same
+    // refusal now.
     let refused_codes = Migrator::down(&database, Some(2)).await;
     assert!(
         refused_codes.is_err(),
@@ -361,6 +370,20 @@ fn migrations_before(name: &str) -> Result<u32, Box<dyn Error>> {
         .position(|migration| migration.name() == name)
         .ok_or("audit failure vocabulary migration is not registered")?;
     Ok(u32::try_from(position)?)
+}
+
+/// The count of applied migrations a rollback must undo to reach the given
+/// migration: the framework's `down(Some(n))` rolls back the n newest
+/// applied migrations, so the count is the list length minus the
+/// migration's registration position — the down-side twin of
+/// [`migrations_before`].
+fn rollback_steps_to(name: &str) -> Result<u32, Box<dyn Error>> {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("audit failure vocabulary migration is not registered")?;
+    Ok(u32::try_from(migrations.len() - position)?)
 }
 
 /// Writes one failed terminal audit row in the §16.3 execution shape with

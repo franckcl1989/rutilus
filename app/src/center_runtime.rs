@@ -53,8 +53,8 @@ use rutilus_application::{
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
-    CertificateFingerprint, DeploymentPosture, EndpointId, InstanceId, InstanceKind, OperationId,
-    PrincipalId, RedfishCommand, ResourceODataId,
+    CenterBindingState, CertificateFingerprint, DeploymentPosture, EndpointId, InstanceId,
+    InstanceKind, OperationId, PrincipalId, RedfishCommand, ResourceODataId,
 };
 use rutilus_persistence::{
     CenterBindingRepositoryError, CenterOutboxRepositoryError, CenterProjectionRepositoryError,
@@ -340,8 +340,34 @@ impl CenterServices for StandaloneState {
                 .list_projected_endpoints(site)
                 .await
                 .map_err(CenterServicesError::Projection)?;
+            // R6-E-02: only endpoints whose site's binding is in force are
+            // listed — a revoked site's projected endpoints must not keep
+            // being offered to the console. The involved sites' bindings
+            // are read once per site, never per endpoint, and an endpoint
+            // without a site association (a broken row) is never shown,
+            // exactly like the operation view's site filter.
+            let mut involved_sites = HashSet::new();
+            for row in &rows {
+                if let Some(site) = row.site_id() {
+                    involved_sites.insert(site);
+                }
+            }
+            let mut bound_sites = HashMap::new();
+            for site in involved_sites {
+                let is_bound = self
+                    .store
+                    .find_binding_by_site(site)
+                    .await
+                    .map_err(CenterServicesError::Binding)?
+                    .is_some_and(|binding| binding.state() == CenterBindingState::Bound);
+                bound_sites.insert(site, is_bound);
+            }
             Ok(rows
                 .into_iter()
+                .filter(|row| {
+                    row.site_id()
+                        .is_some_and(|site| bound_sites.get(&site).copied().unwrap_or(false))
+                })
                 .map(|row| {
                     CenterEndpointView::new(
                         row.site_id(),
@@ -418,8 +444,15 @@ impl CenterServices for StandaloneState {
                 .await
                 .map_err(CenterServicesError::Binding)?
             {
-                RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked => Ok(()),
+                RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked => {}
             }
+            // R6-C-6: the revocation ends the site's established session —
+            // the registry entry is removed and the connection task's
+            // disconnect signal fires, so the revoked site's connection
+            // closes instead of keeping its flush and its reply path alive
+            // (the V5E-5 retirement premise).
+            self.registry.disconnect(site);
+            Ok(())
         })
     }
 
@@ -436,6 +469,41 @@ impl CenterServices for StandaloneState {
         let target = target.clone();
         let command = command.clone();
         Box::pin(async move {
+            // R6-C-1: the §17.5 idempotency scan and the operation creation
+            // of one site are one critical section — two concurrent
+            // identical dispatches must produce one operation, one offer,
+            // one execution. The gate is held only inside this dispatch: no
+            // path it covers dispatches again, so the non-reentrant mutex
+            // cannot deadlock.
+            let gate = {
+                let mut gates = self
+                    .dispatch_gates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                gates
+                    .entry(site)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let _dispatch_guard = gate.lock().await;
+            // R6-E-02: the target site's binding must be in force — a
+            // revoked (or not yet bound) site must never receive a new
+            // dispatch. The web layer audits the refusal outcome, exactly
+            // like every other dispatch refusal.
+            let binding = self
+                .store
+                .find_binding_by_site(site)
+                .await
+                .map_err(|_| CenterOperationRefusal::Store)?;
+            let binding_in_force =
+                binding.is_some_and(|binding| binding.state() == CenterBindingState::Bound);
+            if !binding_in_force {
+                // TODO(R6-A6): the interim verdict is the authorization
+                // refusal until the typed `SiteBindingRevoked` refusal
+                // variant lands in the web mapping (see
+                // docs/r6-findings/A1.md).
+                return Err(CenterOperationRefusal::NotAuthorized);
+            }
             let request = CenterOperationRequest::new(site, endpoint, target, command, actor);
             match dispatch.dispatch(&request, now).await {
                 Ok(dispatched) => Ok(DispatchedCenterOperation::new(
@@ -468,6 +536,15 @@ impl CenterServices for StandaloneState {
                     | CenterDispatchError::Operation(_)
                     | CenterDispatchError::Outbox(_)
                     | CenterDispatchError::Role(_) => CenterOperationRefusal::Store,
+                    // TODO(R6-A6): the interim verdict is the
+                    // unknown-endpoint refusal until the typed
+                    // `UnknownOutcomePending` refusal variant lands in the
+                    // web mapping (see docs/r6-findings/A1.md).
+                    CenterDispatchError::UnknownOutcomePending { .. } => {
+                        CenterOperationRefusal::UnknownEndpoint {
+                            endpoint_id: endpoint,
+                        }
+                    }
                 }),
             }
         })
@@ -957,6 +1034,11 @@ async fn run_center_connection(
         );
         return;
     }
+    // R6-C-6: the registry's per-site disconnect signal lets a binding
+    // revocation end this connection. The signal is armed inside
+    // `mark_connected`, so a revocation racing this setup still fires: the
+    // `Notify` stores the notification for the first `notified()` await.
+    let disconnect = state.registry.disconnect_watch(site.instance_id());
     // The crash backstop (N2-4): the engine removes the site on every
     // orderly exit, and this guard guarantees the same cleanup when the
     // task ends abnormally — a panic unwind runs the guard's `Drop`. A
@@ -964,7 +1046,8 @@ async fn run_center_connection(
     // reconnects would be refused as `AlreadyConnected` forever, silently.
     // The cleanup is idempotent, so the guard and the engine's own cleanup
     // never conflict.
-    let _disconnect_guard = DisconnectOnDrop::new(Arc::clone(&state.registry), site.instance_id());
+    let site_id = site.instance_id();
+    let _disconnect_guard = DisconnectOnDrop::new(Arc::clone(&state.registry), site_id);
     let engine = CenterInboundEngine::new(
         connection,
         store,
@@ -977,14 +1060,23 @@ async fn run_center_connection(
     if let Err(error) = engine
         .run(async move {
             let mut stop = stop;
-            stop.stopped().await;
+            match disconnect {
+                Some(disconnect) => {
+                    tokio::select! {
+                        () = stop.stopped() => {}
+                        () = disconnect.notified() => {
+                            tracing::warn!(
+                                "site {site_id}: the center revoked the binding; closing the connection"
+                            );
+                        }
+                    }
+                }
+                None => stop.stopped().await,
+            }
         })
         .await
     {
-        tracing::error!(
-            "site {} center connection ended: {error}",
-            site.instance_id()
-        );
+        tracing::error!("site {site_id} center connection ended: {error}");
     }
 }
 
@@ -1020,16 +1112,20 @@ pub enum CenterRunError {
 mod tests {
     use std::{error::Error, net::Ipv4Addr, path::PathBuf, sync::Arc};
 
-    use rutilus_application::{CenterTrustAnchor, SiteCertificateIssuer};
+    use rutilus_application::{
+        CenterProjectionRepository, CenterTrustAnchor, EndpointProjectionWrite, ResolvedSite,
+        ResourceProjectionWrite, SiteCertificateIssuer,
+    };
     use rutilus_center_protocol::{EnvelopeMessage, OperationOffer};
     use rutilus_domain::{
-        CertificateFingerprint, InstanceId, InstanceKind, Operation, OperationSource,
-        OperationTarget, OutboxEntry, OutboxEntryId, ResetType, SiteInstance, SystemCommand,
-        TargetId,
+        CenterBinding, CenterBindingId, CertificateFingerprint, EndpointId, InstanceId,
+        InstanceKind, Operation, OperationSource, OperationTarget, OutboxEntry, OutboxEntryId,
+        Principal, PrincipalId, PrincipalName, RedfishCommand, ResetType, ResourceFeature,
+        ResourceODataId, Role, RoleAssignment, SiteInstance, SystemCommand, TargetId,
     };
     use rutilus_persistence::SqliteStore;
     use rutilus_platform::{RuntimeLock, RuntimePaths};
-    use rutilus_security::MasterKey;
+    use rutilus_security::{MasterKey, generate_binding_code};
     use time::{Duration, OffsetDateTime};
     use tokio::net::TcpListener;
 
@@ -1232,6 +1328,7 @@ mod tests {
             audit_tail: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             registry: Arc::new(rutilus_application::CenterSessionRegistry::new()),
             center_issuer: std::sync::Mutex::new(None),
+            dispatch_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -1387,6 +1484,179 @@ mod tests {
                     && message.contains("undecodable envelope")
             }),
             "the undecodable row is reported at warn, not silently dropped"
+        );
+        Ok(())
+    }
+
+    /// Seeds one fully dispatchable site: the instance row, a `Bound`
+    /// binding, an administrator role assignment, and the endpoint and
+    /// resource projections of the `/redfish/v1/Systems/1` target.
+    async fn seed_dispatchable_site(
+        state: &StandaloneState,
+        now: OffsetDateTime,
+    ) -> Result<(SiteInstance, CenterBindingId, PrincipalId, EndpointId), Box<dyn Error>> {
+        let site = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Test Site"),
+            InstanceKind::Site,
+            now,
+        );
+        state.store.create_instance(&site).await?;
+        let code = generate_binding_code()?;
+        let binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            String::from("https://center.example"),
+            site.id(),
+            &code,
+            now + Duration::minutes(10),
+            now,
+        );
+        state.store.create_binding(&binding).await?;
+        state
+            .store
+            .bind_with_code(
+                binding.id(),
+                &code,
+                Some(CertificateFingerprint::from_bytes([0x42; 32])),
+                now,
+            )
+            .await?;
+        let principal =
+            Principal::new(PrincipalId::generate(), PrincipalName::parse("admin")?, now);
+        state.store.create_principal(&principal).await?;
+        state
+            .store
+            .assign_role(&RoleAssignment::new(
+                principal.id(),
+                Role::Administrator,
+                None,
+                now,
+                None,
+            ))
+            .await?;
+        let endpoint_id = EndpointId::generate();
+        let projection = EndpointProjectionWrite::new(
+            endpoint_id,
+            String::from("Rack A PDU"),
+            String::from("https://192.0.2.10"),
+            rutilus_application::CenterTrustMode::SystemCa,
+            1,
+            String::from("ok"),
+        );
+        CenterProjectionRepository::upsert_endpoint(&state.store, &projection, site.id(), now)
+            .await?;
+        let resource = ResourceProjectionWrite::new(
+            endpoint_id,
+            String::from("/redfish/v1/Systems/1"),
+            ResourceFeature::Systems,
+            None,
+            None,
+            1,
+            None,
+            now,
+        );
+        CenterProjectionRepository::upsert_resource(&state.store, &resource, site.id(), now)
+            .await?;
+        Ok((site, binding.id(), principal.id(), endpoint_id))
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_identical_dispatches_create_one_operation() -> Result<(), Box<dyn Error>>
+    {
+        // R6-C-1: the §17.5 idempotency scan and the operation creation of
+        // one site are one critical section — two concurrent identical
+        // dispatches must produce one operation, one offer, one execution,
+        // not a double-minted identity the site would execute twice.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, _binding_id, actor, endpoint_id) = seed_dispatchable_site(&state, now).await?;
+        let target = ResourceODataId::parse("/redfish/v1/Systems/1")?;
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+
+        let (first, second) = tokio::join!(
+            state.dispatch_center_operation(site.id(), endpoint_id, &target, &command, actor, now,),
+            state.dispatch_center_operation(site.id(), endpoint_id, &target, &command, actor, now,),
+        );
+        let first = first.unwrap_or_else(|_| unreachable!("the concurrent dispatch must succeed"));
+        let second =
+            second.unwrap_or_else(|_| unreachable!("the concurrent dispatch must succeed"));
+        assert_eq!(
+            first.operation_id(),
+            second.operation_id(),
+            "both concurrent dispatches must resolve to the same operation"
+        );
+        let operations =
+            rutilus_operation_engine::OperationStore::list_operations(&state.store, None).await?;
+        assert_eq!(
+            operations.len(),
+            1,
+            "exactly one tracking record is created"
+        );
+        assert!(
+            !operations[0].state().is_terminal(),
+            "the one operation is the in-flight dispatch, never a terminal row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_a_revoked_site_is_refused_and_the_revocation_ends_the_session()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-02: a revoked site's binding is not in force, so the
+        // dispatch gate refuses it (the web layer audits the refusal
+        // outcome); R6-C-6: the revocation also ends the site's established
+        // session — the registry entry is removed and the connection task's
+        // disconnect signal fires.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, binding_id, actor, endpoint_id) = seed_dispatchable_site(&state, now).await?;
+        let target = ResourceODataId::parse("/redfish/v1/Systems/1")?;
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+
+        // The site holds an established session when the revocation lands.
+        state.registry.mark_connected(
+            ResolvedSite::new(
+                site.id(),
+                binding_id,
+                CertificateFingerprint::from_bytes([0x42; 32]),
+            ),
+            now,
+        )?;
+        let watch = state
+            .registry
+            .disconnect_watch(site.id())
+            .ok_or("the online site must expose its disconnect signal")?;
+        let connection = tokio::spawn(async move {
+            watch.notified().await;
+        });
+        state.revoke_center_binding(site.id(), now).await?;
+        assert!(
+            !state.registry.is_online(site.id()),
+            "the revocation must remove the site from the online registry"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+            .await
+            .map_err(|_| "the revocation never closed the session")??;
+
+        // The dispatch gate refuses the revoked site; the interim verdict
+        // is the authorization refusal (TODO(R6-A6) — see
+        // docs/r6-findings/A1.md).
+        let Err(refusal) = state
+            .dispatch_center_operation(site.id(), endpoint_id, &target, &command, actor, now)
+            .await
+        else {
+            unreachable!("a revoked site must refuse dispatch")
+        };
+        assert!(matches!(refusal, CenterOperationRefusal::NotAuthorized));
+        assert!(
+            rutilus_operation_engine::OperationStore::list_operations(&state.store, None)
+                .await?
+                .is_empty(),
+            "no operation may be created for a revoked site"
         );
         Ok(())
     }

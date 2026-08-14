@@ -21,9 +21,25 @@
 //! keeps the wait finite.
 //!
 //! Restore is offline (design §20.2): the caller holds the runtime lock, and
-//! [`restore_database_files`] replaces the database and its sidecars
-//! atomically (sibling temporary file plus rename), removing any stale WAL
-//! and shared-memory index so the restored state cannot replay old frames.
+//! [`restore_database_files`] replaces the database and its sidecars through
+//! sibling temporary files plus rename, removing any stale WAL and
+//! shared-memory index so the restored state cannot replay old frames.
+//!
+//! Each file is replaced atomically, but the database and its WAL are not a
+//! pair-replaceable unit (R6-D-5): a crash between the renames leaves a
+//! mixed pair — the new main file beside the old WAL or vice versa — and
+//! `SQLite` resolves that silently by discarding the WAL whose salts no
+//! longer match the database header, so the restore's WAL-only commits would
+//! be lost without a trace. The restore therefore writes a durable
+//! "restore in progress" marker (the `<database>-restore-pending` sidecar,
+//! holding SHA-256 fingerprints of the snapshot pair and of the live pair)
+//! before the first overwrite and removes it only after every file is fully
+//! in place. The next [`SqliteStore::open`] finds a surviving marker and
+//! verifies the live pair against the recorded fingerprints: a pair that
+//! matches the snapshot (the restore completed) or the recorded pre-restore
+//! state (the restore never touched the files) is accepted and the marker
+//! cleared; anything else is refused as an interrupted restore instead of
+//! being opened in a silently mixed state.
 
 use std::{
     fs::{self, File},
@@ -34,16 +50,24 @@ use std::{
 use rutilus_migration::Migrator;
 use sea_orm::{DbErr, EntityTrait};
 use sea_orm_migration::MigratorTrait;
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::AcquireError;
 
-use crate::SqliteStore;
+use crate::{OpenStoreError, SqliteStore};
 
 /// The fixed WAL sidecar suffix `SQLite` uses in WAL journal mode.
 const WAL_SIDECAR_SUFFIX: &str = "-wal";
 /// The transient shared-memory index sidecar, rebuilt on every open.
 const SHM_SIDECAR_SUFFIX: &str = "-shm";
+/// The sidecar suffix of the persistent "restore in progress" marker: it
+/// exists from the first restore overwrite to the completed pair, and the
+/// next open verifies the live files against the fingerprints it records.
+const RESTORE_PENDING_SUFFIX: &str = "-restore-pending";
+/// The marker's textual state tokens.
+const MARKER_ABSENT: &str = "absent";
+const MARKER_NONE: &str = "none";
 /// Bounded retry budget for a checkpoint racing the snapshot copy.
 const SNAPSHOT_RETRY_BUDGET: usize = 4;
 /// The migration table name recorded by the default `MigratorTrait`.
@@ -167,21 +191,175 @@ pub enum AppliedMigrationsError {
 /// WAL, and the transient shared-memory index is always removed so the
 /// restored pair cannot replay frames from a previous database generation.
 ///
+/// The two files are not replaceable as one atomic unit (R6-D-5): before the
+/// first overwrite, a durable restore-pending marker records SHA-256
+/// fingerprints of the snapshot pair and of the live pair; it is removed
+/// only after every replacement succeeded. A crash between the renames
+/// leaves the marker behind, and the next store open verifies the live pair
+/// against the recorded fingerprints, refusing a mixed pair instead of
+/// letting `SQLite` silently discard the mismatched WAL.
+///
 /// # Errors
 ///
 /// Returns [`RestoreError`] for any failed temporary write, synchronization,
-/// rename, or stale-sidecar removal stage.
+/// rename, marker, or stale-sidecar removal stage. A failure after the
+/// marker was written leaves the marker in place, so the interrupted state
+/// is detected at the next open.
 pub fn restore_database_files(
     database_path: &Path,
     snapshot: &DatabaseSnapshot,
 ) -> Result<(), RestoreError> {
-    replace_file(database_path, &snapshot.database)?;
-    let wal_path = sidecar_path(database_path, WAL_SIDECAR_SUFFIX);
-    match &snapshot.wal {
-        Some(wal) => replace_file(&wal_path, wal)?,
-        None => remove_stale_sidecar(&wal_path)?,
+    let marker_path = sidecar_path(database_path, RESTORE_PENDING_SUFFIX);
+    write_restore_marker(database_path, &marker_path, snapshot)?;
+    let result = (|| {
+        replace_file(database_path, &snapshot.database)?;
+        let wal_path = sidecar_path(database_path, WAL_SIDECAR_SUFFIX);
+        match &snapshot.wal {
+            Some(wal) => replace_file(&wal_path, wal)?,
+            None => remove_stale_sidecar(&wal_path)?,
+        }
+        remove_stale_sidecar(&sidecar_path(database_path, SHM_SIDECAR_SUFFIX))
+    })();
+    if result.is_ok() {
+        // The pair is fully in place; the marker's job is done. A failure to
+        // clear it reports an unresolved restore state — the next open would
+        // verify the complete pair and clear the marker, but the error is
+        // the honest signal for this call.
+        remove_restore_marker(&marker_path)?;
     }
-    remove_stale_sidecar(&sidecar_path(database_path, SHM_SIDECAR_SUFFIX))
+    result
+}
+
+/// Removes the restore-pending marker, mapping the sidecar-removal failure
+/// onto the marker's own error variant.
+fn remove_restore_marker(marker_path: &Path) -> Result<(), RestoreError> {
+    match remove_stale_sidecar(marker_path) {
+        Ok(()) => Ok(()),
+        Err(RestoreError::RemoveSidecar { path, source }) => {
+            Err(RestoreError::RemoveMarker { path, source })
+        }
+        Err(other) => Err(RestoreError::RemoveMarker {
+            path: marker_path.to_path_buf(),
+            source: io::Error::other(other.to_string()),
+        }),
+    }
+}
+
+/// The lowercase hex SHA-256 fingerprint of one byte slice.
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX_DIGITS[usize::from(byte & 0x0F)]));
+    }
+    hex
+}
+
+/// The fingerprint of one file's bytes, or the fallback token when the file
+/// is missing or unreadable — a sidecar that cannot be read at marker time
+/// is recorded as absent, because a rollback restores the database state,
+/// not an unreadable leftover.
+fn fingerprint_of_file_or(path: &Path, fallback: &str) -> String {
+    match fs::read(path) {
+        Ok(bytes) => fingerprint_bytes(&bytes),
+        Err(_) => fallback.to_owned(),
+    }
+}
+
+/// Writes the restore-pending marker for a data directory: four
+/// space-separated tokens — the snapshot database fingerprint, the snapshot
+/// WAL fingerprint (or `none`), the live database fingerprint (or `absent`),
+/// and the live WAL fingerprint (or `none`).
+fn write_restore_marker(
+    database_path: &Path,
+    marker_path: &Path,
+    snapshot: &DatabaseSnapshot,
+) -> Result<(), RestoreError> {
+    let parent = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent).map_err(|source| RestoreError::CreateParent {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let snapshot_wal = snapshot
+        .wal()
+        .map_or_else(|| MARKER_NONE.to_owned(), fingerprint_bytes);
+    let pre_database = fingerprint_of_file_or(database_path, MARKER_ABSENT);
+    let pre_wal = fingerprint_of_file_or(
+        &sidecar_path(database_path, WAL_SIDECAR_SUFFIX),
+        MARKER_NONE,
+    );
+    let content = format!(
+        "{} {snapshot_wal} {pre_database} {pre_wal}\n",
+        fingerprint_bytes(&snapshot.database),
+    );
+    write_and_sync_file(marker_path, content.as_bytes()).map_err(|source| {
+        RestoreError::WriteMarker {
+            path: marker_path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// Verifies the restore-pending marker of a data directory, if one survives.
+///
+/// Called by the store open before anything else touches the files. A live
+/// pair matching the recorded snapshot fingerprints means the restore
+/// completed (the marker's removal did not land); a pair matching the
+/// recorded pre-restore fingerprints means the restore never overwrote
+/// anything. Both are accepted and the marker is cleared. Any other pair is
+/// a mixed state left by an interrupted restore and is refused, so `SQLite`
+/// never opens a pair whose WAL it would silently discard.
+///
+/// # Errors
+///
+/// Returns [`OpenStoreError::RestoreInterrupted`] when the live pair
+/// matches neither recorded state, the marker is unreadable or malformed,
+/// or the marker cannot be cleared after a successful verification.
+pub(crate) fn verify_restore_marker(database_path: &Path) -> Result<(), OpenStoreError> {
+    let marker_path = sidecar_path(database_path, RESTORE_PENDING_SUFFIX);
+    let content = match fs::read_to_string(&marker_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(OpenStoreError::RestoreInterrupted {
+                marker: marker_path,
+                reason: format!("the restore marker could not be read: {source}"),
+            });
+        }
+    };
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    let [snapshot_database, snapshot_wal, pre_database, pre_wal] = tokens.as_slice() else {
+        return Err(OpenStoreError::RestoreInterrupted {
+            marker: marker_path,
+            reason: String::from("the restore marker is malformed"),
+        });
+    };
+    let live_database = fingerprint_of_file_or(database_path, MARKER_ABSENT);
+    let live_wal = fingerprint_of_file_or(
+        &sidecar_path(database_path, WAL_SIDECAR_SUFFIX),
+        MARKER_NONE,
+    );
+    let complete = live_database == *snapshot_database && live_wal == *snapshot_wal;
+    let untouched = live_database == *pre_database && live_wal == *pre_wal;
+    if !(complete || untouched) {
+        return Err(OpenStoreError::RestoreInterrupted {
+            marker: marker_path,
+            reason: String::from(
+                "the live database pair matches neither the recorded snapshot nor the \
+                 recorded pre-restore state — a restore was interrupted mid-overwrite",
+            ),
+        });
+    }
+    remove_restore_marker(&marker_path).map_err(|source| OpenStoreError::RestoreInterrupted {
+        marker: marker_path,
+        reason: format!("the verified restore marker could not be cleared: {source}"),
+    })
 }
 
 /// Whether a backup database can be restored by this product binary.
@@ -430,6 +608,18 @@ pub enum RestoreError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to write the restore-pending marker at {path}: {source}")]
+    WriteMarker {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to remove the restore-pending marker at {path}: {source}")]
+    RemoveMarker {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// A controlled failure while checking a backup database against the
@@ -529,6 +719,109 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["before-backup"]);
         restored.close().await?;
+        Ok(())
+    }
+
+    /// The R6-D-5 refusal path: a restore interrupted mid-overwrite (the
+    /// main database replaced, the WAL replacement failed) leaves a mixed
+    /// pair that the next open must refuse instead of letting `SQLite`
+    /// silently discard the mismatched WAL.
+    #[tokio::test]
+    async fn an_interrupted_restore_is_refused_at_the_next_open() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let store = SqliteStore::open(&database_path).await?;
+        insert_credential(&store.database, "before-backup").await?;
+        let snapshot = store.consistent_snapshot().await?;
+        insert_credential(&store.database, "after-backup").await?;
+        store.close().await?;
+
+        // Sabotage the restore mid-overwrite: a directory squatting on the
+        // WAL sidecar makes the second replacement fail after the main
+        // database was already replaced — exactly the mixed-pair state the
+        // restore-pending marker must catch at the next open.
+        let wal_path = sidecar_path(&database_path, WAL_SIDECAR_SUFFIX);
+        std::fs::remove_file(&wal_path).ok();
+        std::fs::create_dir(&wal_path)?;
+        let Err(error) = restore_database_files(&database_path, &snapshot) else {
+            unreachable!("the sabotaged restore must fail")
+        };
+        assert!(
+            matches!(error, RestoreError::Persist { .. }),
+            "the restore must fail replacing the WAL, got: {error}"
+        );
+        std::fs::remove_dir(&wal_path)?;
+        assert!(
+            sidecar_path(&database_path, RESTORE_PENDING_SUFFIX).exists(),
+            "the interrupted restore must leave the restore-pending marker"
+        );
+
+        let reopened = SqliteStore::open(&database_path).await;
+        assert!(
+            matches!(reopened, Err(OpenStoreError::RestoreInterrupted { .. })),
+            "a mixed pair after an interrupted restore must be refused, got: {reopened:?}"
+        );
+        Ok(())
+    }
+
+    /// The R6-D-5 acceptance path after completion: a restore that finished
+    /// but whose marker removal did not land (a crash after the last
+    /// replacement) leaves a complete pair under the marker; the next open
+    /// verifies it against the recorded snapshot fingerprints and clears the
+    /// marker instead of refusing.
+    #[tokio::test]
+    async fn a_complete_pair_under_the_restore_marker_is_accepted_at_open()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let store = SqliteStore::open(&database_path).await?;
+        insert_credential(&store.database, "before-backup").await?;
+        let snapshot = store.consistent_snapshot().await?;
+        store.close().await?;
+
+        restore_database_files(&database_path, &snapshot)?;
+        let marker_path = sidecar_path(&database_path, RESTORE_PENDING_SUFFIX);
+        write_restore_marker(&database_path, &marker_path, &snapshot)?;
+
+        let reopened = SqliteStore::open(&database_path).await?;
+        assert!(
+            !marker_path.exists(),
+            "the open must clear a marker whose recorded pair matches the live files"
+        );
+        let mut names = credential_names(&reopened).await?;
+        names.sort();
+        assert_eq!(names, vec!["before-backup"]);
+        reopened.close().await?;
+        Ok(())
+    }
+
+    /// The R6-D-5 acceptance path before any overwrite: a restore that
+    /// crashed after writing the marker but before the first replacement
+    /// leaves the live pair untouched; the next open recognizes the recorded
+    /// pre-restore fingerprints, clears the marker, and opens normally.
+    #[tokio::test]
+    async fn an_untouched_pair_under_the_restore_marker_is_accepted_at_open()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let store = SqliteStore::open(&database_path).await?;
+        insert_credential(&store.database, "before-backup").await?;
+        let snapshot = store.consistent_snapshot().await?;
+        store.close().await?;
+
+        let marker_path = sidecar_path(&database_path, RESTORE_PENDING_SUFFIX);
+        write_restore_marker(&database_path, &marker_path, &snapshot)?;
+
+        let reopened = SqliteStore::open(&database_path).await?;
+        assert!(
+            !marker_path.exists(),
+            "the open must clear a marker whose recorded pre-restore pair \
+             matches the untouched live files"
+        );
+        let mut names = credential_names(&reopened).await?;
+        names.sort();
+        assert_eq!(names, vec!["before-backup"]);
+        reopened.close().await?;
         Ok(())
     }
 
@@ -640,13 +933,17 @@ mod tests {
         let newer_bytes = std::fs::read(&newer_path)?;
 
         let compatibility = restore_compatibility(&newer_bytes, None).await?;
-        assert!(matches!(
+        assert_eq!(
             compatibility,
             RestoreCompatibility::NewerSchema {
-                backup_applied: 28,
-                supported: 27
+                // The future row sits on a database that applied every
+                // registered migration, so the counts are derived from the
+                // live stack — never hardcoded, so a migration added later
+                // cannot stale the test (R6-D-2).
+                backup_applied: Migrator::migrations().len() + 1,
+                supported: Migrator::migrations().len(),
             }
-        ));
+        );
         Ok(())
     }
 

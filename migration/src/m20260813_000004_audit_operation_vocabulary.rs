@@ -46,9 +46,13 @@ use sea_orm_migration::prelude::*;
 /// accepted, and its target principal — if any — sits on a `change-password`
 /// row the product writes under a `user` actor, so the copy is a pure
 /// data-preserving operation, verified by the migration test that inserts
-/// rows before the rebuild and reads them back after. The migration
-/// overrides [`MigrationTrait::use_transaction`] so the whole up (and the
-/// symmetric down) commits atomically on `SQLite`.
+/// rows before the rebuild and reads them back after. The one legacy shape
+/// the widened schema cannot represent — a target principal under a
+/// `system` or `local-operator` actor, data no product version writes — is
+/// refused by an explicit pre-check before the copy, the mirror of the
+/// down's refusal, with a message naming the migration and the widened
+/// rule. The migration overrides [`MigrationTrait::use_transaction`] so the
+/// whole up (and the symmetric down) commits atomically on `SQLite`.
 ///
 /// # Downgrade symmetry
 ///
@@ -152,6 +156,37 @@ async fn rebuild_audit_events(
         }
     }
     if direction == RebuildDirection::Forward {
+        // The widened shape's target-principal rule pins the actor: a row
+        // carrying a target principal must name a `user` actor (S3-4), so a
+        // legacy row whose target principal sits under a `system` or
+        // `local-operator` actor cannot be represented in the widened
+        // schema — the widened CHECK would reject the copy mid-way. Like
+        // the down's pre-check, the refusal is explicit — the message names
+        // the migration and the widened rule, so a deployment that never
+        // should have carried such a row sees exactly why the up stops.
+        let unrepresentable = {
+            let statement = Query::select()
+                .expr(Expr::col(AuditEventShape::TargetPrincipalId).count())
+                .from(AuditEventShape::Table)
+                .and_where(Expr::col(AuditEventShape::Action).eq("change-password"))
+                .and_where(Expr::col(AuditEventShape::TargetPrincipalId).is_not_null())
+                .and_where(Expr::col(AuditEventShape::Actor).ne("user"))
+                .to_owned();
+            let row = connection.query_one(&statement).await?.ok_or_else(|| {
+                DbErr::Custom(String::from(
+                    "the 000004 up could not inspect the audit table",
+                ))
+            })?;
+            row.try_get_by_index::<i64>(0)
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+        };
+        if unrepresentable > 0 {
+            return Err(DbErr::Custom(String::from(
+                "the 000004 up refuses audit_events rows carrying a target principal \
+                 under a non-user actor: the widened ck_audit_events_target_principal \
+                 CHECK cannot represent the row; remove the rows before applying",
+            )));
+        }
         connection
             .execute_unprepared(AUDIT_EVENTS_OPERATION_VOCABULARY_DDL)
             .await?;

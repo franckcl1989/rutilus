@@ -20,6 +20,10 @@ sha2.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["serde-well-known"] }
 tokio.workspace = true
+# The deterministic receipt key of a reply whose wire operation id is not a
+# UUID (R6-E-08): the raw id cannot key a `center_inbox` receipt directly,
+# so the key is a UUID v5 of the raw string.
+uuid = { workspace = true, features = ["v5"] }
 # §6.2 diagnostic logging: the center-sync engine records operational
 # failures and absorbed protocol anomalies through tracing::error!/warn!.
 tracing.workspace = true

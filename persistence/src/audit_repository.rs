@@ -56,6 +56,15 @@ impl SqliteStore {
             .map_err(|source| corrupt(operation_id, source))?;
         validate_stored_trail(&existing).map_err(|source| corrupt(operation_id, source))?;
 
+        // At-least-once idempotency (R6-C-4): when the trail's terminal event
+        // is already this very event, the durable fact is present and the
+        // append reports success without inserting a duplicate row. This is
+        // the compensation drain's re-issue case — a retry of an append whose
+        // write actually succeeded — and the transaction is rolled back with
+        // the event already durably recorded.
+        if existing.last().is_some_and(|last| last.id() == event.id()) {
+            return Ok(());
+        }
         validate_append(operation_id, existing.last(), event)?;
         project_event(event)
             .insert(&transaction)
@@ -96,8 +105,10 @@ impl SqliteStore {
     }
 
     /// Lists the newest persisted events across every operation, newest
-    /// first, bounded by `limit` (audit follow-up V5A-2: the production read
-    /// surface of persisted audit history).
+    /// first, bounded by `limit`, skipping the `offset` newest events (audit
+    /// follow-up V5A-2: the production read surface of persisted audit
+    /// history; E-11: the `offset` is the pagination primitive of that
+    /// surface).
     ///
     /// The console's audit query reads a bounded in-memory tail that is
     /// warmed from this listing at startup, so a restart never hides the
@@ -119,10 +130,12 @@ impl SqliteStore {
     pub async fn list_recent_audit_events(
         &self,
         limit: u64,
+        offset: u64,
     ) -> Result<Vec<AuditEvent>, AuditRepositoryError> {
         let models = audit_event::Entity::find()
             .order_by_desc(audit_event::Column::OccurredAt)
             .order_by_desc(audit_event::Column::EventSequence)
+            .offset(offset)
             .limit(limit)
             .all(&self.database)
             .await
@@ -731,7 +744,7 @@ mod tests {
         store.append_audit_event(&first_succeeded).await?;
 
         assert_eq!(
-            store.list_recent_audit_events(10).await?,
+            store.list_recent_audit_events(10, 0).await?,
             [first_succeeded, second_started, first_started],
             "the listing must span operations, newest first"
         );
@@ -752,14 +765,82 @@ mod tests {
             store.append_audit_event(&started).await?;
         }
 
-        let bounded = store.list_recent_audit_events(2).await?;
+        let bounded = store.list_recent_audit_events(2, 0).await?;
         assert_eq!(bounded.len(), 2);
         assert_eq!(
             bounded[0].occurred_at(),
             now + Duration::seconds(2),
             "the newest event is first"
         );
-        assert_eq!(store.list_recent_audit_events(0).await?.len(), 0);
+        assert_eq!(store.list_recent_audit_events(0, 0).await?.len(), 0);
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_event_listing_skips_the_offset_newest_events() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        let mut events = Vec::new();
+        for index in 0..3_u8 {
+            let context =
+                enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+            let started = AuditEvent::started(context, now + Duration::seconds(i64::from(index)));
+            store.append_audit_event(&started).await?;
+            events.push(started);
+        }
+
+        // Offset one: the newest event is skipped, the rest stay newest
+        // first.
+        assert_eq!(
+            store.list_recent_audit_events(10, 1).await?,
+            [events[1].clone(), events[0].clone()]
+        );
+        // Limit and offset compose: a bounded page after the newest event.
+        assert_eq!(
+            store.list_recent_audit_events(1, 1).await?,
+            [events[1].clone()]
+        );
+        // An offset past the end lists nothing, like a tail page beyond the
+        // history.
+        assert!(store.list_recent_audit_events(10, 10).await?.is_empty());
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reappending_the_trail_terminal_event_is_idempotent() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        let context = enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+        let started = AuditEvent::started(context.clone(), now);
+        let succeeded = AuditEvent::succeeded(
+            context,
+            AuditSequence::FIRST.next()?,
+            now + Duration::SECOND,
+        )?;
+        store.append_audit_event(&started).await?;
+        store.append_audit_event(&succeeded).await?;
+
+        // R6-C-4: the compensation drain may re-issue an append whose write
+        // actually landed; the re-append of the trail's terminal event is
+        // acknowledged without duplicating the row.
+        assert!(store.append_audit_event(&succeeded).await.is_ok());
+        assert_eq!(
+            store
+                .find_audit_operation(started.context().operation_id())
+                .await?,
+            [started.clone(), succeeded.clone()],
+            "the idempotent re-append must not duplicate the terminal row"
+        );
+        assert_eq!(
+            store.list_recent_audit_events(10, 0).await?,
+            [succeeded, started]
+        );
         store.close().await?;
         drop(directory);
         Ok(())
@@ -782,7 +863,7 @@ mod tests {
             Set(Some(String::from("https://operator:password@192.0.2.90")));
         stored.update(&store.database).await?;
 
-        let result = store.list_recent_audit_events(10).await;
+        let result = store.list_recent_audit_events(10, 0).await;
         assert!(matches!(
             &result,
             Err(AuditRepositoryError::Corrupt {

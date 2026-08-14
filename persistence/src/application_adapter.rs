@@ -529,6 +529,16 @@ impl rutilus_application::CenterOutbox for SqliteStore {
         )
     }
 
+    fn find_offer_by_operation(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::find_outbox_entry_by_operation(self, instance_id, operation_id).await
+        })
+    }
+
     fn acknowledge(
         &self,
         entry_id: OutboxEntryId,

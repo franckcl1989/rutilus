@@ -135,21 +135,40 @@ fn domain_accepts_execution(operation: AuditRedfishOperation) -> bool {
 }
 
 /// The codes of one `IN (...)` list inside a `CREATE TABLE` DDL, anchored on
-/// the constrained column — the schema side of the domain↔CHECK binding,
-/// read from the real DDL instead of a transcribed list, so the test
-/// compares the actual CHECK against the actual domain vocabulary.
+/// the `ck_audit_events_action` constraint — the schema side of the
+/// domain↔CHECK binding, read from the real DDL instead of a transcribed
+/// list, so the test compares the actual CHECK against the actual domain
+/// vocabulary.
+///
+/// The list is located inside the constraint's own window (from
+/// `CONSTRAINT ck_audit_events_action` to the next `CONSTRAINT`), never by
+/// the anchor column alone: a second `redfish_operation IN (...)` list in a
+/// later constraint would otherwise steal the read silently (R6-D-8), while
+/// the window makes a misanchored read fail loudly instead.
 fn in_list_codes(ddl: &str, anchor: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    const CONSTRAINT: &str = "CONSTRAINT ck_audit_events_action";
+    let constraint_start = ddl
+        .find(CONSTRAINT)
+        .ok_or_else(|| format!("no `{CONSTRAINT}` constraint in the DDL"))?;
+    let after_marker = constraint_start + CONSTRAINT.len();
+    // The window ends at the next `CONSTRAINT` keyword — the action
+    // constraint's body holds no nested `CONSTRAINT` text, so the boundary
+    // is exact.
+    let constraint_end = ddl[after_marker..]
+        .find("CONSTRAINT")
+        .map_or(ddl.len(), |position| after_marker + position);
+    let scope = &ddl[constraint_start..constraint_end];
     let marker = format!("{anchor} IN (");
-    let start = ddl
+    let start = scope
         .find(&marker)
-        .ok_or_else(|| format!("no `{marker}` list in the DDL"))?
+        .ok_or_else(|| format!("no `{marker}` list inside the {CONSTRAINT} constraint"))?
         + marker.len();
     // The list's literals nest no parentheses, so the first `)` closes it.
-    let end = ddl[start..]
+    let end = scope[start..]
         .find(')')
         .ok_or_else(|| format!("the `{anchor} IN (` list is not closed"))?
         + start;
-    Ok(ddl[start..end]
+    Ok(scope[start..end]
         .split(',')
         .map(|code| code.trim().trim_matches('\'').to_owned())
         .collect())
@@ -358,6 +377,55 @@ async fn operation_rebuild_preserves_existing_audit_rows() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// The up's pre-check (R6-D-3): a legacy row whose target principal sits
+/// under a non-user actor — a shape the 000003 constraint set still admits,
+/// though no product version writes it — cannot be represented in the
+/// widened schema, where the target-principal rule pins the actor to
+/// `user`. The up must refuse it with a named message before the copy
+/// starts, not fail on a raw mid-copy constraint error, mirroring the
+/// down's pre-check observability convention.
+#[tokio::test]
+async fn up_refuses_target_principal_under_non_user_actor_with_migration_context()
+-> Result<(), Box<dyn Error>> {
+    let (_directory, database) = connect().await?;
+    let steps = migrations_before(AUDIT_OPERATION_VOCABULARY_MIGRATION)?;
+    Migrator::up(&database, Some(steps)).await?;
+    let occurred_at = OffsetDateTime::now_utc();
+
+    insert_change_password_row(&database, "system", Some(Uuid::now_v7()), occurred_at).await?;
+
+    let refused = Migrator::up(&database, None).await;
+    let message = match refused {
+        Err(sea_orm::DbErr::Custom(message)) => message,
+        Err(other) => return Err(format!("the up must refuse, got: {other}").into()),
+        Ok(()) => return Err("the up must refuse a non-user-actor target row".into()),
+    };
+    assert!(
+        message.contains("000004 up"),
+        "the refusal must name the migration, got: {message}"
+    );
+    assert!(
+        message.contains("target_principal"),
+        "the refusal must name the widened target-principal rule, got: {message}"
+    );
+
+    // Remove the unrepresentable row — the refusal rolled the whole up back
+    // (the migration runs on one transaction) — and the up applies cleanly,
+    // preserving the representable legacy row.
+    rutilus_entity::audit_event::Entity::delete_many()
+        .exec(&database)
+        .await?;
+    let execution_id = insert_execute_row(&database, "reset-system", occurred_at).await?;
+    Migrator::up(&database, None).await?;
+    let stored = rutilus_entity::audit_event::Entity::find_by_id(execution_id.id)
+        .one(&database)
+        .await?
+        .ok_or("the legacy execution row must survive the rebuild")?;
+    assert_eq!(stored.action, "execute-operation");
+    assert_eq!(stored.redfish_operation, "reset-system");
+    Ok(())
+}
+
 // The down test walks the full vocabulary through the refusal and the
 // data-preserving copy, so it exceeds the pedantic line budget (same
 // exception as the rebuild migrations' copy steps).
@@ -389,7 +457,12 @@ async fn down_refuses_new_codes_with_migration_context_and_preserves_representab
     // shape cannot represent the seventeen later codes. The refusal names
     // the migration and the restored shape — the pre-check's observability
     // convention — so a rolled-back deployment sees why the rollback stops.
-    let refused = Migrator::down(&database, Some(1)).await;
+    // The framework's `down(Some(n))` rolls back the n newest applied
+    // migrations (a count, not a target version), so the count follows the
+    // registration position — every migration added after the 000004
+    // extends the list and the count follows.
+    let steps = rollback_steps_to(AUDIT_OPERATION_VOCABULARY_MIGRATION)?;
+    let refused = Migrator::down(&database, Some(steps)).await;
     let message = match refused {
         Err(sea_orm::DbErr::Custom(message)) => message,
         Err(other) => return Err(format!("the down must refuse, got: {other}").into()),
@@ -420,6 +493,10 @@ async fn down_refuses_new_codes_with_migration_context_and_preserves_representab
                 .await?;
         }
     }
+    // The refused call above already rolled back every migration newer
+    // than the 000004 (each successful rollback commits on its own), so a
+    // single step is the 000004 itself — and only it: the restored shape
+    // below must still be the 000003 shape, not the 000001 shape.
     Migrator::down(&database, Some(1)).await?;
 
     // Every restored-shape row reads back with the full execution shape.
@@ -487,6 +564,20 @@ fn migrations_before(name: &str) -> Result<u32, Box<dyn Error>> {
         .position(|migration| migration.name() == name)
         .ok_or("audit operation vocabulary migration is not registered")?;
     Ok(u32::try_from(position)?)
+}
+
+/// The count of applied migrations a rollback must undo to reach the given
+/// migration: the framework's `down(Some(n))` rolls back the n newest
+/// applied migrations, so the count is the list length minus the
+/// migration's registration position — the down-side twin of
+/// [`migrations_before`].
+fn rollback_steps_to(name: &str) -> Result<u32, Box<dyn Error>> {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("audit operation vocabulary migration is not registered")?;
+    Ok(u32::try_from(migrations.len() - position)?)
 }
 
 /// Writes one terminal audit row in the §16.3 execution shape: the endpoint

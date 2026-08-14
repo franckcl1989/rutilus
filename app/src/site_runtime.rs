@@ -1470,7 +1470,12 @@ async fn binding_revoked(store: &SqliteStore, site: InstanceId, poll: Duration) 
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, error::Error, net::Ipv4Addr, sync::Mutex};
+    use std::{
+        collections::{HashMap, VecDeque},
+        error::Error,
+        net::Ipv4Addr,
+        sync::Mutex,
+    };
 
     use rutilus_application::CenterSessionRegistry;
     use rutilus_domain::{
@@ -1861,6 +1866,7 @@ mod tests {
             audit_tail: Arc::new(Mutex::new(VecDeque::new())),
             registry: Arc::new(CenterSessionRegistry::new()),
             center_issuer: Mutex::new(None),
+            dispatch_gates: Mutex::new(HashMap::new()),
         }))
     }
 

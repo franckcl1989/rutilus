@@ -146,9 +146,19 @@ jobs:
       # §19.4: cargo test. --workspace is required because
       # default-members = ["app"] would skip every other crate; --locked pins
       # the committed Cargo.lock.
+      #
+      # R6-W-8 ran-assertion (2026-08-14): the step now runs through
+      # scripts/assert-tests-ran.sh with pin 1913 — the master-measured
+      # count at HEAD e85560a (`cargo test --locked --workspace -- --list`:
+      # lib/integration 1912 + doc 1 = 1913, matching the 2026-08-14 门禁复跑
+      # in release-readiness.md §五; re-measured locally on the same commit).
+      # Floor semantics as elsewhere: the step fails only when the total dips
+      # below the pin, and the --expect-tests list (R6-W-7) anchors six
+      # gate-critical names across six crates — a deleted or cfg-emptied
+      # suite fails even when the remaining count still clears the floor.
       - name: Test (full workspace)
         if: matrix.is_default
-        run: cargo test --locked --workspace
+        run: bash scripts/assert-tests-ran.sh 1913 --expect-tests version_reports_product_and_upstream_baseline,json_log_format_is_accepted_and_keeps_user_visible_output,refresh_capture_flows_into_the_diagnostics_response,links_the_complete_development_capability_surface,migration_down_drops_children_before_parents,workspace_sources_have_no_hardcoded_secrets_or_plaintext_disclosure --locked --workspace
 
       # Non-default platforms: full compile of every target (the 跨平台 Build
       # gate) plus the cross-platform E2E suites below.
@@ -218,11 +228,25 @@ jobs:
       # swatinem/rust-cache step above caches only cargo registry/build
       # artifacts under a ref-scoped key — no advisory-database reuse and no
       # cache pollution surface between runs either way.
+      # R6-8 (2026-08-14): `command-arguments: --deny warnings` turns every
+      # cargo-deny lint warning into a failure. The trigger exists because the
+      # eight formerly-skipped crates (ahash@0.7.8/0.8.12, getrandom@0.3.4,
+      # hashbrown@0.12.3, rand@0.10.2, r-efi@5.3.0/6.0.0, sha2@0.11.0) were
+      # verified unreachable and their skip entries deleted from deny.toml —
+      # with only `command: check` a silently-stale skip entry (or any other
+      # new warning) would go green. The flag is passed via command-arguments
+      # (after the `check` subcommand) because `--deny warnings` is a check
+      # option, while the action's `arguments` input lands BEFORE the command;
+      # the action's Dockerfile pins cargo-deny 0.20.2, the exact version
+      # verified locally (`cargo deny --all-features check --deny warnings`
+      # -> all ok, exit 0). Note the flag spelling: `--deny warnings`, not
+      # `--deny-warnings` — 0.20.2 has no --deny-warnings flag.
       - name: Deny checks
         if: matrix.is_default
         uses: embarkstudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # tag v2
         with:
           command: check
+          command-arguments: --deny warnings
 
       # §19.4: cargo audit. Standalone gate enabled 2026-08-12. cargo-audit
       # reads only audit.toml — NOT deny.toml — so the [advisories] ignore
@@ -282,7 +306,7 @@ jobs:
       # the measured baseline; the test total grows with the product.
       - name: Secret leak gate
         if: matrix.is_default
-        run: bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate
+        run: bash scripts/assert-tests-ran.sh 10 --expect-tests workspace_sources_have_no_hardcoded_secrets_or_plaintext_disclosure,workspace_scan_is_deterministic,workspace_scan_covers_the_expected_source_population,crate_scan_includes_build_scripts --locked -p rutilus-security --test secret_leak_gate
 
       # §19.4: 跨平台 Build — wasm32 UI artifact. Commands mirror ui/README.md;
       # wasm-bindgen-cli must stay at 0.2.126, the exact workspace
@@ -295,12 +319,14 @@ jobs:
       # and no other evidence, so the step now (a) LF-normalizes and
       # BOM-strips BOTH sides of the js comparison before diffing — a CRLF or
       # BOM round-trip on either side must not fail the gate on the
-      # line-ending class of difference alone — (b) backslash-normalizes BOTH
-      # sides of the wasm comparison (rust-src installed in the build above,
-      # `tr '\\' '/'` copies below), and (c) on a real mismatch uploads the
-      # CI-generated js+wasm as a diagnostics artifact (actions/upload-artifact
-      # v4, the same pin the release job uses) BEFORE failing, so the next
-      # failure carries the evidence the first one lacked.
+      # line-ending class of difference alone — (b) target-normalizes BOTH
+      # sides of the wasm comparison (rust-src installed in the build above;
+      # the registered path-segment transform below replaces the former
+      # whole-file `tr '\\' '/'` — R6-W-1/W-2, 2026-08-14), and (c) on a real
+      # mismatch uploads the CI-generated js+wasm as a diagnostics artifact
+      # (actions/upload-artifact v4, the same pin the release job uses)
+      # BEFORE failing, so the next failure carries the evidence the first
+      # one lacked.
       #
       # Three-source byte-difference analysis (2026-08-13): the committed
       # web/assets were generated on a Windows host, and a fresh build on the
@@ -326,32 +352,57 @@ jobs:
       #      installs rust-src so CI emits the same class as the committed
       #      artifacts — but the toolchain directory embeds the HOST TRIPLE,
       #      so even with rust-src on both sides this class is not
-      #      byte-identical after tr (the residual is spelled out in the
-      #      summary paragraph below).
-      # The normalization is therefore a path-separator-only transform:
-      # `tr '\\' '/'` maps byte 0x5C (\) to 0x2F (/) in BOTH wasm comparison
-      # copies, making classes 1-2 byte-identical. Class 3 is NOT fully
-      # normalized: the sysroot src path embeds the host toolchain triple —
-      # `.cargo-home\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\...`
-      # in the committed artifacts vs
-      # `.cargo-home/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/...`
-      # in the ubuntu build — and tr cannot eliminate that difference. The
-      # residual is real: the next ubuntu CI run will fail this step red
-      # once by design, with the diagnostics upload carrying the
-      # CI-generated js+wasm as the forensic evidence; complete elimination
-      # requires a triple-normalization step — the SAME substitution applied
-      # to both comparison copies — in the comparison layer, planned for the
-      # next iteration.
-      # The transform still cannot mask a real functional difference: both
-      # copies receive the same transform, so any genuinely differing code
-      # or data byte stays different (tamper simulation, 2026-08-13: a
-      # single flipped byte fails the comparison). Note that 0x5C is NOT
-      # confined to embedded path strings — of the 1368 0x5C bytes in these
-      # artifacts, 816 sit in the code segment as LEB128 immediates — the
-      # safety argument rests on the identical-transform property, not on
-      # where 0x5C appears. The comparison runs on normalized COPIES under
-      # target/wasm-compare — the generated artifacts themselves are never
-      # modified.
+      #      byte-identical under a separator-only transform — the triple
+      #      normalization added in the summary paragraph below is what
+      #      closes it.
+      # The normalization is therefore a TARGETED transform on the
+      # comparison copies, implemented R6-W-1/W-2 (2026-08-14): a python3
+      # pass that processes the NUL-terminated data segments of the wasm and,
+      # ONLY inside the segments that carry a registered path marker
+      # (`.cargo-home`, or a `ui\src`/`ui/src` prefix), (1) rewrites byte
+      # 0x5C (\) to 0x2F (/) and (2) applies the triple normalization
+      # `1.97.1-<host-triple>` -> `1.97.1-toolchain`. The registered markers
+      # are exactly the three path classes of the analysis above. Class 3 now
+      # converges too: the committed `.cargo-home\.rustup\toolchains\
+      # 1.97.1-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\...` and
+      # the ubuntu build's `.cargo-home/.rustup/toolchains/
+      # 1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/...`
+      # both map to `.cargo-home/.rustup/toolchains/1.97.1-toolchain/lib/
+      # rustlib/src/rust/library/...`. (The runner-side sysroot prefix is
+      # registered too: GitHub ubuntu images export neither RUSTUP_HOME nor
+      # CARGO_HOME at runtime — install-rust.sh sets them only for the image
+      # build — so dtolnay/rust-toolchain's rustup lands under $HOME and the
+      # `--remap-path-prefix=$HOME=.cargo-home` rewrite applies, giving the
+      # `.cargo-home/.rustup/...` form on both hosts.)
+      # Scope of the mask, stated honestly (R6-W-2): the transform is
+      # identical on both copies, so any byte difference OUTSIDE the
+      # registered path segments stays visible — a flipped code byte, a
+      # changed message, a new string — and the tamper simulation
+      # (2026-08-13: a single flipped byte fails the comparison) still holds
+      # there. A difference INSIDE a registered path segment IS invisible to
+      # the gate: a newly added dependency whose panic-location strings live
+      # under `.cargo-home/.cargo/registry/src/...` would not be seen, and
+      # the 0x5C<->0x2F byte class cannot distinguish a genuine backslash
+      # path from a tampered one inside those segments. The former claim
+      # that the identical transform preserves "any real difference" was
+      # over-broad; the correct statement is that the mask is confined to
+      # the registered classes, which are exactly the host-dependent path
+      # strings of the three-source analysis. Quantified (measured on the
+      # committed artifact): of the 1368 0x5C bytes, 422 sit in the
+      # registered segments (62 `.cargo-home` segments carrying 418 + 2
+      # `ui\src` segments carrying 4, of 276994 NUL-separated segments
+      # total) and the remaining 946 — including the 816 LEB128 immediates
+      # of the code segment per the 2026-08-13 analysis — are never touched,
+      # where the former whole-file `tr '\\' '/'` touched all 1368. The
+      # comparison runs on normalized COPIES under target/wasm-compare — the
+      # generated artifacts themselves are never modified.
+      # Verification status (R6-W-1): the transform is validated locally by
+      # replaying it over the committed artifact (the embedded Windows
+      # triple and path shapes are confirmed present); whether the ubuntu
+      # build's actual byte output converges under it can only be confirmed
+      # by the next real CI run — 待下一次 CI 运行验证. The former "the next
+      # ubuntu CI run will fail red by design" statement is superseded: with
+      # the triple normalization in place the gate is expected GREEN.
       - name: Build wasm32 UI artifact
         id: build-wasm32-ui
         if: matrix.is_default
@@ -419,22 +470,39 @@ jobs:
             web/assets/rutilus_ui.js > target/wasm-compare/committed-rutilus_ui.js
           # The wasm is binary, but its data segments embed host-dependent
           # path strings (the three-source analysis above): both sides get
-          # the same backslash-to-forward-slash normalization into
-          # target/wasm-compare copies (GNU tr; this step runs only on the
-          # ubuntu default job) before the byte comparison, so the
-          # path-separator class of difference alone cannot fail the gate
-          # while any real code or data difference still does. The mismatch
-          # flag is written BEFORE the failing exit so the diagnostics
-          # upload step below can gate on it (a run step aborts at the first
-          # non-zero command under `bash -e`, so the comparison itself runs
-          # inside an if/else).
-          tr '\\' '/' < target/wasm-assets/rutilus_ui_bg.wasm > target/wasm-compare/generated-rutilus_ui_bg.wasm
-          tr '\\' '/' < web/assets/rutilus_ui_bg.wasm > target/wasm-compare/committed-rutilus_ui_bg.wasm
-          # Local-reproduction note (2026-08-13): Windows MSYS tr 8.32 does
-          # not process the `\\` escape — `tr '\\' '/'` warns "unescaped
-          # backslash at end of string" and leaves 0x5C untranslated — so a
-          # local MSYS replay of this normalization must use perl or python
-          # instead of tr.
+          # the same TARGETED normalization into target/wasm-compare copies
+          # (python3, preinstalled on the ubuntu default job) before the
+          # byte comparison, so the registered path-string classes of
+          # difference alone cannot fail the gate while any difference
+          # outside them still does. The mismatch flag is written BEFORE the
+          # failing exit so the diagnostics upload step below can gate on it
+          # (a run step aborts at the first non-zero command under `bash -e`,
+          # so the comparison itself runs inside an if/else).
+          python3 - <<'PYEOF'
+          import re
+          def normalize(src, dst):
+              data = open(src, 'rb').read()
+              out = []
+              for seg in data.split(b'\x00'):
+                  # Registered path classes only (R6-W-1/W-2): `.cargo-home`
+                  # carries the cargo registry and rustup sysroot paths
+                  # (classes 1 and 3); the `ui\src`/`ui/src` prefix is the
+                  # workspace-relative class 2.
+                  if b'.cargo-home' in seg or seg.startswith(b'ui\\src') or seg.startswith(b'ui/src'):
+                      seg = seg.replace(b'\\', b'/')
+                      # Host-toolchain triple (class 3):
+                      # 1.97.1-<triple> -> 1.97.1-toolchain.
+                      seg = re.sub(rb'1\.97\.1-[^/]*', b'1.97.1-toolchain', seg)
+                  out.append(seg)
+              open(dst, 'wb').write(b'\x00'.join(out))
+          normalize('target/wasm-assets/rutilus_ui_bg.wasm', 'target/wasm-compare/generated-rutilus_ui_bg.wasm')
+          normalize('web/assets/rutilus_ui_bg.wasm', 'target/wasm-compare/committed-rutilus_ui_bg.wasm')
+          PYEOF
+          # Local-reproduction note (2026-08-14): the python3 transform is
+          # host-portable — the former whole-file `tr '\\' '/'` pass did not
+          # run correctly under Windows MSYS tr 8.32 ("unescaped backslash
+          # at end of string" left 0x5C untranslated), while this transform
+          # is reproducible byte-for-byte on any host with python3.
           if diff -q target/wasm-compare/generated-rutilus_ui.js target/wasm-compare/committed-rutilus_ui.js \
               && diff -q target/wasm-compare/generated-rutilus_ui_bg.wasm target/wasm-compare/committed-rutilus_ui_bg.wasm; then
             echo "wasm UI artifacts match the checked-in files"
@@ -542,25 +610,38 @@ jobs:
       # tests passes, and only a dip below 50 (whole-suite deletion,
       # #[ignore], or cfg-emptying) fails. The pin is the lower bound of
       # the measured baseline; the test total grows with the product.
+      #
+      # R6-W-7 (2026-08-14): the --expect-tests list adds a NAME-level
+      # assertion on top of the count — six core down_order_gate test names
+      # must appear as passed in the run output, so hollowing the gate
+      # while keeping >= 50 other passing tests (the count floor's blind
+      # spot) fails the step.
       - name: Migration test
         if: matrix.is_default
-        run: bash scripts/assert-tests-ran.sh 50 --locked -p rutilus-migration
+        run: bash scripts/assert-tests-ran.sh 50 --expect-tests migration_down_drops_children_before_parents,gate_rejects_parent_before_child_down,gate_accepts_child_before_parent_down,gate_checks_raw_sql_drop_order_in_down_body,gate_checks_builder_drops_in_helpers_outside_the_down_body,gate_rejects_unresolvable_drop_targets --locked -p rutilus-migration
 
-      # Ran-assertion coverage (2026-08-13, W6-1 follow-up): the
-      # scripts/assert-tests-ran.sh gate currently covers exactly two
-      # steps — the Secret leak gate (pin 10) and the Migration test
-      # (pin 50) above. Release baseline check, Capability ledger check,
-      # and the workspace Test step are registered as future candidates
-      # but are NOT asserted yet: they still run plain `cargo test`, so a
-      # deleted or emptied suite there would pass the step uncaught
-      # until their assert-tests-ran.sh pins are added.
+      # Ran-assertion coverage (2026-08-14, R6-W-8): the
+      # scripts/assert-tests-ran.sh gate now covers all five test-shaped
+      # steps — the workspace Test step (pin 1913), the Secret leak gate
+      # (pin 10), the Migration test (pin 50), the Capability ledger check
+      # (pin 295), and the Release baseline check (pin 14) below — each
+      # with an --expect-tests name list (R6-W-7). No default-job
+      # test-shaped gate runs plain `cargo test` anymore (the windows/macos
+      # cross-platform E2E step above stays plain by design: its suites are
+      # covered by the ubuntu workspace run).
 
       # §19.4: Capability Ledger Check. Asserts the compiled nv-redfish
       # baseline (version 0.13.0, std-redfish, 14 OEM feature groups) in
       # infra-redfish/src/lib.rs::links_the_complete_development_capability_surface.
+      #
+      # R6-W-8 ran-assertion (2026-08-14): pin 295 is the locally measured
+      # `cargo test --locked -p rutilus-infra-redfish -- --list` count at
+      # HEAD e85560a (all lib unit tests; 0 doc-tests), matching the
+      # per-crate 295 of the release-readiness.md §五 门禁复跑. The
+      # --expect-tests names are the ledger's two own tests.
       - name: Capability ledger check
         if: matrix.is_default
-        run: cargo test --locked -p rutilus-infra-redfish
+        run: bash scripts/assert-tests-ran.sh 295 --expect-tests links_the_complete_development_capability_surface,compiled_oem_features_match_the_domain_oem_capabilities_exactly --locked -p rutilus-infra-redfish
 
       # §2.3: Release Baseline Check. Runs the frozen 0.8.0 release-baseline
       # gates in infra-redfish/src/release_baseline.rs (the `release_baseline`
@@ -570,9 +651,15 @@ jobs:
       # decision and match the vendored nv-redfish src/lib.rs, the schema
       # versions must match Cargo.lock, and the capability-ledger hash
       # snapshot must equal the §15.3 negotiation golden.
+      #
+      # R6-W-8 ran-assertion (2026-08-14): pin 14 is the locally measured
+      # `cargo test --locked -p rutilus-infra-redfish release_baseline
+      # -- --list` count at HEAD e85560a (the 14 release_baseline::tests
+      # functions); the --expect-tests list anchors the six frozen-baseline
+      # cores among them.
       - name: Release baseline check
         if: matrix.is_default
-        run: cargo test --locked -p rutilus-infra-redfish release_baseline
+        run: bash scripts/assert-tests-ran.sh 14 --expect-tests release_baseline_version_matches_the_pinned_manifest,release_baseline_explicit_features_match_the_workspace_manifests_bidirectionally,release_baseline_every_module_is_classified_with_a_decision,release_baseline_ledger_hash_matches_the_negotiation_golden,release_baseline_module_inventory_matches_the_vendored_lib_rs,release_baseline_schema_versions_match_the_committed_lockfile --locked -p rutilus-infra-redfish release_baseline
 
   # ===========================================================================
   # §5.4 / 1.0.0 release condition 17: release artifacts — signed binaries,

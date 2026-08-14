@@ -279,6 +279,14 @@ where
     /// The typed command could not be serialized into its wire payload.
     #[error("the command could not be serialized: {0}")]
     CommandSerialization(#[source] serde_json::Error),
+    /// A terminal `Unknown` operation already covers this dispatch key —
+    /// the site may have landed the write (§13.5: `Unknown` means the
+    /// outcome cannot be proven). The dispatch is refused with the existing
+    /// operation id instead of minting a fresh one, so a retry can never
+    /// double-execute a write whose result the site could not prove
+    /// (R6-E-01).
+    #[error("operation {operation_id} ended Unknown and may have landed; the dispatch is refused")]
+    UnknownOutcomePending { operation_id: OperationId },
     /// The projection repository failed; carries its own error.
     #[error("the projection repository failed: {0}")]
     Projection(#[source] ProjectionError),
@@ -378,6 +386,14 @@ where
         if let Some(existing) = self.find_undecided(request, now).await? {
             return Ok(existing);
         }
+        // R6-E-01 (§13.5): an `Unknown` outcome means the site cannot prove
+        // whether the write landed — a fresh dispatch of the same key could
+        // double-execute it. The refusal carries the existing operation id,
+        // so the operator can reconcile against that record instead of
+        // re-dispatching blindly.
+        if let Some(operation_id) = self.find_unknown_outcome(request).await? {
+            return Err(CenterDispatchError::UnknownOutcomePending { operation_id });
+        }
         // The tracking record precedes the offer, so the site's reply
         // always finds its record.
         let operation_id = OperationId::generate();
@@ -410,32 +426,33 @@ where
     /// - The pending offer's TTL passed: the retry retires the stale rows
     ///   and delivers a fresh offer under the same id — same §17.5 key, so
     ///   the site can never execute it twice.
-    /// - No pending offer row exists: the retry reads the full offer
-    ///   history — the fall-through repair read — and resolves the
-    ///   candidate against its acknowledged rows (§15.4 delivered history)
-    ///   or its scan-truncated pending rows. An acknowledged offer whose
-    ///   reply receipt was lost is re-delivered under the same id, or
-    ///   returned in flight with its original expiry, so the site's §17.5
-    ///   idempotency still binds; an acknowledged offer for a different
-    ///   target is a different operation on the same endpoint and command,
-    ///   and the retry starts fresh below; a record the history does not
-    ///   know at all was never enqueued, and a fresh id cannot
-    ///   double-execute anything. The repair for the offerless record
-    ///   alone runs only for a single candidate, where no other operation
-    ///   could own the retry — and the same history judgment governs the
-    ///   single candidate, so a different-target dispatch is never
-    ///   blind-merged into its id (F1, W3F-1) and an in-flight or
-    ///   scan-truncated offer returns in flight or re-delivers under the
-    ///   same id exactly like the multi-candidate path (W3F-5).
+    /// - No pending offer row exists: the retry resolves the candidate
+    ///   through the directed read over the plaintext `operation_id`
+    ///   column (R6-E-04) — the fall-through repair read, which addresses
+    ///   one operation's newest row without decrypting the site's queue. An
+    ///   acknowledged offer whose reply receipt was lost is re-delivered
+    ///   under the same id, or returned in flight with its original expiry,
+    ///   so the site's §17.5 idempotency still binds; an acknowledged
+    ///   offer for a different target is a different operation on the same
+    ///   endpoint and command, and the retry starts fresh below; a record
+    ///   the directed read does not know at all was never enqueued, and a
+    ///   fresh id cannot double-execute anything. The repair for the
+    ///   offerless record alone runs only for a single candidate, where no
+    ///   other operation could own the retry — and the same directed-read
+    ///   judgment governs the single candidate, so a different-target
+    ///   dispatch is never blind-merged into its id (F1, W3F-1) and an
+    ///   in-flight or scan-truncated offer returns in flight or
+    ///   re-delivers under the same id exactly like the multi-candidate
+    ///   path (W3F-5).
     ///
     /// The tracking scan queries every candidate state on the state index
     /// (`ix_operations_state`, §13.6) instead of listing the whole table,
     /// and the offer scan reads only the pending queue (bounded by
     /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`]), so a retry of a live dispatch
     /// never decrypts an acknowledged offer row; the rare fall-through
-    /// branches are the single-candidate repair's bounded newest window
-    /// ([`Self::offer_history`]) and the multi-candidate fall-through's
-    /// full history ([`Self::offer_history_full`]).
+    /// branch resolves each candidate the pending scan cannot see through
+    /// [`Self::resolve_candidate`]'s directed read — one row per candidate,
+    /// never a scan of the site's queue.
     async fn find_undecided(
         &self,
         request: &CenterOperationRequest,
@@ -488,26 +505,33 @@ where
         if candidates.len() == 1 && !facts.iter().any(|fact| fact.operation_id == candidates[0]) {
             let operation_id = candidates[0];
             // The single-candidate repair read (W3F-1, W3F-5): the
-            // candidate is resolved against the bounded offer history with
-            // exactly the judgment the multi-candidate path applies — the
-            // retry must never blind-merge a different-target dispatch
-            // into the existing id, and an in-flight or scan-truncated
-            // offer returns in flight or re-delivers under the same id as
-            // the documentation promises. Only a record the history does
-            // not know at all was never enqueued — the offer a failed
-            // dispatch stranded — and its offer is delivered now; a
-            // history-known candidate whose offers target a different
-            // resource is a different operation on the same endpoint and
-            // command, and the retry starts fresh below. See
-            // [`Self::offer_history`] for the bounded-window semantics.
-            let history = self.offer_history(request.site_id).await?;
+            // candidate is resolved with exactly the judgment the
+            // multi-candidate path applies — the retry must never
+            // blind-merge a different-target dispatch into the existing
+            // id, and an in-flight or scan-truncated offer returns in
+            // flight or re-delivers under the same id as the documentation
+            // promises. Only a record the directed read does not know at
+            // all was never enqueued — the offer a failed dispatch
+            // stranded — and its offer is delivered now; a known candidate
+            // whose newest offer targets a different resource is a
+            // different operation on the same endpoint and command, and
+            // the retry starts fresh below. The pre-migration rows (no
+            // `operation_id` column value) are backfilled by the directed
+            // read itself, so an acknowledged pre-migration offer is never
+            // mistaken for a never-enqueued record.
             if let Some(dispatched) = self
-                .resolve_candidate(request, operation_id, &facts, Some(&history), now)
+                .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
                 return Ok(Some(dispatched));
             }
-            if history.iter().any(|fact| fact.operation_id == operation_id) {
+            if self
+                .outbox
+                .find_offer_by_operation(request.site_id, operation_id)
+                .await
+                .map_err(CenterDispatchError::Outbox)?
+                .is_some()
+            {
                 return Ok(None);
             }
             tracing::warn!(
@@ -522,99 +546,23 @@ where
         }
         // The fall-through repair read: the pending scan is bounded by
         // [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] and skips the acknowledged
-        // rows, so a candidate it cannot see is resolved from the full
-        // offer history instead — loaded once per retry through
-        // [`Self::offer_history_full`], see [`Self::resolve_candidate`].
+        // rows, so each candidate it cannot see is resolved through the
+        // directed read over the plaintext `operation_id` column (R6-E-04)
+        // — one row per candidate, never a scan of the site's whole queue.
         // A retry must never mint a fresh id for a delivered operation:
-        // the id is the §17.5 key, so this read is deliberately unbounded
-        // — a bounded fall-through could hide a delivered operation's
-        // offers and start fresh under a new id, which would
-        // double-execute the write at the site.
-        let mut history: Option<Vec<OfferFact>> = None;
+        // the id is the §17.5 key, so the directed read is the honest
+        // fall-through — a fall-through that hid a delivered operation's
+        // offers would start fresh under a new id and double-execute the
+        // write at the site.
         for operation_id in candidates {
-            if !facts.iter().any(|fact| fact.operation_id == operation_id) && history.is_none() {
-                history = Some(self.offer_history_full(request.site_id).await?);
-            }
             if let Some(dispatched) = self
-                .resolve_candidate(request, operation_id, &facts, history.as_deref(), now)
+                .resolve_candidate(request, operation_id, &facts, now)
                 .await?
             {
                 return Ok(Some(dispatched));
             }
         }
         Ok(None)
-    }
-
-    /// Lists the newest §15.6 offer history of one site, bounded by
-    /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] — the single-candidate repair
-    /// read (V4P-3) of the retry scan.
-    ///
-    /// The center's durable outbox holds exactly the §15.6 offers,
-    /// acknowledged or not, so the history carries the offer facts — the
-    /// target and the expiry — that the tracking operation record does not
-    /// persist. There is no `operation_id` column to direct the read at one
-    /// candidate's offers (the payload is a ciphertext envelope), so the
-    /// bound caps the decryption work at the newest window; the read is
-    /// still the rare branch (an acknowledged receipt-lost offer, a queue
-    /// the scan truncated, an enqueue failure), never the hot path of a
-    /// retry with a live pending offer.
-    ///
-    /// # The bounded-window semantics
-    ///
-    /// A single candidate whose offers all lie beyond the window is
-    /// indistinguishable from a record that was never enqueued, and the
-    /// repair then re-delivers a fresh offer under the *existing*
-    /// operation id — never a fresh id. That is the safety argument of the
-    /// over-limit case: the id is the §17.5 key, so the site's idempotency
-    /// (the inbox entry keyed by that id) answers the re-delivered offer
-    /// with its recorded state, and the duplicate paths never re-execute
-    /// and never revive a rejected entry — no write can run twice. What the
-    /// bound costs is only the *target discrimination* of the unbounded
-    /// read: a candidate whose offers target a different resource is
-    /// normally judged a different operation (the retry starts fresh
-    /// below), while beyond the window it is treated as the same dispatch
-    /// and re-delivered under its id — a possibly different-target envelope
-    /// under a retained id, which the site absorbs as a duplicate of that
-    /// id. Execution safety is unchanged; only the envelope's target may
-    /// disagree with the recorded operation's target (a cosmetic tracking
-    /// inconsistency, bounded by the window).
-    async fn offer_history(
-        &self,
-        site_id: InstanceId,
-    ) -> Result<Vec<OfferFact>, DispatchErrorOf<Store, Outbox, Roles>> {
-        let entries = self
-            .outbox
-            .list_offers_bounded(site_id, CENTER_DISPATCH_OFFER_SCAN_LIMIT)
-            .await
-            .map_err(CenterDispatchError::Outbox)?;
-        Ok(entries.iter().filter_map(offer_facts).collect())
-    }
-
-    /// Lists the full §15.6 offer history of one site — the multi-candidate
-    /// fall-through repair read of the retry scan, loaded once per retry
-    /// the bounded pending scan cannot resolve.
-    ///
-    /// Unlike the single-candidate repair ([`Self::offer_history`]), this
-    /// read is deliberately unbounded: the multi-candidate path resolves
-    /// every candidate against the history, and a candidate whose offers
-    /// were truncated away would be mistaken for a never-queued record —
-    /// the loop would then end without a match and the dispatch would mint
-    /// a fresh id for a delivered operation, double-executing the write at
-    /// the site. The unbounded read is the rare branch (an acknowledged
-    /// receipt-lost offer, a queue the scan truncated, an enqueue
-    /// failure), never the hot path of a retry with a live pending offer,
-    /// and the pending scan's [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] is what
-    /// keeps the common path cheap.
-    async fn offer_history_full(
-        &self,
-        site_id: InstanceId,
-    ) -> Result<Vec<OfferFact>, DispatchErrorOf<Store, Outbox, Roles>> {
-        let entries = self
-            .outbox
-            .list_offers(site_id)
-            .await
-            .map_err(CenterDispatchError::Outbox)?;
-        Ok(entries.iter().filter_map(offer_facts).collect())
     }
 
     /// Resolves one candidate against its offer facts with the §15.6
@@ -627,37 +575,47 @@ where
     ///
     /// The candidate's pending facts are the primary source — the bounded
     /// scan of [`Self::find_undecided`]. When the pending scan cannot see
-    /// the candidate at all, `history` (the site's full offer history,
-    /// loaded once by the caller) is consulted: an acknowledged offer is
-    /// delivered history (§15.4) whose reply receipt may have been lost —
-    /// re-delivered under the same id, or returned in flight, so the
-    /// site's §17.5 idempotency still binds — and a pending offer beyond
-    /// the scan's limit is the truncation case, resolved exactly like the
-    /// pending scan would. A candidate neither source knows was never
-    /// enqueued: nothing was ever delivered for it, so the fresh start
-    /// below cannot double-execute anything (the single-candidate repair
-    /// in `find_undecided` is the repair path for such a record alone).
+    /// the candidate at all, the directed read over the plaintext
+    /// `operation_id` column (R6-E-04) supplies the candidate's newest
+    /// durable row — exactly the fall-through repair the pre-column
+    /// history reads performed, without decrypting the site's queue: an
+    /// acknowledged offer is delivered history (§15.4) whose reply receipt
+    /// may have been lost — re-delivered under the same id, or returned in
+    /// flight, so the site's §17.5 idempotency still binds — and a pending
+    /// offer beyond the scan's limit is the truncation case, resolved
+    /// exactly like the pending scan would. A candidate neither source
+    /// knows was never enqueued: nothing was ever delivered for it, so the
+    /// fresh start below cannot double-execute anything (the single-
+    /// candidate repair in `find_undecided` is the repair path for such a
+    /// record alone).
     async fn resolve_candidate(
         &self,
         request: &CenterOperationRequest,
         operation_id: OperationId,
         pending: &[OfferFact],
-        history: Option<&[OfferFact]>,
         now: OffsetDateTime,
     ) -> Result<Option<DispatchedOperation>, DispatchErrorOf<Store, Outbox, Roles>> {
-        let mut rows = pending
+        let rows = pending
             .iter()
             .filter(|fact| fact.operation_id == operation_id)
             .collect::<Vec<_>>();
-        if rows.is_empty()
-            && let Some(history) = history
+        // R6-E-04: the fall-through repair read is the directed lookup —
+        // the newest durable row of the operation, one row instead of a
+        // scan of the site's whole queue (the pre-migration rows are
+        // backfilled by the read itself).
+        let mut directed: Option<OfferFact> = None;
+        let mut newest = rows.iter().copied().max_by_key(|fact| fact.sequence);
+        if newest.is_none()
+            && let Some(entry) = self
+                .outbox
+                .find_offer_by_operation(request.site_id, operation_id)
+                .await
+                .map_err(CenterDispatchError::Outbox)?
         {
-            rows = history
-                .iter()
-                .filter(|fact| fact.operation_id == operation_id)
-                .collect::<Vec<_>>();
+            directed = offer_facts(&entry);
+            newest = directed.as_ref();
         }
-        let Some(newest) = rows.iter().max_by_key(|fact| fact.sequence) else {
+        let Some(newest) = newest else {
             return Ok(None);
         };
         if newest.target != request.target_odata_id.as_str() {
@@ -676,6 +634,12 @@ where
                     .await
                     .map_err(CenterDispatchError::Outbox)?;
             }
+            if let Some(directed) = &directed {
+                self.outbox
+                    .acknowledge(directed.entry_id, now)
+                    .await
+                    .map_err(CenterDispatchError::Outbox)?;
+            }
             return self
                 .deliver_retry(request, operation_id, now)
                 .await
@@ -685,6 +649,49 @@ where
             operation_id,
             newest.expires_at,
         )))
+    }
+
+    /// Finds a terminal `Unknown` operation covering the dispatch key
+    /// (R6-E-01, §13.5): a center-sourced operation on the same endpoint
+    /// and command that ended `Unknown` — the site could not prove whether
+    /// the write landed. The addressed site is confirmed through the
+    /// durable offer row, so an `Unknown` operation whose offer lives in
+    /// another site's queue (the endpoint was re-homed since) does not
+    /// block this site's dispatch; the newest row per operation survives
+    /// the ack-time pruning, so the confirmation is the directed read.
+    async fn find_unknown_outcome(
+        &self,
+        request: &CenterOperationRequest,
+    ) -> Result<Option<OperationId>, DispatchErrorOf<Store, Outbox, Roles>> {
+        let unknown = self
+            .store
+            .list_operations(Some(OperationState::Unknown))
+            .await
+            .map_err(CenterDispatchError::Operation)?;
+        let mut matches = unknown
+            .into_iter()
+            .filter(|operation| {
+                operation.source() == OperationSource::Center
+                    && operation
+                        .targets()
+                        .first()
+                        .is_some_and(|target| target.endpoint_id() == request.endpoint_id)
+                    && operation.command() == request.command
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|operation| (operation.created_at(), operation.id()));
+        for operation in matches {
+            if self
+                .outbox
+                .find_offer_by_operation(request.site_id, operation.id())
+                .await
+                .map_err(CenterDispatchError::Outbox)?
+                .is_some()
+            {
+                return Ok(Some(operation.id()));
+            }
+        }
+        Ok(None)
     }
 
     /// Delivers a fresh §15.6 offer under an existing operation id — the
@@ -780,6 +787,10 @@ fn offer_facts(entry: &OutboxEntry) -> Option<OfferFact> {
 enum ReplyTarget {
     /// The site accepted the offer and is executing the operation.
     Running,
+    /// The site accepted the offer as an asynchronous remote task and is
+    /// monitoring it (§13.6 — the wire `OperationProgress.state` names the
+    /// `waiting-remote` state, R6-E-06).
+    WaitingRemote,
     /// The site refused the offer or the operation failed.
     Failed,
     /// The site reports a provable endpoint-side limitation: this write's
@@ -809,6 +820,16 @@ impl ReplyTarget {
             Self::Running => &[
                 OperationEvent::ValidationStarted,
                 OperationEvent::ValidationPassed,
+            ],
+            // `WaitingRemote` leads through the same execution path and
+            // then into the remote-task tracking (§13.6, R6-E-06); the
+            // events that do not apply are absorbed, so a progress report
+            // that arrives after a lost `Accepted` heals the lagging record
+            // exactly like the running path.
+            Self::WaitingRemote => &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+                OperationEvent::RemoteTaskStarted,
             ],
             // `Unsupported` lands in the same honest terminal state (E3-4):
             // the domain state machine has no unsupported state, and the
@@ -854,10 +875,15 @@ pub trait CenterReplyConsumer: Send + Sync {
 /// verified before any credit (a reply routed through another site's
 /// connection must never advance a foreign operation): the endpoint's
 /// projection first, and the operation's durable offer facts when the
-/// projection is gone (V5E-1), so a terminal reply still credits after the
-/// endpoint was deleted. `Store` is therefore also the center-outbox
-/// boundary: the store that persists the §15.6 offers (the same
-/// `&SqliteStore` the runtime hands the tracking).
+/// projection is gone (V5E-1) or disagrees with the replying site (R6-E-03
+/// — the endpoint may have been re-homed after the dispatch, and the
+/// replying site's own queue holding the offer proves the credit), so a
+/// terminal reply still credits after the endpoint was deleted or moved.
+/// A reply the tracking cannot credit is recorded as an absorbing receipt
+/// before it is absorbed (R6-E-08), so nothing the site said vanishes
+/// without a trace. `Store` is therefore also the center-outbox boundary:
+/// the store that persists the §15.6 offers (the same `&SqliteStore` the
+/// runtime hands the tracking).
 pub struct CenterOperationTracking<Store, Inbox> {
     store: Store,
     inbox: Inbox,
@@ -921,10 +947,22 @@ where
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
             let Some(operation_id) = reply_operation_id(envelope.message.as_ref()) else {
-                // A reply with an unparseable operation id cannot be
-                // recorded; it is logged and absorbed so a corrupt frame
-                // never ends the connection.
-                tracing::warn!("site {site}: dropping a reply with an unparseable operation id");
+                // R6-E-08: a reply with an unparseable operation id cannot
+                // be tracked, but it must not vanish without a trace — the
+                // absorbing receipt records what the site said (the phase
+                // stays `Received` and the envelope is stored verbatim,
+                // with the raw id inside it; the receipt key is the
+                // deterministic derivation of the raw id, because a corrupt
+                // id cannot key a receipt directly). The frame is then
+                // absorbed so it never ends the connection.
+                self.record_absorbed_reply(
+                    site,
+                    envelope,
+                    raw_reply_operation_id(envelope.message.as_ref()),
+                    now,
+                )
+                .await?;
+                tracing::warn!("site {site}: absorbing a reply with an unparseable operation id");
                 return Ok(());
             };
             let Some(target) = reply_target(envelope.message.as_ref()) else {
@@ -937,9 +975,14 @@ where
                 .await
                 .map_err(CenterOperationTrackingError::Operation)?
             else {
-                // A reply for an operation the center has no record of (a
-                // restore that predates the offer, a manual DB change) is
-                // absorbed: the connection must survive it.
+                // R6-E-08: a reply for an operation the center has no
+                // record of (a restore that predates the offer, a manual DB
+                // change) is absorbed — the connection must survive it —
+                // and the absorbing receipt records what the site said: the
+                // phase stays `Received` and the envelope is stored
+                // verbatim under the operation id, so the reply leaves a
+                // trace in the audit trail.
+                self.record_reply(site, envelope, operation_id, now).await?;
                 tracing::warn!(
                     "site {site}: absorbing a reply for the unknown operation {operation_id}"
                 );
@@ -1019,23 +1062,30 @@ where
     Inbox: CenterInbox,
 {
     /// The site an operation's offer was addressed to: the endpoint's site
-    /// in the center projection (§15.5), and — when the projection is gone —
-    /// the operation's recorded offer facts (V5E-1).
+    /// in the center projection (§15.5), and — when the projection is gone
+    /// or disagrees with the replying site — the operation's recorded offer
+    /// facts (V5E-1, R6-E-03).
     ///
-    /// The projection is the primary source; `None` when the endpoint is no
-    /// longer projected — the endpoint was deleted by the site after the
-    /// operation ran, or the center was restored from a database that
-    /// predates the projection. The reply is then verified against the
-    /// operation's durable offer facts instead of being refused: the
-    /// center's outbox holds exactly the §15.6 offers, so the replying
-    /// site's own history carries the offer the center addressed to it, and
-    /// the offer envelope records the addressed site. A legitimate reply
-    /// always comes from the site whose queue holds the offer, so the
-    /// fallback restores the credit for the very replies the deleted
-    /// projection would have stranded; a reply from any other site finds no
-    /// offer in its queue and stays refused. `None` — the reply is refused
-    /// (fail closed) — only when the projection AND the offer facts are
-    /// both missing.
+    /// The projection is the primary source when it names the replying
+    /// site. When the endpoint is no longer projected — the endpoint was
+    /// deleted by the site after the operation ran, or the center was
+    /// restored from a database that predates the projection — the reply is
+    /// verified against the operation's durable offer facts instead of
+    /// being refused (V5E-1): the center's outbox holds exactly the §15.6
+    /// offers, so the replying site's own queue carries the offer the
+    /// center addressed to it, and the offer envelope records the addressed
+    /// site. When the projection names a *different* site than the replying
+    /// one (R6-E-03), the offer facts arbitrate before any refusal: the
+    /// endpoint may have been re-homed after the dispatch, and the reply
+    /// still credits when the replying site's own queue holds the offer —
+    /// only when the projection AND the offer facts both disagree is the
+    /// reply refused. A legitimate reply always comes from the site whose
+    /// queue holds the offer, so the fallback restores the credit for the
+    /// very replies the deleted or moved projection would have stranded; a
+    /// reply from any other site finds no offer in its queue and stays
+    /// refused. `None` — the reply is refused (fail closed) — only when
+    /// the projection and the offer facts are both missing or both
+    /// disagree.
     async fn offer_site(
         &self,
         operation: &Operation,
@@ -1054,20 +1104,30 @@ where
             .await
             .map_err(CenterOperationTrackingError::Projection)?
         {
-            return Ok(projection.site_id());
+            let projected_site = projection.site_id();
+            if projected_site == Some(site) {
+                return Ok(projected_site);
+            }
+            // R6-E-03: the projection disagrees with the replying site —
+            // the endpoint was re-homed after the dispatch. The durable
+            // offer facts arbitrate: the replying site's own queue holding
+            // the offer proves the center addressed it there, so the reply
+            // credits; only when the facts also disagree is the reply
+            // refused.
+            return self.offer_site_from_offer_facts(operation.id(), site).await;
         }
         self.offer_site_from_offer_facts(operation.id(), site).await
     }
 
     /// The expected site of one operation rebuilt from its recorded §15.6
-    /// offer facts (V5E-1): the replying site's durable outbox history holds
-    /// the offer the center addressed to it, and the offer envelope records
-    /// the addressed site.
+    /// offer facts (V5E-1): the replying site's durable outbox holds the
+    /// offer the center addressed to it, and the offer envelope records the
+    /// addressed site.
     ///
-    /// The read is the full offer history of the replying site — the same
-    /// unbounded read the dispatch retry's fall-through uses — but it runs
-    /// only on the fallback path, when the endpoint's projection is gone,
-    /// so the decryption surface stays off the hot path. The offer's
+    /// The read is the directed lookup over the plaintext `operation_id`
+    /// column (R6-E-04) — the newest durable row of the operation, one row
+    /// instead of a scan of the replying site's whole queue; the
+    /// pre-migration rows are backfilled by the read itself. The offer's
     /// recorded site is the expected site; a row whose envelope's site
     /// disagrees with the queue it lives in (a manual DB change) is
     /// returned as-is, and the caller's site comparison refuses it.
@@ -1076,16 +1136,15 @@ where
         operation_id: OperationId,
         site: InstanceId,
     ) -> Result<Option<InstanceId>, TrackingErrorOf<Store, Inbox>> {
-        let entries = self
+        let Some(entry) = self
             .store
-            .list_offers(site)
+            .find_offer_by_operation(site, operation_id)
             .await
-            .map_err(CenterOperationTrackingError::Outbox)?;
-        Ok(entries
-            .iter()
-            .filter_map(offer_facts)
-            .find(|fact| fact.operation_id == operation_id)
-            .and_then(|fact| fact.site_id))
+            .map_err(CenterOperationTrackingError::Outbox)?
+        else {
+            return Ok(None);
+        };
+        Ok(offer_facts(&entry).and_then(|fact| fact.site_id))
     }
 
     /// Persists the reply envelope as the operation's inbox receipt — the
@@ -1113,6 +1172,26 @@ where
             .await
             .map_err(CenterOperationTrackingError::Inbox)?;
         Ok(())
+    }
+
+    /// Records one reply that the tracking cannot credit as an absorbing
+    /// receipt (R6-E-08): the envelope is stored verbatim at the `Received`
+    /// phase — the durable trace of what the site said — even though no
+    /// tracking record can absorb it. A raw operation id that does not
+    /// parse as a `OperationId` cannot key a receipt directly, so its
+    /// receipt key is the deterministic derivation
+    /// ([`absorbed_receipt_operation_id`]): the same raw id always lands
+    /// on the same key, and the stored payload carries the raw id verbatim.
+    async fn record_absorbed_reply(
+        &self,
+        site: InstanceId,
+        envelope: &Envelope,
+        raw_operation_id: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<(), TrackingErrorOf<Store, Inbox>> {
+        let operation_id =
+            raw_operation_id.map_or_else(OperationId::generate, absorbed_receipt_operation_id);
+        self.record_reply(site, envelope, operation_id, now).await
     }
 
     /// Persists the reply envelope as the operation's inbox receipt and
@@ -1188,6 +1267,14 @@ where
 
 /// The operation id of one reply message.
 fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> {
+    raw_reply_operation_id(message).and_then(|raw| raw.parse().ok())
+}
+
+/// The raw operation id string of one reply message — the verbatim wire
+/// value, without parsing (R6-E-08): the absorbing receipt of a corrupt id
+/// must preserve the raw string, and the payload stores the envelope
+/// verbatim around it.
+fn raw_reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<&str> {
     let Some(
         EnvelopeMessage::OperationAccepted(OperationAccepted { operation_id, .. })
         | EnvelopeMessage::OperationRejected(OperationRejected { operation_id, .. })
@@ -1197,7 +1284,20 @@ fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> 
     else {
         return None;
     };
-    operation_id.parse().ok()
+    Some(operation_id)
+}
+
+/// The receipt key of a reply whose wire operation id is not a valid
+/// `OperationId` (R6-E-08): a corrupt id cannot key a `center_inbox`
+/// receipt directly, so the key is the deterministic UUID v5 of the raw
+/// string — the same raw id always yields the same key, and the receipt
+/// payload carries the raw id verbatim, so the trace survives both the
+/// re-delivery and the audit read.
+fn absorbed_receipt_operation_id(raw: &str) -> OperationId {
+    OperationId::from_uuid(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        raw.as_bytes(),
+    ))
 }
 
 /// The `OperationCompleted` summary vocabulary of the E3-4 refusal
@@ -1241,8 +1341,17 @@ fn is_unsupported_summary(summary: &str) -> bool {
 /// The tracking target of one reply message.
 fn reply_target(message: Option<&EnvelopeMessage>) -> Option<ReplyTarget> {
     match message {
-        Some(EnvelopeMessage::OperationAccepted(_) | EnvelopeMessage::OperationProgress(_)) => {
-            Some(ReplyTarget::Running)
+        Some(EnvelopeMessage::OperationAccepted(_)) => Some(ReplyTarget::Running),
+        Some(EnvelopeMessage::OperationProgress(progress)) => {
+            // R6-E-06: the progress frame carries the site's real operation
+            // state (§15.6 `OperationProgress.state` — the domain state
+            // code, §13.2): an asynchronous task the site is monitoring
+            // tracks as `WaitingRemote` with the remote-task lead-in,
+            // every other progress state stays on the plain running path.
+            match progress.state.parse::<OperationState>() {
+                Ok(OperationState::WaitingRemote) => Some(ReplyTarget::WaitingRemote),
+                _ => Some(ReplyTarget::Running),
+            }
         }
         Some(EnvelopeMessage::OperationRejected(_)) => Some(ReplyTarget::Failed),
         Some(EnvelopeMessage::OperationCompleted(completed)) => {
@@ -3617,7 +3726,11 @@ mod tests {
             OperationState::Cancelled
         );
 
-        let unknown = dispatch
+        // The plain failure dispatch runs before the unknown one — R6-E-01:
+        // a terminal `Unknown` outcome blocks a same-key re-dispatch (the
+        // write may have landed), so the unknown receipt is the last of the
+        // three dispatches.
+        let failed = dispatch
             .dispatch(
                 &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
                 now + Duration::seconds(3),
@@ -3626,37 +3739,8 @@ mod tests {
         accept_reply(
             &tracking,
             site,
-            unknown.operation_id(),
-            now + Duration::seconds(4),
-        )
-        .await?;
-        complete_reply(
-            &tracking,
-            site,
-            unknown.operation_id(),
-            "unknown",
-            now + Duration::seconds(5),
-        )
-        .await?;
-        assert_eq!(
-            state
-                .find_operation_owned(unknown.operation_id())
-                .ok_or("the tracking record is missing")?
-                .state(),
-            OperationState::Unknown
-        );
-
-        let failed = dispatch
-            .dispatch(
-                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
-                now + Duration::seconds(6),
-            )
-            .await?;
-        accept_reply(
-            &tracking,
-            site,
             failed.operation_id(),
-            now + Duration::seconds(7),
+            now + Duration::seconds(4),
         )
         .await?;
         complete_reply(
@@ -3664,7 +3748,7 @@ mod tests {
             site,
             failed.operation_id(),
             "failed",
-            now + Duration::seconds(8),
+            now + Duration::seconds(5),
         )
         .await?;
         assert_eq!(
@@ -3673,6 +3757,35 @@ mod tests {
                 .ok_or("the tracking record is missing")?
                 .state(),
             OperationState::Failed
+        );
+
+        let unknown = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(6),
+            )
+            .await?;
+        accept_reply(
+            &tracking,
+            site,
+            unknown.operation_id(),
+            now + Duration::seconds(7),
+        )
+        .await?;
+        complete_reply(
+            &tracking,
+            site,
+            unknown.operation_id(),
+            "unknown",
+            now + Duration::seconds(8),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(unknown.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Unknown
         );
         Ok(())
     }
@@ -3860,6 +3973,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retry_after_an_unknown_outcome_is_refused_with_the_existing_operation_id()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-01 (§13.5): an `Unknown` outcome means the site cannot prove
+        // whether the write landed, so a same-key dispatch must be refused
+        // with the existing operation id — never minted afresh, never
+        // double-executed. The refusal is stable: every retry names the
+        // same id.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            first.operation_id(),
+            "unknown",
+            now + Duration::SECOND,
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(first.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Unknown
+        );
+
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await;
+        assert!(
+            matches!(
+                retry,
+                Err(CenterDispatchError::UnknownOutcomePending { operation_id })
+                    if operation_id == first.operation_id()
+            ),
+            "the retry must be refused with the existing operation id"
+        );
+        // The refusal is stable: a second retry names the same id.
+        let second_retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(3),
+            )
+            .await;
+        assert!(matches!(
+            second_retry,
+            Err(CenterDispatchError::UnknownOutcomePending { operation_id })
+                if operation_id == first.operation_id()
+        ));
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no second tracking record is created"
+        );
+        assert_eq!(state.offers_owned().len(), 1, "no second offer is enqueued");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_the_original_site_credits_after_the_endpoint_was_re_homed()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-03: the endpoint's projection moves to another site after
+        // the dispatch (the site re-homed the endpoint), and the reply
+        // arrives over the *original* site's connection — the projection
+        // alone would refuse it and leave the operation non-terminal
+        // forever. The offer facts arbitrate: the replying site's own queue
+        // holds the offer the center addressed to it, so the reply credits.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let other_site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+
+        // The endpoint's projection moves to the other site before the
+        // reply arrives.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, other_site));
+        accept_reply(
+            &tracking,
+            site,
+            dispatched.operation_id(),
+            now + Duration::SECOND,
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(dispatched.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Running,
+            "the original site's reply must credit through the offer facts"
+        );
+        // The durable receipt records the credited reply.
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].instance_id(), site);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_waiting_remote_progress_reply_tracks_the_remote_task_state()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-06: the progress frame carries the site's real operation
+        // state (§15.6 `OperationProgress.state`), so an asynchronous task
+        // the site is monitoring tracks as `WaitingRemote` — with the
+        // remote-task lead-in — instead of being folded into the plain
+        // running path.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let operation_id = dispatched.operation_id();
+
+        // A plain running progress report stays on the running path.
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                        operation_id: operation_id.to_string(),
+                        state: String::from("running"),
+                        detail: String::from("executing"),
+                    })),
+                },
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Running
+        );
+
+        // The site reports the asynchronous task: the record leads into the
+        // remote-task tracking.
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 2,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                        operation_id: operation_id.to_string(),
+                        state: String::from("waiting-remote"),
+                        detail: String::from("monitoring the BMC task"),
+                    })),
+                },
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::WaitingRemote
+        );
+
+        // A re-delivered older progress report is absorbed: the record
+        // stays on the remote-task path.
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 3,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                        operation_id: operation_id.to_string(),
+                        state: String::from("running"),
+                        detail: String::new(),
+                    })),
+                },
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::WaitingRemote
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absorbed_replies_for_unknown_operations_leave_a_durable_receipt()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-08: a reply the tracking cannot credit — an operation the
+        // center has no record of, or an operation id that does not parse —
+        // is recorded as an absorbing receipt (the phase stays `Received`
+        // and the envelope is stored verbatim) before the warn, so nothing
+        // the site said vanishes without a trace.
+        let (store, state) = MockDispatchStore::new();
+        let tracking = CenterOperationTracking::new(store.clone(), store);
+        let now = base_time();
+        let site = InstanceId::generate();
+
+        // A reply for an unknown-but-parseable operation id.
+        let unknown_id = OperationId::generate();
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationAccepted(OperationAccepted {
+                        operation_id: unknown_id.to_string(),
+                        accepted_at_unix: now.unix_timestamp(),
+                    })),
+                },
+                now,
+            )
+            .await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].operation_id(), unknown_id);
+        assert_eq!(receipts[0].state(), InboxEntryState::Received);
+        assert!(
+            receipts[0].payload_json().contains(&unknown_id.to_string()),
+            "the receipt payload must carry the envelope verbatim"
+        );
+
+        // A reply whose operation id does not parse: the receipt key is the
+        // deterministic derivation of the raw id, and the payload carries
+        // the raw id verbatim.
+        let corrupt_id = String::from("not-a-uuid");
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 2,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationAccepted(OperationAccepted {
+                        operation_id: corrupt_id.clone(),
+                        accepted_at_unix: now.unix_timestamp(),
+                    })),
+                },
+                now,
+            )
+            .await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[1].state(), InboxEntryState::Received);
+        assert!(
+            receipts[1].payload_json().contains(&corrupt_id),
+            "the receipt payload must carry the corrupt id verbatim"
+        );
+
+        // Re-delivering the same corrupt id lands on the same deterministic
+        // key: the receipt is absorbed as a duplicate, never a second row.
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 3,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationAccepted(OperationAccepted {
+                        operation_id: corrupt_id,
+                        accepted_at_unix: now.unix_timestamp(),
+                    })),
+                },
+                now,
+            )
+            .await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(
+            receipts.len(),
+            2,
+            "the corrupt id must map to one receipt key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reply_target_parses_the_wire_progress_state() {
+        let progress = |state: &str| {
+            Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                operation_id: String::new(),
+                state: state.to_owned(),
+                detail: String::new(),
+            }))
+        };
+        // R6-E-06: the wire `OperationProgress.state` is the site's real
+        // operation state; the remote-task state tracks as `WaitingRemote`
+        // and every other (or unparseable) state stays on the running path.
+        assert_eq!(
+            reply_target(progress("waiting-remote").as_ref()),
+            Some(ReplyTarget::WaitingRemote)
+        );
+        assert_eq!(
+            reply_target(progress("running").as_ref()),
+            Some(ReplyTarget::Running)
+        );
+        assert_eq!(
+            reply_target(progress("queued").as_ref()),
+            Some(ReplyTarget::Running)
+        );
+        assert_eq!(
+            reply_target(progress("not-a-state").as_ref()),
+            Some(ReplyTarget::Running)
+        );
+    }
+
+    #[tokio::test]
     async fn a_terminal_completed_reply_heals_a_record_that_missed_the_acceptance()
     -> Result<(), Box<dyn Error>> {
         let (store, state) = MockDispatchStore::new();
@@ -3871,10 +4327,11 @@ mod tests {
         seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
         let tracking = CenterOperationTracking::new(store.clone(), store.clone());
 
-        // The record is `Queued` when the terminal report arrives (the
-        // accepted reply was lost): the unknown-outcome report still lands,
-        // healing the lagging record like the succeeded path does.
-        let unknown = dispatch
+        // A summary that names no stable state is a plain failure. The
+        // failure dispatch runs first — R6-E-01: a terminal `Unknown`
+        // outcome blocks a same-key re-dispatch (the write may have
+        // landed), so the unknown report is the last receipt of the test.
+        let failed = dispatch
             .dispatch(
                 &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
                 now,
@@ -3883,32 +4340,9 @@ mod tests {
         complete_reply(
             &tracking,
             site,
-            unknown.operation_id(),
-            "unknown",
-            now + Duration::SECOND,
-        )
-        .await?;
-        assert_eq!(
-            state
-                .find_operation_owned(unknown.operation_id())
-                .ok_or("the tracking record is missing")?
-                .state(),
-            OperationState::Unknown
-        );
-
-        // A summary that names no stable state is a plain failure.
-        let failed = dispatch
-            .dispatch(
-                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
-                now + Duration::seconds(2),
-            )
-            .await?;
-        complete_reply(
-            &tracking,
-            site,
             failed.operation_id(),
             "the recorded outcome is unavailable",
-            now + Duration::seconds(3),
+            now + Duration::SECOND,
         )
         .await?;
         assert_eq!(
@@ -3917,6 +4351,31 @@ mod tests {
                 .ok_or("the tracking record is missing")?
                 .state(),
             OperationState::Failed
+        );
+
+        // The record is `Queued` when the terminal report arrives (the
+        // accepted reply was lost): the unknown-outcome report still lands,
+        // healing the lagging record like the succeeded path does.
+        let unknown = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            unknown.operation_id(),
+            "unknown",
+            now + Duration::seconds(3),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(unknown.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Unknown
         );
         Ok(())
     }

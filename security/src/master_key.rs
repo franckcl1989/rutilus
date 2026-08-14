@@ -9,7 +9,16 @@ use secrecy::{ExposeSecret, SecretBox, SecretString};
 use zeroize::Zeroizing;
 
 const MASTER_KEY_LENGTH: usize = 32;
-const ENVELOPE_MAGIC: [u8; 8] = *b"RUTMK001";
+/// Format marker of the current passphrase-protected master-key envelope:
+/// the wrapping key is derived with the product password baseline's
+/// Argon2id parameters (64 MiB / three passes / one lane — the
+/// `rutilus_domain::ARGON2ID_*` constants).
+const ENVELOPE_MAGIC: [u8; 8] = *b"RUTMK002";
+/// Format marker of the legacy version-one envelope, whose wrapping key was
+/// derived with the Argon2id library defaults (19 MiB / two passes / one
+/// lane). Legacy envelopes are still accepted by [`recover_master_key`] and
+/// are re-protected under the current format by [`rewrap_master_key`].
+const LEGACY_ENVELOPE_MAGIC: [u8; 8] = *b"RUTMK001";
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 24;
 const AUTHENTICATION_TAG_LENGTH: usize = 16;
@@ -17,7 +26,9 @@ const ENCRYPTED_MASTER_KEY_LENGTH: usize = MASTER_KEY_LENGTH + AUTHENTICATION_TA
 const SALT_OFFSET: usize = ENVELOPE_MAGIC.len();
 const NONCE_OFFSET: usize = SALT_OFFSET + SALT_LENGTH;
 const CIPHERTEXT_OFFSET: usize = NONCE_OFFSET + NONCE_LENGTH;
-/// Exact byte length of the version-one passphrase-protected master-key envelope.
+/// Exact byte length of the passphrase-protected master-key envelope (both
+/// the current `RUTMK002` format and the legacy `RUTMK001` format share the
+/// layout).
 pub const MASTER_KEY_ENVELOPE_LENGTH: usize = CIPHERTEXT_OFFSET + ENCRYPTED_MASTER_KEY_LENGTH;
 
 /// Version marker of the system-protected master-key envelope.
@@ -111,7 +122,9 @@ impl fmt::Debug for MasterKey {
 pub struct ProtectedMasterKey([u8; MASTER_KEY_ENVELOPE_LENGTH]);
 
 impl ProtectedMasterKey {
-    /// Validates and copies a persisted envelope.
+    /// Validates and copies a persisted envelope: the current `RUTMK002`
+    /// format and the legacy `RUTMK001` format are both accepted (a legacy
+    /// envelope still unlocks and is migrated by [`rewrap_master_key`]).
     ///
     /// # Errors
     ///
@@ -122,13 +135,21 @@ impl ProtectedMasterKey {
         if bytes.len() != MASTER_KEY_ENVELOPE_LENGTH {
             return Err(MasterKeyProtectionError::InvalidEnvelopeLength);
         }
-        if !bytes.starts_with(&ENVELOPE_MAGIC) {
+        if !bytes.starts_with(&ENVELOPE_MAGIC) && !bytes.starts_with(&LEGACY_ENVELOPE_MAGIC) {
             return Err(MasterKeyProtectionError::UnsupportedEnvelope);
         }
 
         let mut envelope = [0_u8; MASTER_KEY_ENVELOPE_LENGTH];
         envelope.copy_from_slice(bytes);
         Ok(Self(envelope))
+    }
+
+    /// Whether the envelope uses the legacy `RUTMK001` format (derived with
+    /// the library-default Argon2id parameters). A legacy envelope unlocks
+    /// normally; the unlock path re-protects it under the current format.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.0[..LEGACY_ENVELOPE_MAGIC.len()] == LEGACY_ENVELOPE_MAGIC
     }
 
     /// Returns the complete public envelope for durable storage.
@@ -146,8 +167,11 @@ impl fmt::Debug for ProtectedMasterKey {
 
 /// Protects a generated master key with a key derived from the local unlock passphrase.
 ///
-/// The version-one format fixes Argon2id v1.3 parameters and authenticates its format
-/// marker and random salt as associated data. The passphrase and both key values remain
+/// The current format (`RUTMK002`) fixes the Argon2id v1.3 parameters of the
+/// product password baseline (64 MiB / three passes / one lane — the
+/// `rutilus_domain::ARGON2ID_*` constants, so the two derivations cannot
+/// drift apart) and authenticates its format marker and random salt as
+/// associated data. The passphrase and both key values remain
 /// secret-wrapped or zeroized in memory.
 ///
 /// # Errors
@@ -167,7 +191,7 @@ pub fn protect_master_key(
     let wrapping_key = derive_wrapping_key(passphrase, &salt)?;
     let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key.as_ref())
         .map_err(|_| MasterKeyProtectionError::InvalidWrappingKeyLength)?;
-    let associated_data = associated_data(&salt);
+    let associated_data = associated_data(ENVELOPE_MAGIC, &salt);
     let ciphertext = cipher
         .encrypt(
             &XNonce::from(nonce),
@@ -205,10 +229,22 @@ pub fn recover_master_key(
     let mut nonce = [0_u8; NONCE_LENGTH];
     nonce.copy_from_slice(&protected.0[NONCE_OFFSET..CIPHERTEXT_OFFSET]);
 
-    let wrapping_key = derive_wrapping_key(passphrase, &salt)?;
+    // A legacy `RUTMK001` envelope was derived with the library-default
+    // Argon2id parameters and authenticated the legacy magic; both must be
+    // reproduced exactly to unlock it.
+    let legacy = protected.is_legacy();
+    let wrapping_key = if legacy {
+        derive_wrapping_key_v1(passphrase, &salt)?
+    } else {
+        derive_wrapping_key(passphrase, &salt)?
+    };
     let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key.as_ref())
         .map_err(|_| MasterKeyProtectionError::InvalidWrappingKeyLength)?;
-    let associated_data = associated_data(&salt);
+    let associated_data = if legacy {
+        associated_data(LEGACY_ENVELOPE_MAGIC, &salt)
+    } else {
+        associated_data(ENVELOPE_MAGIC, &salt)
+    };
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(
@@ -356,8 +392,12 @@ impl fmt::Debug for RewrappedMasterKey {
 /// [`UnlockSource`] `target`.
 ///
 /// The source is always the passphrase envelope — the one protection that an
-/// operator can recover interactively. The target's credentials are
-/// validated: [`UnlockSource::Passphrase`] requires `target_passphrase` and
+/// operator can recover interactively. Re-protecting a legacy `RUTMK001`
+/// envelope under [`UnlockSource::Passphrase`] is the format migration: the
+/// recovered key is written in the current `RUTMK002` format, so the unlock
+/// path migrates a legacy envelope simply by re-wrapping it with the same
+/// passphrase. The target's credentials are validated:
+/// [`UnlockSource::Passphrase`] requires `target_passphrase` and
 /// [`UnlockSource::System`] requires `target_protector`; an extra credential
 /// for the other target is ignored.
 ///
@@ -399,7 +439,39 @@ fn ensure_passphrase(passphrase: &SecretString) -> Result<(), MasterKeyProtectio
     Ok(())
 }
 
+/// Derives the wrapping key for the current `RUTMK002` format: Argon2id
+/// v1.3 with the product password baseline's parameters (64 MiB / three
+/// passes / one lane), taken from the domain crate's `ARGON2ID_*`
+/// constants so the master-key derivation and the password derivation
+/// cannot drift apart.
 fn derive_wrapping_key(
+    passphrase: &SecretString,
+    salt: &[u8; SALT_LENGTH],
+) -> Result<Zeroizing<[u8; MASTER_KEY_LENGTH]>, MasterKeyProtectionError> {
+    let params = Params::new(
+        rutilus_domain::ARGON2ID_MEMORY_KIB,
+        rutilus_domain::ARGON2ID_TIME_COST,
+        rutilus_domain::ARGON2ID_PARALLELISM,
+        Some(MASTER_KEY_LENGTH),
+    )
+    .map_err(MasterKeyProtectionError::KeyDerivation)?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut wrapping_key = Zeroizing::new([0_u8; MASTER_KEY_LENGTH]);
+    argon2
+        .hash_password_into(
+            passphrase.expose_secret().as_bytes(),
+            salt,
+            wrapping_key.as_mut(),
+        )
+        .map_err(MasterKeyProtectionError::KeyDerivation)?;
+    Ok(wrapping_key)
+}
+
+/// Derives the wrapping key of the legacy `RUTMK001` format: the Argon2id
+/// library defaults (19 MiB / two passes / one lane) the version-one
+/// envelope was protected with. Kept only so a persisted legacy envelope
+/// still unlocks; the migration re-protects it under the current format.
+fn derive_wrapping_key_v1(
     passphrase: &SecretString,
     salt: &[u8; SALT_LENGTH],
 ) -> Result<Zeroizing<[u8; MASTER_KEY_LENGTH]>, MasterKeyProtectionError> {
@@ -422,9 +494,9 @@ fn derive_wrapping_key(
     Ok(wrapping_key)
 }
 
-fn associated_data(salt: &[u8; SALT_LENGTH]) -> [u8; SALT_OFFSET + SALT_LENGTH] {
+fn associated_data(magic: [u8; 8], salt: &[u8; SALT_LENGTH]) -> [u8; SALT_OFFSET + SALT_LENGTH] {
     let mut associated_data = [0_u8; SALT_OFFSET + SALT_LENGTH];
-    associated_data[..SALT_OFFSET].copy_from_slice(&ENVELOPE_MAGIC);
+    associated_data[..SALT_OFFSET].copy_from_slice(&magic);
     associated_data[SALT_OFFSET..].copy_from_slice(salt);
     associated_data
 }
@@ -621,6 +693,8 @@ mod tests {
 
         assert_eq!(decrypted.expose_secret(), secret.expose_secret());
         assert_eq!(persisted.len(), MASTER_KEY_ENVELOPE_LENGTH);
+        assert!(persisted.starts_with(&ENVELOPE_MAGIC));
+        assert!(!protected.is_legacy());
         assert_eq!(format!("{original:?}"), "MasterKey([REDACTED])");
         assert_eq!(format!("{protected:?}"), "ProtectedMasterKey([REDACTED])");
         Ok(())
@@ -845,6 +919,89 @@ mod tests {
             decrypt_credential(&master_key, &encrypted)?.expose_secret(),
             secret.expose_secret()
         );
+        Ok(())
+    }
+
+    /// Reproduces the legacy version-one envelope format — `RUTMK001`
+    /// magic, library-default Argon2id parameters, legacy-magic associated
+    /// data — exactly as `protect_master_key` wrote it before the
+    /// RUTMK002 bump. Kept in the test module so the migration path is
+    /// exercised against a genuine legacy envelope.
+    fn protect_master_key_legacy_for_test(
+        master_key: &MasterKey,
+        passphrase: &SecretString,
+    ) -> Result<ProtectedMasterKey, MasterKeyProtectionError> {
+        let mut salt = [0_u8; SALT_LENGTH];
+        getrandom::fill(&mut salt).map_err(MasterKeyProtectionError::RandomnessUnavailable)?;
+        let mut nonce = [0_u8; NONCE_LENGTH];
+        getrandom::fill(&mut nonce).map_err(MasterKeyProtectionError::RandomnessUnavailable)?;
+
+        let wrapping_key = derive_wrapping_key_v1(passphrase, &salt)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key.as_ref())
+            .map_err(|_| MasterKeyProtectionError::InvalidWrappingKeyLength)?;
+        let ciphertext = cipher
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: master_key.expose(),
+                    aad: &associated_data(LEGACY_ENVELOPE_MAGIC, &salt),
+                },
+            )
+            .map_err(|_| MasterKeyProtectionError::EncryptionFailed)?;
+
+        let mut envelope = [0_u8; MASTER_KEY_ENVELOPE_LENGTH];
+        envelope[..SALT_OFFSET].copy_from_slice(&LEGACY_ENVELOPE_MAGIC);
+        envelope[SALT_OFFSET..NONCE_OFFSET].copy_from_slice(&salt);
+        envelope[NONCE_OFFSET..CIPHERTEXT_OFFSET].copy_from_slice(&nonce);
+        envelope[CIPHERTEXT_OFFSET..].copy_from_slice(&ciphertext);
+        Ok(ProtectedMasterKey(envelope))
+    }
+
+    /// R6-S-11: a legacy `RUTMK001` envelope still unlocks with its
+    /// passphrase (and only with it), and re-protecting it under the
+    /// `Passphrase` source migrates it to the current `RUTMK002` format —
+    /// the unlock path's migration step.
+    #[tokio::test]
+    async fn legacy_v1_envelope_unlocks_and_rewraps_to_the_current_format()
+    -> Result<(), Box<dyn Error>> {
+        let master_key = MasterKey::from_boxed_bytes(Box::new([0x7a; MASTER_KEY_LENGTH]));
+        let passphrase: SecretString = String::from("legacy local unlock phrase").into();
+
+        let legacy = protect_master_key_legacy_for_test(&master_key, &passphrase)?;
+        assert!(legacy.is_legacy());
+        assert!(legacy.as_bytes().starts_with(&LEGACY_ENVELOPE_MAGIC));
+        // The envelope round-trips through from_bytes like a persisted file.
+        let parsed = ProtectedMasterKey::from_bytes(legacy.as_bytes())?;
+        assert!(parsed.is_legacy());
+
+        // The legacy envelope unlocks with the same passphrase...
+        let recovered = recover_master_key(&legacy, &passphrase)?;
+        assert_eq!(recovered.expose(), master_key.expose());
+        // ...and only with it: a wrong passphrase still authenticates
+        // against the legacy derivation and fails cleanly.
+        let wrong: SecretString = String::from("wrong legacy phrase").into();
+        let wrong_error = recover_master_key(&legacy, &wrong)
+            .err()
+            .ok_or("wrong passphrase unexpectedly recovered the legacy master key")?;
+        assert_eq!(wrong_error, MasterKeyProtectionError::AuthenticationFailed);
+
+        // Migration: rewrap under the same passphrase re-protects the key
+        // in the current format.
+        let rewrapped = rewrap_master_key::<ComplementProtector>(
+            &legacy,
+            &passphrase,
+            UnlockSource::Passphrase,
+            Some(&passphrase),
+            None,
+        )
+        .await?;
+        let RewrappedMasterKey::Passphrase(current) = rewrapped else {
+            return Err("expected a passphrase-protected master key".into());
+        };
+        assert!(!current.is_legacy());
+        assert!(current.as_bytes().starts_with(&ENVELOPE_MAGIC));
+        let recovered = recover_master_key(&current, &passphrase)?;
+        assert_eq!(recovered.expose(), master_key.expose());
         Ok(())
     }
 

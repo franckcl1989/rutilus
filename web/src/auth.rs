@@ -44,7 +44,7 @@
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     error::Error,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -126,12 +126,21 @@ const IP_FAILURE_LIMIT: usize = 20;
 /// so a longer presented username is invalid — it must still consume the
 /// per-username budget (the invalid-name attempts of one attacker), but it
 /// must not grow the in-memory bucket map with an unbounded
-/// attacker-controlled string. The key is the first
+/// attacker-controlled string. The key is the normalized projection
+/// (trimmed and lowercased) truncated to the first
 /// [`MAX_PRINCIPAL_NAME_CHARS`](rutilus_domain::MAX_PRINCIPAL_NAME_CHARS)
 /// characters, so truncation can only share buckets between invalid names —
 /// never tighten a legitimate principal's budget, because valid names never
 /// exceed the bound.
 const RATE_LIMIT_USERNAME_CHARS: usize = rutilus_domain::MAX_PRINCIPAL_NAME_CHARS;
+
+/// `me` queries allowed per client address in one window (R6-W-9): the
+/// Public session-state endpoint carries a per-address query throttle —
+/// same IP budget mechanism as the sign-in surface, no username
+/// dimension, no refund. The cap sits above the sign-in failure budget
+/// because a console page load is one query, and below the point where a
+/// probe flood would run free store lookups.
+pub(crate) const ME_IP_QUERY_LIMIT: usize = 60;
 
 /// New-bucket insertions between full sweeps of one rate-limit bucket map
 /// (security-review N3).
@@ -317,6 +326,26 @@ pub(crate) fn dispatch_scope_allows(
     role.is_some_and(|role| rutilus_application::allows_dispatch(role, assignment_site, site))
 }
 
+/// One session-revocation outcome the Web layer can answer (R6-S-1).
+///
+/// The persistence boundary distinguishes "no such session" and "already
+/// revoked" — both settled states the route can answer directly — from
+/// the failure classes (corrupt row, database error, write coordination)
+/// the route must surface as an explicit 500. The Web crate cannot see
+/// the repository error behind the generic [`AuthServices::Error`], so
+/// the runtime — which knows its own error type — classifies the
+/// outcomes here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRevocation {
+    /// The session was revoked by this call.
+    Revoked,
+    /// No session with the presented id exists.
+    NotFound,
+    /// The session was already revoked — the idempotent repeat of a
+    /// settled revocation.
+    AlreadyRevoked,
+}
+
 /// The authentication boundaries implemented by the embedding runtime.
 ///
 /// The Web crate stays free of persistence and security internals: the
@@ -342,7 +371,7 @@ pub trait AuthServices: Send + Sync {
         &self,
         session_id: SessionId,
         at: OffsetDateTime,
-    ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
+    ) -> BoundaryFuture<'_, Result<SessionRevocation, Self::Error>>;
     fn revoke_sessions_for_principal(
         &self,
         principal_id: PrincipalId,
@@ -1009,6 +1038,12 @@ pub(crate) struct AuthState {
     /// the one-time code is even looked up, and a successful claim refunds
     /// its slots (S3-3) like the sign-in surface.
     bootstrap_limiter: LoginRateLimiter,
+    /// The `me` query throttle (R6-W-9): the same per-address budget
+    /// mechanism as the sign-in surface, in its own instance and keyed on
+    /// the presenting address only — the endpoint is Public and
+    /// sessionless, so a probe flood must not be free, while a page load
+    /// is one query and the budget never writes the username dimension.
+    me_limiter: LoginRateLimiter,
 }
 
 impl AuthState {
@@ -1018,6 +1053,7 @@ impl AuthState {
             rate_limiter: LoginRateLimiter::new(),
             password_change_limiter: LoginRateLimiter::new(),
             bootstrap_limiter: LoginRateLimiter::new(),
+            me_limiter: LoginRateLimiter::new(),
         }
     }
 
@@ -1058,15 +1094,21 @@ struct LoginRateLimiter {
 
 /// One rate-limit bucket map with the bookkeeping that bounds its size.
 ///
-/// Every entry records the presenting address beside its instant: the
-/// per-username map needs it for the W3S-4 same-address count, and the
-/// per-address map stores it for the same entry shape.
+/// Every entry records the presenting address beside its instant and the
+/// token that identifies the reservation (R6-C-5): the per-username map
+/// needs the address for the W3S-4 same-address count, and a refund
+/// removes its own reservation by the token — never another attempt's
+/// entry, under any interleaving.
 #[derive(Debug)]
 struct BucketMap {
-    buckets: HashMap<String, VecDeque<(Instant, String)>>,
+    buckets: HashMap<String, VecDeque<(Instant, String, u64)>>,
     /// New keys inserted since the last full sweep; reaching
     /// [`BUCKET_PRUNE_THRESHOLD`] triggers one.
     inserts_since_prune: usize,
+    /// The next reservation token of this map. Each granted reservation
+    /// receives a fresh value, so a token names exactly one entry of the
+    /// map for its whole lifetime.
+    next_token: u64,
 }
 
 impl BucketMap {
@@ -1074,8 +1116,24 @@ impl BucketMap {
         Self {
             buckets: HashMap::new(),
             inserts_since_prune: 0,
+            next_token: 0,
         }
     }
+}
+
+/// One granted reservation, naming the entries it recorded in each budget
+/// map (R6-C-5).
+///
+/// A refund removes exactly the entries this reservation recorded — the
+/// tokens are minted per map and unique within it — so concurrent
+/// attempts can never shift a slot between each other: the bucket always
+/// ends as the failure count, and no entry ever carries another
+/// attempt's identity (the expiry timing stays the recording attempt's
+/// own).
+#[derive(Clone, Copy, Debug)]
+struct Reservation {
+    username_token: u64,
+    ip_token: u64,
 }
 
 impl LoginRateLimiter {
@@ -1087,66 +1145,93 @@ impl LoginRateLimiter {
     }
 
     /// Consumes one budget slot of the username and the address atomically
-    /// (S3-3).
+    /// (S3-3); `None` when a budget is exhausted.
     ///
     /// The reservation *is* the rate-limit record: it happens before any
     /// verification, under one lock acquisition per key, so N concurrent
     /// attempts can never all pass a stale `allows`-style check and then
     /// record — the old check-then-act window that let a burst exceed the
-    /// budget. A successful verification must release the slot with
-    /// [`Self::refund`]; a failed or cancelled attempt keeps it, which is
-    /// exactly the failure accounting. The credential-change path
-    /// deliberately never refunds (V4R-2): its successes are derivations
-    /// the budget accounts, so [`Self::refund`] stays the sign-in
-    /// surface's contract. The username bound is the more specific one: a
-    /// blocked username is refused even when the address budget remains.
-    fn reserve(&self, username: &str, ip: &str, now: Instant) -> bool {
+    /// budget. A successful verification must release the entries with
+    /// [`Self::refund`] on the returned [`Reservation`]; a failed or
+    /// cancelled attempt keeps them, which is exactly the failure
+    /// accounting. The credential-change path deliberately never refunds
+    /// (V4R-2): its successes are derivations the budget accounts, so
+    /// [`Self::refund`] stays the sign-in surface's contract. The username
+    /// bound is the more specific one: a blocked username is refused even
+    /// when the address budget remains.
+    fn reserve(&self, username: &str, ip: &str, now: Instant) -> Option<Reservation> {
         let username_key = bounded_username_key(username);
-        if !Self::reserve_username_key(
+        let username_token = Self::reserve_username_key(
             &self.by_username,
             &username_key,
             ip,
             now,
             USERNAME_FAILURE_LIMIT,
-        ) {
-            return false;
-        }
-        let reserved = if Self::reserve_ip_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT) {
-            true
-        } else {
+        )?;
+        let Some(ip_token) = Self::reserve_ip_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT) else {
             // The address budget refused: release the username slot so the
             // reservation is all-or-nothing across both budgets. The slot
-            // is the one this call just reserved — the newest entry the
-            // presenting address recorded.
-            Self::refund_key(&self.by_username, &username_key, ip);
-            false
+            // is the one this call just reserved — removed by its own
+            // token, so no other attempt's entry can be touched.
+            Self::refund_key_by_token(&self.by_username, &username_key, username_token);
+            // The full sweep still runs after the compensation — a bucket
+            // the compensation just emptied is reclaimed by the same sweep
+            // that the insert triggered, so the sweep never leaves its own
+            // artifact behind.
+            Self::sweep_if_due(&self.by_username, now);
+            Self::sweep_if_due(&self.by_ip, now);
+            return None;
         };
-        // The full sweep runs after the compensation, so a bucket the
-        // compensation just emptied is reclaimed by the same sweep that the
-        // insert triggered — the sweep never leaves its own artifact behind.
+        // The full sweep runs after the reservation, exactly like the
+        // compensation path above.
         Self::sweep_if_due(&self.by_username, now);
         Self::sweep_if_due(&self.by_ip, now);
-        reserved
+        Some(Reservation {
+            username_token,
+            ip_token,
+        })
     }
 
-    /// Releases one reserved slot of each budget after a successful
+    /// Releases the entries of one reservation after a successful
     /// verification (S3-3) — the sign-in surface's accounting; the
     /// credential-change path deliberately never refunds (V4R-2).
     ///
-    /// The released slot is the refunding attempt's own entry — the newest
-    /// entry the presenting address recorded (V4R-5) — never another
-    /// address's newest entry, so the per-address budget attributions stay
-    /// exact under multi-IP interleaving. The bucket's length always ends
-    /// as the failure count, and the window expiry rule never changes a
-    /// verdict. A missing bucket (a fully expired key the sweep reclaimed)
-    /// is a no-op: the slot it held had already left the window.
-    fn refund(&self, username: &str, ip: &str) {
-        Self::refund_key(&self.by_username, &bounded_username_key(username), ip);
-        Self::refund_key(&self.by_ip, ip, ip);
+    /// The released entries are exactly the refunding attempt's own: the
+    /// reservation carries the token each budget map assigned its entry
+    /// (R6-C-5), so a refund removes precisely what its own reservation
+    /// recorded — under multi-IP and same-address interleaving alike, no
+    /// other attempt's slot can be freed and no entry can end up carrying
+    /// another attempt's identity (the old newest-same-address pop could
+    /// swap identities between two in-flight attempts of one address;
+    /// that swap only ever shifted expiry timing, never the count verdict
+    /// — but it could not answer *whose* failure the entry was, and the
+    /// token-keyed removal makes the attribution exact). The bucket's
+    /// length always ends as the failure count. A missing entry (a fully
+    /// expired token the sweep reclaimed) is a no-op: the slot it held had
+    /// already left the window.
+    fn refund(&self, username: &str, ip: &str, reservation: Reservation) {
+        Self::refund_key_by_token(
+            &self.by_username,
+            &bounded_username_key(username),
+            reservation.username_token,
+        );
+        Self::refund_key_by_token(&self.by_ip, ip, reservation.ip_token);
     }
 
-    /// Consumes one budget slot of the per-username key; `false` when the
-    /// budget is already exhausted (nothing is consumed on a refusal).
+    /// Consumes one slot of the per-address budget only — the `me` query
+    /// throttle (R6-W-9): the endpoint is Public and sessionless, so a
+    /// probe flood is bounded exactly like the sign-in surface's address
+    /// budget, without the username dimension (there is none) and without
+    /// any refund — the query itself is what the budget counts, so a
+    /// frequency cap is the honest record. The tokens of these entries are
+    /// minted by the same map, so their refund semantics — never used on
+    /// this path — would be exact all the same.
+    fn reserve_ip(&self, ip: &str, now: Instant, limit: usize) -> bool {
+        Self::reserve_ip_key(&self.by_ip, ip, now, limit).is_some()
+    }
+
+    /// Consumes one budget slot of the per-username key; `None` (and no
+    /// consumption) when the budget is already exhausted.
     ///
     /// W3S-4: only the entries recorded from the *presenting* address count
     /// toward the limit, so a username cannot be locked out by failures
@@ -1160,46 +1245,59 @@ impl LoginRateLimiter {
         ip: &str,
         now: Instant,
         limit: usize,
-    ) -> bool {
+    ) -> Option<u64> {
         let Ok(mut guard) = bucket.lock() else {
-            return false;
+            return None;
         };
+        // The token is minted before the bucket borrow; a refused
+        // reservation wastes one counter value, which is harmless — only
+        // uniqueness matters, and a monotonic counter can never repeat.
+        let token = guard.next_token;
+        guard.next_token += 1;
         let failures = Self::bucket(&mut guard, key);
         Self::prune_front(failures, now);
-        let reserved = failures
+        if failures
             .iter()
-            .filter(|(_, entry_ip)| entry_ip == ip)
+            .filter(|(_, entry_ip, _)| entry_ip == ip)
             .count()
-            < limit;
-        if reserved {
-            failures.push_back((now, ip.to_owned()));
+            < limit
+        {
+            failures.push_back((now, ip.to_owned(), token));
+            Some(token)
+        } else {
+            None
         }
-        reserved
     }
 
-    /// Consumes one budget slot of the per-address key; `false` when the
-    /// budget is already exhausted.
+    /// Consumes one budget slot of the per-address key; `None` (and no
+    /// consumption) when the budget is already exhausted.
     fn reserve_ip_key(
         bucket: &Arc<Mutex<BucketMap>>,
         key: &str,
         now: Instant,
         limit: usize,
-    ) -> bool {
+    ) -> Option<u64> {
         let Ok(mut guard) = bucket.lock() else {
-            return false;
+            return None;
         };
+        let token = guard.next_token;
+        guard.next_token += 1;
         let failures = Self::bucket(&mut guard, key);
         Self::prune_front(failures, now);
-        let reserved = failures.len() < limit;
-        if reserved {
-            failures.push_back((now, key.to_owned()));
+        if failures.len() < limit {
+            failures.push_back((now, key.to_owned(), token));
+            Some(token)
+        } else {
+            None
         }
-        reserved
     }
 
     /// Returns the bucket of one key, creating it with the insert
     /// bookkeeping that bounds the map (N3).
-    fn bucket<'a>(buckets: &'a mut BucketMap, key: &str) -> &'a mut VecDeque<(Instant, String)> {
+    fn bucket<'a>(
+        buckets: &'a mut BucketMap,
+        key: &str,
+    ) -> &'a mut VecDeque<(Instant, String, u64)> {
         match buckets.buckets.entry(key.to_owned()) {
             Entry::Vacant(entry) => {
                 buckets.inserts_since_prune += 1;
@@ -1212,10 +1310,10 @@ impl LoginRateLimiter {
     /// Pops every entry that has left the window from the front of one
     /// bucket. Entries are pushed in non-decreasing time order, so the
     /// front is always the oldest.
-    fn prune_front(failures: &mut VecDeque<(Instant, String)>, now: Instant) {
+    fn prune_front(failures: &mut VecDeque<(Instant, String, u64)>, now: Instant) {
         while failures
             .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) >= RATE_WINDOW)
+            .is_some_and(|(at, _, _)| now.duration_since(*at) >= RATE_WINDOW)
         {
             failures.pop_front();
         }
@@ -1231,33 +1329,35 @@ impl LoginRateLimiter {
         }
     }
 
-    /// Releases the newest reserved slot of one key that the presenting
-    /// address recorded; a no-op when the key holds no entry of the
-    /// address.
+    /// Releases the entry of one key that a reservation token names — the
+    /// refunding attempt's own entry, exactly (R6-C-5); a no-op when the
+    /// entry is gone (the reservation was already refunded, or its entry
+    /// left the window and was reclaimed).
     ///
-    /// In the per-username map every entry carries the address that
-    /// recorded it, so the address-matched pop removes exactly the slot of
-    /// the refunding attempt: under multi-IP interleaving the newest entry
-    /// of the bucket may belong to another address's in-flight attempt,
-    /// and popping it would free the wrong address's slot while the
-    /// refunding address's reservation stayed as a phantom (V4R-5). Entries
-    /// of the same address are interchangeable for the per-address count —
-    /// when the newest same-address entry belongs to another in-flight
-    /// attempt of the same address, removing it keeps the address's budget
-    /// exact. In the per-address map every entry carries the key itself, so
-    /// the match is identical to popping the newest entry.
+    /// The token was minted by the same map on the reservation, so it can
+    /// name only the entry that reservation recorded — under multi-IP and
+    /// same-address interleaving alike, the removal never touches another
+    /// attempt's slot, and an entry never outlives its own reservation
+    /// under a foreign identity (the identity swap the old
+    /// newest-same-address pop could produce — which only ever shifted
+    /// expiry timing, never a count verdict — cannot happen). In the
+    /// per-address map every entry carries the key itself, so the match is
+    /// equally exact there.
     ///
-    /// The `rposition` scan is O(bucket length): the 15-minute window
+    /// The `position` scan is O(bucket length): the 15-minute window
     /// and the per-window budget (≤20) bound the bucket, and the
     /// limiter's own gating bounds the refund frequency — bounded cost,
     /// no behavioral impact.
-    fn refund_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, ip: &str) {
+    fn refund_key_by_token(bucket: &Arc<Mutex<BucketMap>>, key: &str, token: u64) {
         if let Ok(mut guard) = bucket.lock() {
             let buckets = &mut *guard;
             let Some(failures) = buckets.buckets.get_mut(key) else {
                 return;
             };
-            if let Some(index) = failures.iter().rposition(|(_, entry_ip)| entry_ip == ip) {
+            if let Some(index) = failures
+                .iter()
+                .position(|(_, _, entry_token)| *entry_token == token)
+            {
                 failures.remove(index);
             }
         }
@@ -1267,7 +1367,7 @@ impl LoginRateLimiter {
     /// [`BUCKET_PRUNE_THRESHOLD`] buckets since the last one. Only vacant
     /// inserts can grow the map, so only they are counted (N3).
     fn prune_if_due(
-        buckets: &mut HashMap<String, VecDeque<(Instant, String)>>,
+        buckets: &mut HashMap<String, VecDeque<(Instant, String, u64)>>,
         inserts_since_prune: &mut usize,
         now: Instant,
     ) {
@@ -1282,7 +1382,10 @@ impl LoginRateLimiter {
     /// applies the same expiry rule as the access path, so a bucket is
     /// reclaimed only when the next access would empty it anyway, and the
     /// limit verdicts are untouched.
-    fn prune_expired(buckets: &mut HashMap<String, VecDeque<(Instant, String)>>, now: Instant) {
+    fn prune_expired(
+        buckets: &mut HashMap<String, VecDeque<(Instant, String, u64)>>,
+        now: Instant,
+    ) {
         buckets.retain(|_, failures| {
             Self::prune_front(failures, now);
             !failures.is_empty()
@@ -1291,23 +1394,34 @@ impl LoginRateLimiter {
 }
 
 /// Bounds a presented username to the [`RATE_LIMIT_USERNAME_CHARS`]-long
-/// bucket key.
+/// bucket key: the normalized projection of the wire value.
 ///
 /// The sign-in surface keys the per-username bucket on the *presented*
 /// username — before validation, so invalid-name attempts still consume the
 /// budget. The wire value is attacker-controlled and only bounded by the
 /// request body limit, so the raw string must never reach the bucket map:
-/// the key is the first
+/// the key is the projection trimmed of leading and trailing whitespace,
+/// lowercased, and truncated to the first
 /// [`MAX_PRINCIPAL_NAME_CHARS`](rutilus_domain::MAX_PRINCIPAL_NAME_CHARS)
-/// characters. The periodic pruning (N3) bounds the *number* of buckets;
-/// this bound keeps each key itself bounded, and both are needed. The
-/// borrow is returned when the value is already within the bound, so the
-/// common (valid-name) path allocates nothing.
+/// characters (R6-S-9). The normalization keeps the variant spellings of
+/// one name — `Admin`, ` ADMIN `, `admin` — in one shared bucket, so
+/// retyping a name with different case or padding cannot draw from a fresh
+/// budget for every attempt; the truncation can only share buckets between
+/// invalid names, never tighten a legitimate principal's budget. The
+/// periodic pruning (N3) bounds the *number* of buckets; this bound keeps
+/// each key itself bounded, and both are needed. The borrow is returned
+/// when the value is already the canonical projection within the bound, so
+/// the common (valid-name) path allocates nothing.
 fn bounded_username_key(username: &str) -> std::borrow::Cow<'_, str> {
-    if username.chars().count() <= RATE_LIMIT_USERNAME_CHARS {
+    let trimmed = username.trim();
+    let within_bound = trimmed.chars().count() <= RATE_LIMIT_USERNAME_CHARS;
+    let already_canonical = trimmed.len() == username.len()
+        && !trimmed.chars().any(|c| c.to_lowercase().next() != Some(c));
+    if within_bound && already_canonical {
         std::borrow::Cow::Borrowed(username)
     } else {
-        std::borrow::Cow::Owned(username.chars().take(RATE_LIMIT_USERNAME_CHARS).collect())
+        let normalized = trimmed.to_lowercase();
+        std::borrow::Cow::Owned(normalized.chars().take(RATE_LIMIT_USERNAME_CHARS).collect())
     }
 }
 
@@ -1379,11 +1493,19 @@ where
             // extends the session — the countdown continues while it is in
             // use. The presenting token is re-issued unchanged — the row
             // stores only its hash.
-            let secure = is_https(&uri, &headers);
-            response.headers_mut().append(
-                SET_COOKIE,
-                session_cookie(presented_token, session.expires_at(), secure),
-            );
+            //
+            // A handler that already answered the session cookie — the
+            // logout and password-change paths, which clear it with
+            // `Max-Age=0` — is never re-issued over: appending a second
+            // `Set-Cookie` would leave the browser with both the clear and
+            // a fresh session cookie, and the fresh one would win (R6-S-2).
+            if response.headers().get(SET_COOKIE).is_none() {
+                let secure = is_https(&uri, &headers);
+                response.headers_mut().append(
+                    SET_COOKIE,
+                    session_cookie(presented_token, session.expires_at(), secure),
+                );
+            }
             response
         }
     }
@@ -1557,9 +1679,20 @@ where
 }
 
 /// The client address of one request, for rate limiting.
+///
+/// The address is normalized (R6-W-4): an IPv4-mapped IPv6 address —
+/// `::ffff:192.0.2.1`, the form dual-stack kernels present for a v4 peer —
+/// is mapped back to its v4 string, so the same client cannot split its
+/// rate-limit budget across two spellings of the same address. A pure v6
+/// address keeps its own string.
 fn request_ip(connect_info: &MaybeClientAddr) -> String {
     match connect_info.0 {
-        Some(address) => address.ip().to_string(),
+        Some(address) => match address.ip() {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+        },
         None => "unknown".to_owned(),
     }
 }
@@ -1729,7 +1862,7 @@ where
     // a stale check-then-act `allows` anymore. A request cancelled while
     // awaiting keeps its reservation until the window slides — the
     // fail-closed choice for a budget, and self-inflicted at worst.
-    if !state.auth.rate_limiter.reserve(username, &ip, rate_now) {
+    let Some(reservation) = state.auth.rate_limiter.reserve(username, &ip, rate_now) else {
         // B2 (security batch): a limiter refusal writes no audit event.
         // §16.3 audits login *outcomes* — attempts that ran; a request the
         // limiter refused before any verification never attempted one, and
@@ -1743,7 +1876,7 @@ where
             StatusCode::TOO_MANY_REQUESTS,
             "too many sign-in attempts; try again later".to_owned(),
         );
-    }
+    };
 
     let Ok(name) = PrincipalName::parse(username) else {
         // The reservation already consumed the rate-limit budget (S3-3); the
@@ -1861,7 +1994,7 @@ where
     // The password (and TOTP) verification succeeded: release the reserved
     // budget slots so the success never counts against the 15-minute window
     // (S3-3). Every failure branch above kept its reservation instead.
-    state.auth.rate_limiter.refund(username, &ip);
+    state.auth.rate_limiter.refund(username, &ip, reservation);
     let Ok(tokens) = state.services.issue_tokens() else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -1979,11 +2112,12 @@ where
     // before any store access or derivation; a success refunds below, and
     // every failure keeps its slots, so a flood of claims is capped at
     // the window budget before the one-time code is even looked up.
-    if !state
-        .auth
-        .bootstrap_limiter
-        .reserve(BOOTSTRAP_PRINCIPAL_NAME, &ip, rate_now)
-    {
+    let Some(reservation) =
+        state
+            .auth
+            .bootstrap_limiter
+            .reserve(BOOTSTRAP_PRINCIPAL_NAME, &ip, rate_now)
+    else {
         // B2 (security batch): a limiter refusal writes no audit event —
         // the 429 is the record, exactly like the sign-in surface — so a
         // flood of refused claims never grows the audit table nor
@@ -1992,7 +2126,7 @@ where
             StatusCode::TOO_MANY_REQUESTS,
             "too many bootstrap attempts; try again later".to_owned(),
         );
-    }
+    };
     let Ok(admin_name) = PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -2003,6 +2137,11 @@ where
         .ok()
         .flatten()
     else {
+        // R6-S-8: the subject lookup itself failed — the claim cannot name
+        // a principal, exactly like the unknown-username sign-in branch, so
+        // the failure is recorded with no principal (the login-failure
+        // shape) instead of falling through to the 401 silently.
+        record_login_failure(&state, None, now).await;
         return json_error(StatusCode::UNAUTHORIZED, "bootstrap failed".to_owned());
     };
     let code_hash = state.services.hash_bootstrap_code(request.code());
@@ -2101,7 +2240,7 @@ where
     state
         .auth
         .bootstrap_limiter
-        .refund(BOOTSTRAP_PRINCIPAL_NAME, &ip);
+        .refund(BOOTSTRAP_PRINCIPAL_NAME, &ip, reservation);
     record_login_success(&state, principal.id(), now).await;
     if authenticator.is_some() {
         record_management_event(
@@ -2188,10 +2327,11 @@ where
     // changes.
     let ip = request_ip(&connect_info);
     let rate_now = Instant::now();
-    if !state
+    if state
         .auth
         .password_change_limiter
         .reserve(&principal_id.to_string(), &ip, rate_now)
+        .is_none()
     {
         // B2 (security batch): a limiter refusal writes no audit event —
         // the 429 itself is the record, exactly like the sign-in surface.
@@ -2338,19 +2478,46 @@ where
 }
 
 /// The §16.2 session-state handler: the console's first-screen decision.
+///
+/// The endpoint is Public and sessionless, so it carries a lightweight
+/// per-address query throttle (R6-W-9): the same IP budget as the sign-in
+/// surface, in the dedicated [`AuthState::me_limiter`], consumed without
+/// any refund — the query itself is what the budget counts, so a probe
+/// flood answers 429 instead of running free store lookups. A page load
+/// is one query, so the cap sits above the sign-in failure budget.
 pub(crate) async fn me<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     headers: HeaderMap,
+    connect_info: MaybeClientAddr,
 ) -> Response
 where
     Services: AuditEventWriter + AuthServices,
     Time: Clock,
 {
+    let ip = request_ip(&connect_info);
+    if !state
+        .auth
+        .me_limiter
+        .reserve_ip(&ip, Instant::now(), ME_IP_QUERY_LIMIT)
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 itself is the record, exactly like the sign-in surface.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many session-state queries; try again later".to_owned(),
+        );
+    }
     let bootstrap_pending = state
         .services
         .has_unconsumed_bootstrap_code()
         .await
-        .unwrap_or(false);
+        .unwrap_or_else(|_| {
+            // R6-S-13: the pending-bootstrap fact is a first-run gate — a
+            // failed read must fail toward "claim pending", never toward
+            // "product already opened".
+            tracing::warn!("the pending-bootstrap read failed; answering claim-pending");
+            true
+        });
     let Some(cookie) = cookie_value(&headers, SESSION_COOKIE_NAME) else {
         return me_response(bootstrap_pending, None);
     };
@@ -2439,6 +2606,14 @@ where
 }
 
 /// Revokes one presented session (§16.2).
+///
+/// The outcome branches on the [`SessionRevocation`] the boundary
+/// classifies (R6-S-1): a missing session answers 404, an already-revoked
+/// session is the idempotent repeat of a settled revocation and answers
+/// success with its audit, and a storage-class failure is surfaced as an
+/// explicit 500 with a failed management event — never as the
+/// unknown-session 404, which would hide a revocation that did not
+/// happen.
 pub(crate) async fn revoke_session<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
@@ -2449,28 +2624,50 @@ where
     Time: Clock,
 {
     let session_id = SessionId::from_uuid(request.session_id());
-    if state
-        .services
-        .revoke_session(session_id, state.clock.now())
-        .await
-        .is_err()
-    {
-        return json_error(
+    let now = state.clock.now();
+    match state.services.revoke_session(session_id, now).await {
+        Ok(SessionRevocation::Revoked | SessionRevocation::AlreadyRevoked) => {
+            record_management_event(
+                &state,
+                context.actor(),
+                context.actor_principal_id(),
+                ProductPermission::ManageUsers,
+                AuditAction::ManageSessions,
+                true,
+                now,
+            )
+            .await;
+            json_ok(Json(LoginResponse::new(String::new())))
+        }
+        Ok(SessionRevocation::NotFound) => json_error(
             StatusCode::NOT_FOUND,
             "the session does not exist".to_owned(),
-        );
+        ),
+        Err(_) => {
+            // B3 (security batch) discipline: a revocation failure is not
+            // optional — a session left revocable past its deadline with no
+            // user or audit signal would be a silent control failure, so
+            // the storage-class error answers an explicit 500 and records a
+            // failed session-management outcome (the same shape as the
+            // password-change revocation failure).
+            record_outcome(
+                &state,
+                context.actor(),
+                context.actor_principal_id(),
+                ProductPermission::ManageUsers,
+                AuditAction::ManageSessions,
+                false,
+                Some((
+                    AuditFailure::SessionRevocationFailed,
+                    AuditFailureVerification::Inconclusive,
+                )),
+                None,
+                now,
+            )
+            .await;
+            uncached_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
-    record_management_event(
-        &state,
-        context.actor(),
-        context.actor_principal_id(),
-        ProductPermission::ManageUsers,
-        AuditAction::ManageSessions,
-        true,
-        state.clock.now(),
-    )
-    .await;
-    json_ok(Json(LoginResponse::new(String::new())))
 }
 
 /// The §16.1 user administration listing.
@@ -2569,10 +2766,15 @@ where
 /// Transitions one principal's enabled/disabled state (§16.1).
 ///
 /// The unknown-principal branch runs one dummy Argon2id derivation so its
-/// 404 costs the same as the sibling administration 404s (V4S-3).
+/// 404 costs the same as the sibling administration 404s (V4S-3). The
+/// path also consumes the credential-change budget (R6-S-10) — keyed on
+/// the acting administrator and presenting address exactly like the
+/// set-password path, with every call keeping its reserved slots — so a
+/// flood of unknown-id probes cannot run the derivation gate for free.
 pub(crate) async fn set_user_state<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
+    connect_info: MaybeClientAddr,
     AxumPath(principal_id): AxumPath<String>,
     Json(request): Json<SetPrincipalStateRequest>,
 ) -> Response
@@ -2581,12 +2783,38 @@ where
     Time: Clock,
 {
     let now = state.clock.now();
+    let Some(actor_principal_id) = context.actor_principal_id() else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "a valid session is required".to_owned(),
+        );
+    };
     let Ok(principal_id) = principal_id.parse::<PrincipalId>() else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "the principal id is invalid".to_owned(),
         );
     };
+    // R6-S-10: the reservation is the record, consumed before the lookup —
+    // the unknown-principal branch's dummy derivation is budgeted too,
+    // like every sign-in attempt — and it is never refunded: the paths
+    // that run the derivation gate are exactly what the budget accounts
+    // (V4R-2), so one administrator cannot probe the surface for free.
+    let ip = request_ip(&connect_info);
+    let rate_now = Instant::now();
+    if state
+        .auth
+        .password_change_limiter
+        .reserve(&actor_principal_id.to_string(), &ip, rate_now)
+        .is_none()
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 itself is the record, exactly like the sign-in surface.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many administration attempts; try again later".to_owned(),
+        );
+    }
     if state
         .services
         .find_principal(principal_id)
@@ -2643,10 +2871,15 @@ where
 /// Reassigns one principal's §16.1 role.
 ///
 /// The unknown-principal branch runs one dummy Argon2id derivation so its
-/// 404 costs the same as the sibling administration 404s (V4S-3).
+/// 404 costs the same as the sibling administration 404s (V4S-3). The
+/// path also consumes the credential-change budget (R6-S-10) — keyed on
+/// the acting administrator and presenting address exactly like the
+/// set-password path, with every call keeping its reserved slots — so a
+/// flood of unknown-id probes cannot run the derivation gate for free.
 pub(crate) async fn assign_user_role<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
+    connect_info: MaybeClientAddr,
     AxumPath(principal_id): AxumPath<String>,
     Json(request): Json<AssignRoleRequest>,
 ) -> Response
@@ -2655,12 +2888,38 @@ where
     Time: Clock,
 {
     let now = state.clock.now();
+    let Some(actor_principal_id) = context.actor_principal_id() else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "a valid session is required".to_owned(),
+        );
+    };
     let Ok(principal_id) = principal_id.parse::<PrincipalId>() else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "the principal id is invalid".to_owned(),
         );
     };
+    // R6-S-10: the reservation is the record, consumed before the lookup —
+    // the unknown-principal branch's dummy derivation is budgeted too,
+    // like every sign-in attempt — and it is never refunded: the paths
+    // that run the derivation gate are exactly what the budget accounts
+    // (V4R-2), so one administrator cannot probe the surface for free.
+    let ip = request_ip(&connect_info);
+    let rate_now = Instant::now();
+    if state
+        .auth
+        .password_change_limiter
+        .reserve(&actor_principal_id.to_string(), &ip, rate_now)
+        .is_none()
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 itself is the record, exactly like the sign-in surface.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many administration attempts; try again later".to_owned(),
+        );
+    }
     if state
         .services
         .find_principal(principal_id)
@@ -2775,10 +3034,11 @@ where
     // derivation it ran is the account (V4R-2), never refunded.
     let ip = request_ip(&connect_info);
     let rate_now = Instant::now();
-    if !state
+    if state
         .auth
         .password_change_limiter
         .reserve(&actor_principal_id.to_string(), &ip, rate_now)
+        .is_none()
     {
         // B2 (security batch): a limiter refusal writes no audit event —
         // the 429 itself is the record, exactly like the sign-in surface.
@@ -3874,6 +4134,36 @@ mod tests {
     }
 
     #[test]
+    fn request_ip_normalizes_ipv4_mapped_addresses() {
+        // R6-W-4: a dual-stack kernel presents a v4 peer as the IPv4-mapped
+        // v6 address `::ffff:192.0.2.1`, so the rate-limit key must map it
+        // back to the v4 string — otherwise the same client splits its
+        // budget across two spellings. A pure v6 address keeps its own
+        // string, and the sessionless fallback stays `unknown`.
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let mapped = MaybeClientAddr(Some(SocketAddr::new(
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201).into(),
+            443,
+        )));
+        assert_eq!(
+            request_ip(&mapped),
+            "192.0.2.1",
+            "the IPv4-mapped form must key on the v4 string"
+        );
+        let v6 = MaybeClientAddr(Some(SocketAddr::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+            443,
+        )));
+        assert_eq!(request_ip(&v6), "2001:db8::1");
+        let v4 = MaybeClientAddr(Some(SocketAddr::new(
+            Ipv4Addr::new(192, 0, 2, 9).into(),
+            443,
+        )));
+        assert_eq!(request_ip(&v4), "192.0.2.9");
+        assert_eq!(request_ip(&MaybeClientAddr(None)), "unknown");
+    }
+
+    #[test]
     fn rate_limiter_enforces_per_username_and_per_ip_budgets() {
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
@@ -3881,14 +4171,14 @@ mod tests {
         // Each reservation below is kept (the failure path never refunds),
         // so the budgets exhaust exactly like recorded failures.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.reserve("admin", "192.0.2.10", now));
+            assert!(limiter.reserve("admin", "192.0.2.10", now).is_some());
         }
         assert!(
-            !limiter.reserve("admin", "192.0.2.10", now),
+            limiter.reserve("admin", "192.0.2.10", now).is_none(),
             "the username budget must exhaust"
         );
         assert!(
-            limiter.reserve("operator", "192.0.2.10", now),
+            limiter.reserve("operator", "192.0.2.10", now).is_some(),
             "another username must keep its own budget"
         );
         // The address budget is independent and larger: one address can
@@ -3898,39 +4188,39 @@ mod tests {
         // fills the remaining budget.
         for index in 0..(IP_FAILURE_LIMIT - USERNAME_FAILURE_LIMIT - 1) {
             let username = format!("user-{index}");
-            assert!(limiter.reserve(&username, "192.0.2.10", now));
+            assert!(limiter.reserve(&username, "192.0.2.10", now).is_some());
         }
         assert!(
-            !limiter.reserve("user-last", "192.0.2.10", now),
+            limiter.reserve("user-last", "192.0.2.10", now).is_none(),
             "the address budget must exhaust too"
         );
-        assert!(
-            limiter.reserve("operator", "192.0.2.20", now),
-            "another address must keep its own budget"
-        );
+        let operator_at_20 = limiter
+            .reserve("operator", "192.0.2.20", now)
+            .unwrap_or_else(|| unreachable!("another address must keep its own budget"));
         // A successful verification returns its slot: refunding one kept
         // reservation reopens exactly one attempt of the presenting
         // address (W3S-4 — the earlier reservation from "192.0.2.10" never
         // counted against this address's budget), and the budget still
         // exhausts at the limit.
-        limiter.refund("operator", "192.0.2.20");
+        limiter.refund("operator", "192.0.2.20", operator_at_20);
         assert!(
-            limiter.reserve("operator", "192.0.2.20", now),
+            limiter.reserve("operator", "192.0.2.20", now).is_some(),
             "a refund must restore exactly one slot"
         );
         for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
-            assert!(limiter.reserve("operator", "192.0.2.20", now));
+            assert!(limiter.reserve("operator", "192.0.2.20", now).is_some());
         }
         assert!(
-            !limiter.reserve("operator", "192.0.2.20", now),
+            limiter.reserve("operator", "192.0.2.20", now).is_none(),
             "the refunded slot is consumed again — never more than one extra attempt"
         );
-        // Refunding an empty budget is a no-op, not a panic.
-        limiter.refund("fresh-user", "192.0.2.99");
+        // Refunding an already-refunded reservation is a no-op, not a
+        // panic — the token names an entry that is gone.
+        limiter.refund("operator", "192.0.2.20", operator_at_20);
 
         // The window slides: an attempt outside the window reopens.
         let later = now + RATE_WINDOW + StdDuration::from_secs(1);
-        assert!(limiter.reserve("admin", "192.0.2.10", later));
+        assert!(limiter.reserve("admin", "192.0.2.10", later).is_some());
     }
 
     #[test]
@@ -3944,30 +4234,46 @@ mod tests {
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
         for index in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.reserve("admin", &format!("192.0.2.{index}"), now));
+            assert!(
+                limiter
+                    .reserve("admin", &format!("192.0.2.{index}"), now)
+                    .is_some()
+            );
         }
         assert!(
-            limiter.reserve("admin", "192.0.2.100", now),
+            limiter.reserve("admin", "192.0.2.100", now).is_some(),
             "a fresh address must not inherit other addresses' failures"
         );
         // The single-address semantics: five failures from one address
-        // still exhaust that address's username budget...
+        // still exhaust that address's username budget — the last
+        // reservation before the exhaustion is kept for the refund below.
+        let mut kept = None;
         for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
-            assert!(limiter.reserve("admin", "192.0.2.100", now));
+            kept = Some(
+                limiter
+                    .reserve("admin", "192.0.2.100", now)
+                    .unwrap_or_else(|| {
+                        unreachable!("the same-address budget must still admit this attempt")
+                    }),
+            );
         }
         assert!(
-            !limiter.reserve("admin", "192.0.2.100", now),
+            limiter.reserve("admin", "192.0.2.100", now).is_none(),
             "the same address must still exhaust at the username limit"
         );
         // ...and a refund still reopens exactly one slot of the presenting
         // address.
-        limiter.refund("admin", "192.0.2.100");
+        limiter.refund(
+            "admin",
+            "192.0.2.100",
+            kept.unwrap_or_else(|| unreachable!("the loop above must have reserved")),
+        );
         assert!(
-            limiter.reserve("admin", "192.0.2.100", now),
+            limiter.reserve("admin", "192.0.2.100", now).is_some(),
             "a refund must restore exactly one slot of the presenting address"
         );
         assert!(
-            limiter.reserve("admin", "192.0.2.101", now),
+            limiter.reserve("admin", "192.0.2.101", now).is_some(),
             "another fresh address is still admitted"
         );
         // The per-address budget stays a global count per address: the
@@ -3976,10 +4282,10 @@ mod tests {
         // address can fill its own 20-slot budget across usernames.
         for index in 0..(IP_FAILURE_LIMIT - USERNAME_FAILURE_LIMIT) {
             let username = format!("user-{index}");
-            assert!(limiter.reserve(&username, "192.0.2.100", now));
+            assert!(limiter.reserve(&username, "192.0.2.100", now).is_some());
         }
         assert!(
-            !limiter.reserve("user-last", "192.0.2.100", now),
+            limiter.reserve("user-last", "192.0.2.100", now).is_none(),
             "the address budget must exhaust at the limit"
         );
     }
@@ -3992,25 +4298,46 @@ mod tests {
         // after the refunding one — the newest entry belongs to the other
         // address; popping it would free the other address's slot while
         // the refunding address's own reservation stayed, shifting the
-        // budget attribution between addresses.
+        // budget attribution between addresses. The token-keyed removal
+        // (R6-C-5) makes the own-entry guarantee structural: the refund
+        // removes the first address's token, never the second's entry.
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
 
         // Two in-flight attempts interleave: the first address reserves,
         // then the second, then the first succeeds and refunds.
-        assert!(limiter.reserve("admin", "192.0.2.1", now));
-        assert!(limiter.reserve("admin", "192.0.2.2", now));
-        limiter.refund("admin", "192.0.2.1");
+        let first = limiter
+            .reserve("admin", "192.0.2.1", now)
+            .unwrap_or_else(|| unreachable!("the first address must be admitted"));
+        let second = limiter
+            .reserve("admin", "192.0.2.2", now)
+            .unwrap_or_else(|| unreachable!("the second address must be admitted"));
+        limiter.refund("admin", "192.0.2.1", first);
+        // The surviving entry is the second attempt's own — its token is
+        // still the one its reservation recorded.
+        let surviving = limiter
+            .by_username
+            .lock()
+            .unwrap_or_else(|_| unreachable!("the rate limiter mutex must not be poisoned"))
+            .buckets
+            .get("admin")
+            .unwrap_or_else(|| unreachable!("the username bucket must exist"))
+            .front()
+            .unwrap_or_else(|| unreachable!("one entry must survive"))
+            .2;
+        assert_eq!(
+            surviving, second.username_token,
+            "the refund must remove the refunding attempt's own entry"
+        );
 
-        // The refund removed the first address's own reservation, so the
-        // second address's reservation still counts: its budget exhausts
-        // at the limit — under the newest-entry pop the second address
-        // would have one free slot and pass this refusal.
+        // The second address's reservation still counts: its budget
+        // exhausts at the limit — under the newest-entry pop the second
+        // address would have one free slot and pass this refusal.
         for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
-            assert!(limiter.reserve("admin", "192.0.2.2", now));
+            assert!(limiter.reserve("admin", "192.0.2.2", now).is_some());
         }
         assert!(
-            !limiter.reserve("admin", "192.0.2.2", now),
+            limiter.reserve("admin", "192.0.2.2", now).is_none(),
             "the interleaved reservation must still count toward its address's budget"
         );
 
@@ -4018,10 +4345,10 @@ mod tests {
         // budget starts clean again and exhausts at the limit like any
         // fresh address.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.reserve("admin", "192.0.2.1", now));
+            assert!(limiter.reserve("admin", "192.0.2.1", now).is_some());
         }
         assert!(
-            !limiter.reserve("admin", "192.0.2.1", now),
+            limiter.reserve("admin", "192.0.2.1", now).is_none(),
             "the refunding address's budget is untouched by the interleaving"
         );
     }
@@ -4048,23 +4375,25 @@ mod tests {
                 limiter.reserve("admin", "192.0.2.60", now)
             }));
         }
-        let mut granted = 0;
+        let mut granted = Vec::new();
         for handle in handles {
-            if handle.join().map_err(|_| "a reservation thread panicked")? {
-                granted += 1;
+            if let Some(reservation) = handle.join().map_err(|_| "a reservation thread panicked")? {
+                granted.push(reservation);
             }
         }
         assert_eq!(
-            granted, USERNAME_FAILURE_LIMIT,
+            granted.len(),
+            USERNAME_FAILURE_LIMIT,
             "the concurrent burst must be capped at the username budget"
         );
         // The kept slots stay consumed, and refunds reopen exactly as many
-        // as were given back.
-        assert!(!limiter.reserve("admin", "192.0.2.60", now));
-        for _ in 0..USERNAME_FAILURE_LIMIT {
-            limiter.refund("admin", "192.0.2.60");
+        // as were given back — each refund removes the entry its own
+        // reservation recorded.
+        assert!(limiter.reserve("admin", "192.0.2.60", now).is_none());
+        for reservation in granted {
+            limiter.refund("admin", "192.0.2.60", reservation);
         }
-        assert!(limiter.reserve("admin", "192.0.2.60", now));
+        assert!(limiter.reserve("admin", "192.0.2.60", now).is_some());
 
         // The address budget is atomic the same way: a burst of fresh
         // usernames from one address admits exactly the IP limit.
@@ -4081,7 +4410,11 @@ mod tests {
         }
         let mut granted = 0;
         for handle in handles {
-            if handle.join().map_err(|_| "a reservation thread panicked")? {
+            if handle
+                .join()
+                .map_err(|_| "a reservation thread panicked")?
+                .is_some()
+            {
                 granted += 1;
             }
         }
@@ -4090,6 +4423,140 @@ mod tests {
             "the concurrent burst must be capped at the address budget"
         );
         Ok(())
+    }
+
+    #[test]
+    fn rate_limiter_refund_conserves_the_count_under_concurrent_interleaving()
+    -> Result<(), Box<dyn Error>> {
+        // R6-C-5: reservations carry the identifiers of the entries they
+        // recorded, so concurrent successes and failures from one address
+        // interleave without any refund touching another attempt's entry:
+        // after every granted attempt either refunded (success) or kept
+        // its entry (failure), the bucket holds exactly the kept attempts'
+        // own entries — the count is conserved and each survivor carries
+        // its own identity, even though the refunds raced the failures.
+        const ATTEMPTS: usize = 6;
+        let limiter = Arc::new(LoginRateLimiter::new());
+        let now = Instant::now();
+        let barrier = Arc::new(std::sync::Barrier::new(ATTEMPTS));
+        let mut handles = Vec::new();
+        for index in 0..ATTEMPTS {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            let refunds = index % 2 == 0;
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let reservation = limiter.reserve("admin", "192.0.2.70", now);
+                // A success refunds inside the burst, while the other
+                // attempts are still in flight.
+                if refunds && let Some(reservation) = reservation {
+                    limiter.refund("admin", "192.0.2.70", reservation);
+                }
+                (reservation, refunds)
+            }));
+        }
+        let mut kept_tokens = Vec::new();
+        for handle in handles {
+            let (reservation, refunds) =
+                handle.join().map_err(|_| "a reservation thread panicked")?;
+            match (reservation, refunds) {
+                // A refused attempt never reserved, so nothing to keep or
+                // refund — the budget caps the burst at the limit. A
+                // refunded attempt likewise leaves nothing to keep: it was
+                // already refunded inside the thread, while the other
+                // attempts were still in flight.
+                (None, _) | (Some(_), true) => {}
+                (Some(reservation), false) => kept_tokens.push(reservation.username_token),
+            }
+        }
+        let buckets = limiter
+            .by_username
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        let bucket = buckets.buckets.get("admin").unwrap_or_else(|| {
+            unreachable!("the kept attempts must leave the username bucket behind")
+        });
+        assert_eq!(
+            bucket.len(),
+            kept_tokens.len(),
+            "the bucket must hold exactly the kept (failed) attempts' entries"
+        );
+        for (_, _, token) in bucket {
+            assert!(
+                kept_tokens.contains(token),
+                "every surviving entry must be a kept attempt's own"
+            );
+        }
+        let ip_buckets = limiter
+            .by_ip
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        let ip_bucket = ip_buckets.buckets.get("192.0.2.70").unwrap_or_else(|| {
+            unreachable!("the kept attempts must leave the address bucket behind")
+        });
+        assert_eq!(
+            ip_bucket.len(),
+            kept_tokens.len(),
+            "the address bucket must conserve the same count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limiter_refund_keeps_each_entries_own_expiry_timing() {
+        // R6-C-5: the token-keyed refund removes the refunding attempt's
+        // own entry, so a surviving failure's entry still carries its own
+        // recording time — the identity swap the old newest-same-address
+        // pop could produce (two in-flight attempts of one address, the
+        // earlier one refunding onto the later one's entry) would have
+        // shifted the surviving entry onto the earlier timestamp, letting
+        // the bucket open before the failure's own window had passed. The
+        // count is conserved either way; the *timing* is what pins the
+        // attribution.
+        let limiter = LoginRateLimiter::new();
+        let t0 = Instant::now();
+        // Attempt A reserves and succeeds (refund) while attempt B of the
+        // same address is still in flight; B then fails and keeps its slot.
+        let a = limiter
+            .reserve("admin", "192.0.2.5", t0)
+            .unwrap_or_else(|| unreachable!("the first attempt must be admitted"));
+        let _b = limiter
+            .reserve("admin", "192.0.2.5", t0 + StdDuration::from_secs(10))
+            .unwrap_or_else(|| unreachable!("the second attempt must be admitted"));
+        limiter.refund("admin", "192.0.2.5", a);
+        // Four further failures fill the username budget around B's entry.
+        for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
+            assert!(
+                limiter
+                    .reserve("admin", "192.0.2.5", t0 + StdDuration::from_secs(20))
+                    .is_some()
+            );
+        }
+        // The surviving entry is B's own, recorded at t0 + 10s: at t0 plus
+        // one window it is still inside its window, so the budget stays
+        // exhausted — under the swapped identity the survivor would have
+        // carried A's t0 timestamp, already outside the window, and the
+        // budget would have opened one entry early.
+        assert!(
+            limiter
+                .reserve("admin", "192.0.2.5", t0 + RATE_WINDOW)
+                .is_none(),
+            "the refund must not shift B's entry onto A's earlier timestamp"
+        );
+        // Once B's own window has passed, the bucket opens.
+        assert!(
+            limiter
+                .reserve(
+                    "admin",
+                    "192.0.2.5",
+                    t0 + RATE_WINDOW + StdDuration::from_secs(20)
+                )
+                .is_some(),
+            "B's entry expires on B's own clock"
+        );
+        // The refunded reservation itself cannot be refunded twice: the
+        // second refund is a no-op, exactly like a re-issued stale one.
+        limiter.refund("admin", "192.0.2.5", a);
     }
 
     #[test]
@@ -4104,23 +4571,29 @@ mod tests {
         // invalid variants and the exact valid-length prefix — exhausts one
         // shared bucket, and the map never stores the full wire string.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.reserve(&format!("{prefix}payload"), "192.0.2.30", now));
+            assert!(
+                limiter
+                    .reserve(&format!("{prefix}payload"), "192.0.2.30", now)
+                    .is_some()
+            );
         }
         assert!(
-            !limiter.reserve(&prefix, "192.0.2.30", now),
+            limiter.reserve(&prefix, "192.0.2.30", now).is_none(),
             "the long invalid forms must share the prefix's bucket"
         );
         assert!(
-            !limiter.reserve(&format!("{prefix}other"), "192.0.2.30", now),
+            limiter
+                .reserve(&format!("{prefix}other"), "192.0.2.30", now)
+                .is_none(),
             "a different long invalid form must share the same bounded bucket"
         );
         assert!(
-            limiter.reserve("bbbb", "192.0.2.30", now),
+            limiter.reserve("bbbb", "192.0.2.30", now).is_some(),
             "another prefix keeps its own bucket"
         );
 
-        // A long value shorter than the bound passes through unmodified —
-        // the borrow path must not truncate legitimate names.
+        // A value that is already the canonical projection passes through
+        // unmodified — the borrow path must not truncate legitimate names.
         assert_eq!(bounded_username_key("admin"), "admin");
         let long = format!("{prefix}tail");
         assert_eq!(
@@ -4129,6 +4602,53 @@ mod tests {
             "the bounded key is the first 64 characters"
         );
         assert_eq!(bounded_username_key(&long).len(), RATE_LIMIT_USERNAME_CHARS);
+    }
+
+    #[test]
+    fn rate_limiter_username_key_normalizes_case_and_whitespace() {
+        // R6-S-9: the per-username bucket key is the normalized projection
+        // of the presented name (trimmed, lowercased, then bounded), so the
+        // variant spellings of one name — case, padding — share one bucket
+        // and cannot each draw from a fresh budget, while a genuinely
+        // different name keeps its own.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            assert!(limiter.reserve("Admin", "192.0.2.10", now).is_some());
+        }
+        assert!(
+            limiter.reserve(" admin ", "192.0.2.10", now).is_none(),
+            "the padded spelling must share the trimmed bucket"
+        );
+        assert!(
+            limiter.reserve("ADMIN", "192.0.2.10", now).is_none(),
+            "the upper-case spelling must share the lowercased bucket"
+        );
+        // The same normalization holds per presenting address (W3S-4): the
+        // variant spellings from a second address share that address's
+        // bucket too.
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            assert!(limiter.reserve("ADMIN", "192.0.2.11", now).is_some());
+        }
+        assert!(
+            limiter.reserve("Admin", "192.0.2.11", now).is_none(),
+            "the variant spellings share one bucket per presenting address"
+        );
+        assert!(
+            limiter.reserve("operator", "192.0.2.10", now).is_some(),
+            "a genuinely different name keeps its own bucket"
+        );
+
+        // The projection itself: trim, lowercase, then the bounded prefix.
+        assert_eq!(bounded_username_key("  Admin  "), "admin");
+        assert_eq!(bounded_username_key("OPERATOR"), "operator");
+        assert_eq!(bounded_username_key("admin"), "admin");
+        let padded_long = format!("  {}TAIL  ", "a".repeat(RATE_LIMIT_USERNAME_CHARS));
+        assert_eq!(
+            bounded_username_key(&padded_long),
+            "a".repeat(RATE_LIMIT_USERNAME_CHARS),
+            "the padded long form is trimmed, lowercased, and truncated"
+        );
     }
 
     #[test]
@@ -4148,11 +4668,11 @@ mod tests {
         // and every attempt beyond the cap is compensated back to an empty
         // bucket that the sweep reclaims like any other expired one.
         for index in 0..BUCKET_PRUNE_THRESHOLD {
-            limiter.reserve(&format!("user-{index}"), "192.0.2.10", now);
+            let _ = limiter.reserve(&format!("user-{index}"), "192.0.2.10", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
-            limiter.reserve(&format!("user-{index}"), "192.0.2.10", after);
+            let _ = limiter.reserve(&format!("user-{index}"), "192.0.2.10", after);
         }
 
         let buckets = limiter
@@ -4209,13 +4729,13 @@ mod tests {
         // Fill the map to one insert below the sweep threshold with stale
         // buckets, then let the window pass.
         for index in 0..(BUCKET_PRUNE_THRESHOLD - 1) {
-            limiter.reserve(&format!("stale-{index}"), "192.0.2.20", now);
+            let _ = limiter.reserve(&format!("stale-{index}"), "192.0.2.20", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         // The first fresh insert trips the sweep while "admin" goes on to
         // hold a full budget at the sweep time.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            limiter.reserve("admin", "192.0.2.10", after);
+            let _ = limiter.reserve("admin", "192.0.2.10", after);
         }
 
         let buckets = limiter
@@ -4229,15 +4749,15 @@ mod tests {
         );
         drop(buckets);
         assert!(
-            !limiter.reserve("admin", "192.0.2.10", after),
+            limiter.reserve("admin", "192.0.2.10", after).is_none(),
             "the swept survivor must keep its exhausted budget"
         );
         assert!(
-            limiter.reserve("another", "192.0.2.10", after),
+            limiter.reserve("another", "192.0.2.10", after).is_some(),
             "a fresh username must still open a budget after the sweep"
         );
         assert!(
-            limiter.reserve("admin2", "192.0.2.99", after),
+            limiter.reserve("admin2", "192.0.2.99", after).is_some(),
             "a fresh address must still open a budget after the sweep"
         );
         Ok(())
@@ -4255,11 +4775,11 @@ mod tests {
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
         for index in 0..BUCKET_PRUNE_THRESHOLD {
-            limiter.reserve(&format!("user-{index}"), "192.0.2.40", now);
+            let _ = limiter.reserve(&format!("user-{index}"), "192.0.2.40", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
-            limiter.reserve(&format!("user-{index}"), "192.0.2.40", after);
+            let _ = limiter.reserve(&format!("user-{index}"), "192.0.2.40", after);
         }
         let buckets = limiter
             .by_username
@@ -4283,7 +4803,8 @@ mod tests {
         // Every entry is recorded at or after `start` and swept at `soon`
         // (one second later) or `later` (one second past the window), so
         // all ages are built from additions only. Each entry also records
-        // the presenting address (W3S-4), which the sweep ignores.
+        // the presenting address (W3S-4) and its reservation token
+        // (R6-C-5), both of which the sweep ignores.
         let start = Instant::now();
         let soon = start + StdDuration::from_secs(1);
         let later = start + RATE_WINDOW + StdDuration::from_secs(1);
@@ -4291,7 +4812,7 @@ mod tests {
         // The straddling bucket's fresh failure, recorded one second
         // inside the window at sweep time.
         let fresh = start + RATE_WINDOW;
-        let address = |ip: &str| ip.to_owned();
+        let entry = |at: Instant, ip: &str, token: u64| (at, ip.to_owned(), token);
 
         // The empty table sweeps to an empty table.
         let mut buckets = HashMap::new();
@@ -4304,14 +4825,14 @@ mod tests {
         let mut buckets = HashMap::new();
         buckets.insert(
             "alive".to_owned(),
-            VecDeque::from([(expired, address("192.0.2.1"))]),
+            VecDeque::from([entry(expired, "192.0.2.1", 0)]),
         );
         LoginRateLimiter::prune_expired(&mut buckets, soon);
         assert!(buckets.contains_key("alive"));
         let mut buckets = HashMap::new();
         buckets.insert(
             "dead".to_owned(),
-            VecDeque::from([(expired, address("192.0.2.1"))]),
+            VecDeque::from([entry(expired, "192.0.2.1", 1)]),
         );
         LoginRateLimiter::prune_expired(&mut buckets, later);
         assert!(buckets.is_empty());
@@ -4323,10 +4844,7 @@ mod tests {
         let mut buckets = HashMap::new();
         buckets.insert(
             "straddling".to_owned(),
-            VecDeque::from([
-                (expired, address("192.0.2.1")),
-                (fresh, address("192.0.2.1")),
-            ]),
+            VecDeque::from([entry(expired, "192.0.2.1", 2), entry(fresh, "192.0.2.1", 3)]),
         );
         LoginRateLimiter::prune_expired(&mut buckets, later);
         assert_eq!(
@@ -4337,15 +4855,15 @@ mod tests {
         assert!(
             buckets
                 .get("straddling")
-                .is_some_and(|failures| failures.contains(&(fresh, address("192.0.2.1"))))
+                .is_some_and(|failures| failures.contains(&entry(fresh, "192.0.2.1", 3)))
         );
 
         // An all-expired table returns to empty.
         let mut buckets = HashMap::new();
-        for index in 0..8 {
+        for index in 0u64..8 {
             buckets.insert(
                 format!("dead-{index}"),
-                VecDeque::from([(expired, address("192.0.2.1"))]),
+                VecDeque::from([entry(expired, "192.0.2.1", index)]),
             );
         }
         LoginRateLimiter::prune_expired(&mut buckets, later);
@@ -4488,6 +5006,10 @@ mod tests {
         /// Whether the session-revocation boundary succeeds (seeded per
         /// test: the revocation-failure audits need it to fail).
         revocation_ok: bool,
+        /// Whether the pending-bootstrap read boundary succeeds (R6-S-13:
+        /// the fail-closed `me` test flips it, so the read answers an
+        /// error and the handler must answer claim-pending).
+        bootstrap_read_ok: bool,
         /// Whether the derivation-gate refusal signal reports busy (the
         /// W3S-1 response-mapping tests flip it).
         derivation_gate_busy: bool,
@@ -4550,9 +5072,11 @@ mod tests {
                     credential: Some(credential),
                     bootstrap_code: Some(code),
                     // The seeded double serves the successful-change tests,
-                    // so the revocation boundary succeeds unless a test
-                    // flips the flag for the failure audits.
+                    // so the revocation and bootstrap-read boundaries
+                    // succeed unless a test flips the flags for the failure
+                    // paths.
                     revocation_ok: true,
+                    bootstrap_read_ok: true,
                     ..WorkerTestInner::default()
                 })),
             })
@@ -4597,8 +5121,8 @@ mod tests {
             &self,
             _session_id: SessionId,
             _at: OffsetDateTime,
-        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoundaryFuture<'_, Result<SessionRevocation, Self::Error>> {
+            Box::pin(async { Ok(SessionRevocation::Revoked) })
         }
         fn revoke_sessions_for_principal(
             &self,
@@ -4749,7 +5273,18 @@ mod tests {
             })
         }
         fn has_unconsumed_bootstrap_code(&self) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
-            Box::pin(async { Ok(false) })
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                if guard.bootstrap_read_ok {
+                    Ok(guard
+                        .bootstrap_code
+                        .as_ref()
+                        .is_some_and(|code| code.used_at().is_none()))
+                } else {
+                    Err(WorkerTestError)
+                }
+            })
         }
         fn consume_bootstrap_code<'a>(
             &'a self,
@@ -5092,6 +5627,50 @@ mod tests {
         assert_eq!(
             inner.hash_sync_calls, 0,
             "the bootstrap path must never call the synchronous boundary"
+        );
+        Ok(())
+    }
+
+    // ---- R6-S-13 pending-bootstrap read fail-closed ---------------------
+
+    #[tokio::test]
+    async fn me_answers_claim_pending_when_the_bootstrap_read_fails() -> Result<(), Box<dyn Error>>
+    {
+        use http_body_util::BodyExt as _;
+        // R6-S-13: the pending-bootstrap fact is a first-run gate — a
+        // failed read must fail toward "claim pending", never toward
+        // "product already opened". The double's read boundary answers an
+        // error, and the handler must still answer the me shape with
+        // `bootstrap_pending` true.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.bootstrap_read_ok = false;
+        }
+        let state = worker_test_state(services);
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/me",
+                axum::routing::get(me::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(state);
+
+        let answered = router
+            .oneshot(Request::get("/api/v1/auth/me").body(Body::empty())?)
+            .await?;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&answered.into_body().collect().await?.to_bytes())?;
+        assert_eq!(
+            body["bootstrap_pending"], true,
+            "a failed pending-bootstrap read must answer claim-pending"
+        );
+        assert_eq!(
+            body["authenticated"], false,
+            "the sessionless me shape is unchanged"
         );
         Ok(())
     }

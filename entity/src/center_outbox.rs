@@ -14,6 +14,15 @@ use sea_orm::entity::prelude::*;
 /// is the stable `OutboxEntryState` code (`pending` or `acked`); the
 /// migration CHECKs the allow-list and pins the ack pairing (`acked` rows
 /// carry `acked_at`).
+///
+/// `operation_id` is the plaintext §15.6 operation id of an offer row
+/// (R6-E-04) — `NULL` for the content rows of the site-side queue. The id is
+/// not a secret (it rides in the clear inside the envelope payload and on
+/// the wire), and the repository writes it from the same payload it stores,
+/// so the column always agrees with the decrypted envelope; the column lets
+/// the dispatch retry's fall-through reads, the V5E-1 reply-site fallback,
+/// and the ack-time pruning address one operation's rows without decrypting
+/// the whole queue.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "center_outbox")]
 pub struct Model {
@@ -26,6 +35,7 @@ pub struct Model {
     pub retry_count: i64,
     pub created_at: TimeDateTimeWithTimeZone,
     pub acked_at: Option<TimeDateTimeWithTimeZone>,
+    pub operation_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

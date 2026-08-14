@@ -191,6 +191,30 @@ impl SqliteStore {
                     CenterBindingRepositoryError::CodeMismatch
                 }
             })?;
+        // R6-C-2: the site certificate fingerprint is a one-to-one identity
+        // — the session admission resolves a presented certificate by it, so
+        // a second *bound* registration carrying the same fingerprint would
+        // split the cross-validation between two sites. The recheck runs
+        // inside the transaction, and the write gate serializes the binds,
+        // so a racing second bind of the same fingerprint is refused after
+        // the first commits; a revoked row (state `revoked`) never blocks
+        // the same site's re-bind.
+        if let Some(fingerprint) = site_cert_fingerprint {
+            let competing = center_binding::Entity::find()
+                .filter(center_binding::Column::SiteCertFingerprint.eq(fingerprint.to_string()))
+                .filter(center_binding::Column::State.eq("bound"))
+                .filter(center_binding::Column::Id.ne(binding_id.into_uuid()))
+                .one(&transaction)
+                .await
+                .map_err(CenterBindingRepositoryError::Database)?;
+            if competing.is_some() {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(CenterBindingRepositoryError::Database)?;
+                return Err(CenterBindingRepositoryError::FingerprintAlreadyBound { fingerprint });
+            }
+        }
         // The conditional update is the atomic guard: only a row still in
         // `pending` can be bound, so the re-read and the write can never
         // diverge even outside the write gate.
@@ -398,6 +422,10 @@ pub enum CenterBindingRepositoryError {
     CodeExpired,
     #[error("binding code does not match the outstanding code")]
     CodeMismatch,
+    #[error(
+        "the site certificate fingerprint {fingerprint} already belongs to a bound registration"
+    )]
+    FingerprintAlreadyBound { fingerprint: CertificateFingerprint },
     #[error("stored binding {binding_id} is invalid: {source}")]
     Corrupt {
         binding_id: CenterBindingId,
@@ -643,6 +671,81 @@ mod tests {
             .await?
             .ok_or("the expired binding must still be found by its code hash")?;
         assert_eq!(by_expired_hash.id(), expired.id());
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_a_fingerprint_already_bound_to_another_registration()
+    -> Result<(), Box<dyn Error>> {
+        // R6-C-2: the site certificate fingerprint is a one-to-one identity
+        // — a second *bound* registration carrying the same fingerprint
+        // would split the session admission's cross-validation between two
+        // sites. The bind rechecks inside the transaction, so the second
+        // bind of the same fingerprint is refused even though its own code
+        // is valid.
+        let (directory, store) = store_with_directory().await?;
+        let base = time::OffsetDateTime::now_utc();
+        let fingerprint = rutilus_domain::CertificateFingerprint::from_bytes([0x77; 32]);
+
+        // Site A binds with the fingerprint.
+        let site_a = site_instance(base);
+        store.create_instance(&site_a).await?;
+        let code_a = generate_binding_code()?;
+        let binding_a = pending_binding(&site_a, &code_a, base);
+        store.create_binding(&binding_a).await?;
+        store
+            .bind_with_code(
+                binding_a.id(),
+                &code_a,
+                Some(fingerprint),
+                base + Duration::MINUTE,
+            )
+            .await?;
+
+        // Site B presents its own valid code but the same fingerprint: the
+        // bind is refused, and B's row stays pending.
+        let site_b = site_instance(base + Duration::SECOND);
+        store.create_instance(&site_b).await?;
+        let code_b = generate_binding_code()?;
+        let binding_b = pending_binding(&site_b, &code_b, base + Duration::SECOND);
+        store.create_binding(&binding_b).await?;
+        assert!(matches!(
+            store
+                .bind_with_code(binding_b.id(), &code_b, Some(fingerprint), base + Duration::MINUTE)
+                .await,
+            Err(CenterBindingRepositoryError::FingerprintAlreadyBound { fingerprint: found })
+                if found == fingerprint
+        ));
+        let stored_b = store
+            .find_binding(binding_b.id())
+            .await?
+            .ok_or("binding B is missing")?;
+        assert_eq!(
+            stored_b.state(),
+            rutilus_domain::CenterBindingState::Pending,
+            "the refused bind must leave the row pending for a later bind"
+        );
+
+        // The re-bind path stays open: after A's revocation, the same
+        // fingerprint can bind a fresh registration again.
+        store.revoke_binding(binding_a.id()).await?;
+        let site_a_again = site_instance(base + Duration::seconds(2));
+        store.create_instance(&site_a_again).await?;
+        let code_again = generate_binding_code()?;
+        let binding_again =
+            pending_binding(&site_a_again, &code_again, base + Duration::seconds(2));
+        store.create_binding(&binding_again).await?;
+        store
+            .bind_with_code(
+                binding_again.id(),
+                &code_again,
+                Some(fingerprint),
+                base + Duration::seconds(3),
+            )
+            .await?;
 
         store.close().await?;
         drop(directory);

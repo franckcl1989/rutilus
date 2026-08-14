@@ -16,7 +16,17 @@
 //! Files are lexed with the same tokenizer as the migration bare-SQL gate
 //! (`migration/tests/bare_sql_gate.rs`): comments and doc comments are
 //! stripped, and plain, byte, and raw string literals are recognized as
-//! tokens, so none of the checks can be fooled by quoting.
+//! tokens, so none of the checks can be fooled by quoting. Plain and byte
+//! literals additionally have their escapes decoded — `\\`, `\'`, `\"`,
+//! `\n`, `\r`, `\t`, `\0`, `\xNN`, `\u{...}`, and the backslash-newline
+//! continuation — so the scanned content is the literal's *compiled* value
+//! (`"\x2D"` is a hyphen, `"\u{50}RIVATE KEY"` is `"PRIVATE KEY"`), while
+//! raw literals are taken verbatim. Byte char literals (`b'-'`, `b'_'`) are
+//! consumed whole — they used to misread as `b` plus a lifetime plus a
+//! stray quote whose char scan swallowed whole source regions — and the
+//! line counter catches up over multi-line raw strings and
+//! `\<newline>` continuations, so every reported `path:line` is the true
+//! source line.
 //!
 //! Rules:
 //!
@@ -35,12 +45,37 @@
 //!   — the bound identifier resolves (transitively, forward-only, and
 //!   scope-aware) to a `let`-bound literal.
 //!
+//!   Registered blind spots of the indirection rule: resolution stops at
+//!   `let`-bound names, so a chain through a `const`/`static` item
+//!   (`const S: &str = "..."; let password = S;` — the constant's own
+//!   binding is flagged only when the constant *name* is itself sensitive)
+//!   and a method-call value (`let password = config.secret();`) never
+//!   resolve, even when the constant or method returns the literal. Both
+//!   shapes would need semantic knowledge the token scan deliberately does
+//!   not use.
+//!
 //! The identifier set is `password`/`passwd`/`pwd`/`passphrase`/`secret`/
-//! `token`/`api_key`/`apikey`/`master_key`/`bootstrap_code` and their
-//! `*_<name>` compound forms (`session_token`, `account_password`, ...),
-//! matched case-insensitively. Identifiers that merely *name* non-secrets
-//! are excluded on purpose: `credential_id`/`endpoint_id` are addresses,
-//! `password_hash` is a digest.
+//! `token`/`api_key`/`apikey`/`master_key`/`bootstrap_code`/`binding_code`
+//! and their `*_<name>` compound forms (`session_token`,
+//! `account_password`, `admin_pwd`, `totp_passcode`, ...), matched
+//! case-insensitively; the unconditional compound suffixes are `_password`/
+//! `_passphrase`/`_secret`/`_token`/`_apikey`/`_api_key`/`_master_key`/
+//! `_bootstrap_code`/`_pwd`/`_passwd`/`_pw`/`_passcode`. Identifiers that
+//! merely *name* non-secrets are excluded on purpose:
+//! `credential_id`/`endpoint_id` are addresses, `password_hash` is a
+//! digest.
+//!
+//! The `_key`/`_pin` compound suffixes carry a registered false-positive
+//! tension: they are treated as secret names only when bound to a
+//! non-empty string literal (`DEFAULT_TOTP_KEY`, `primary_pin`), and [R1]
+//! fires on exactly that shape. A `_key`/`_pin` identifier bound to
+//! anything else (`let primary_key = lookup(id)`, a function definition, a
+//! log argument) is not flagged, and the suffixes are not part of the [R3]
+//! log set. The production constants whose `_key`-suffixed *names* hold
+//! file names or vendor namespace keys (`CENTER_KEY_FILE`, `DELTA_OEM_KEY`,
+//! the backup entry names) are re-registered below in
+//! `ALLOWED_CONSTANT_HITS`, each bound to path+line+name+value — the
+//! deny.toml TRIGGER-note discipline.
 //!
 //! Indistinguishable forms, registered on purpose: the gate flags only
 //! *bindings of sensitive identifiers*, because that is the shape that
@@ -62,16 +97,19 @@
 //! edge of the token scan, accepted in exchange for a purely mechanical
 //! check that needs no value heuristics.
 //!
-//! The [R2] fragment rule carries its registered false-positive edge: it is
-//! deliberately conservative, flagging on any `concat!`/`format!` fragment
-//! that carries a PEM feature word even when the assembled text is not a
-//! complete key block (`let password = concat!("-----BEGIN ", label)` is
-//! flagged although `label` may make it a certificate header). The rule
-//! applies only to *sensitive-identifier* bindings, so the same fragments
-//! under a non-sensitive name (`let pem = concat!("-----BEGIN ",
-//! "PRIVATE KEY-----")`, the label-driven writer pattern) stay unflagged —
-//! mechanically indistinguishable from benign construction, the same
-//! boundary as the [R1] wrapper rule.
+//! The [R2] fragment rule is name-independent: a `concat!`/`format!`
+//! binding whose direct fragments jointly carry a `BEGIN` fragment, an
+//! `END` fragment, and a `PRIVATE KEY` fragment is flagged as a PEM block
+//! split across fragments, whatever the binding's name (`let pem =
+//! concat!("-----BEGIN PRIVATE KEY-----", body, "-----END PRIVATE
+//! KEY-----")`). Writer shapes that carry only the BEGIN side
+//! (`concat!("-----BEGIN ", label)`, `format!("-----BEGIN {label}-----")`)
+//! hold no `END` and no `PRIVATE KEY` fragment and stay unflagged, as does
+//! a BEGIN+PRIVATE KEY pair without END. The registered false-positive
+//! edge is a fragment set that mentions the three words as prose
+//! (`concat!("BEGIN", "END", "PRIVATE KEY")`): the assembled text is no
+//! key block, but the mechanical check has no value heuristics and flags
+//! it — the same conservative boundary the rule has always kept.
 //!
 //! The one registered false-positive edge is block-local mutation: binding
 //! records live per block, so an assignment inside a nested block does not
@@ -83,18 +121,18 @@
 //! [R2] Embedded private-key material — a string literal containing a
 //! complete PEM block: a `-----BEGIN ... PRIVATE KEY-----` header and a
 //! `-----END ... PRIVATE KEY-----` footer in the same literal. A PEM block
-//! split across `concat!`/`format!` fragments is additionally caught by the
-//! conservative fragment rule: a sensitive identifier bound to
-//! `concat!`/`format!` whose fragment list contains any fragment carrying a
-//! PEM feature word (`BEGIN` or `PRIVATE KEY`) is flagged, whether or not
-//! the assembled text is a complete block. Prefix checks
+//! split across `concat!`/`format!` fragments is caught by the
+//! cross-fragment rule: a binding assembled from `concat!`/`format!` whose
+//! direct fragments jointly carry a `BEGIN` fragment, an `END` fragment,
+//! and a `PRIVATE KEY` fragment is flagged, whether or not the assembled
+//! text is a complete block and whatever the binding's name. Prefix checks
 //! (`pem.starts_with("-----BEGIN PRIVATE KEY-----")`) and label-driven PEM
 //! writers (`writeln!(pem, "-----BEGIN {label}-----")`) hold no block and are
 //! not flagged; test-scope fixture `PEM`s are exempt by rule (see below).
 //!
-//! [R3] Plaintext disclosure — `println!`/`eprintln!`/`dbg!` and
-//! `tracing::{trace,debug,info,warn,error}!` invocations whose message
-//! formats a secret-named identifier (`println!("{password}")`,
+//! [R3] Plaintext disclosure — `println!`/`eprintln!`/`print!`/`eprint!`/
+//! `dbg!` and `tracing::{trace,debug,info,warn,error}!` invocations whose
+//! message formats a secret-named identifier (`println!("{password}")`,
 //! `tracing::error!("{session_token:?}")`) or passes one as an argument
 //! (`println!("{}", password)`).
 //!
@@ -123,18 +161,20 @@
 //!   file outside the macro is still flagged; no value is allow-listed.
 //! - `ALLOWED_CONSTANT_HITS` below: the rare production constants whose
 //!   *names* read like secrets but whose values hold no secret material
-//!   (backup-package entry names). Each entry binds path+line+name+value, so
-//!   any drift fails the gate and forces re-review before the entry moves
-//!   (the deny.toml TRIGGER-note discipline).
+//!   (backup-package entry names, TLS file-name constants, a Redfish OEM
+//!   namespace key). Each entry binds path+line+name+value, so any drift
+//!   fails the gate and forces re-review before the entry moves (the
+//!   deny.toml TRIGGER-note discipline).
 //! - The bootstrap-code console print (`app/src/initialization_runtime.rs`):
 //!   the one-time claim code is *designed* to be printed once to the local
 //!   console (§16.2 first-run claim; the variable is `raw_code`, which no
 //!   identifier set names).
 //! - Span macros (`info_span!`, `#[instrument(...)]`) and
 //!   `format!`/`write!`/`writeln!`: spans never emit a message line and the
-//!   app's discipline is `skip_all`; the other three are not output surfaces
-//!   (and the redaction tests' `format!("{password:?}")` asserts the
-//!   `[REDACTED]` form, which must not trip the gate).
+//!   app's discipline is `skip_all`, and the other three are not output
+//!   surfaces (the redaction tests' `format!("{password:?}")` asserts the
+//!   `[REDACTED]` form, which must not trip the gate). `print!`/`eprint!`
+//!   are output surfaces and are covered above like `println!`/`eprintln!`.
 //! - Empty literals (`password = ""`): placeholder, not a secret.
 //! - Non-`.rs` files (docs, fixtures, lockfiles): outside the mechanical
 //!   scope; the release review's runtime half covers the surfaces.
@@ -199,21 +239,40 @@ fn tokenize(display_path: &str, source: &str) -> SourceTokens {
             }
             i = (i + 2).min(chars.len());
         } else if c == '"' {
-            let (content, next) = parse_plain_string(&chars, i + 1);
+            let (content, next, newlines) = parse_plain_string(&chars, i + 1);
             tokens.push(Token::Str { line, content });
+            // Real newlines inside a literal (a `\<newline>` continuation)
+            // are consumed by the parser, so the line counter catches up.
+            line += newlines;
             i = next;
         } else if c == 'r' && raw_string_start(&chars, i) {
-            let (content, next) = parse_raw_string(&chars, i);
+            let (content, next, newlines) = parse_raw_string(&chars, i);
             tokens.push(Token::RawStr { line, content });
+            // Multi-line raw strings carry real newlines past the main
+            // loop; without this the reported lines drift from the source.
+            line += newlines;
             i = next;
-        } else if c == 'b' && (chars.get(i + 1) == Some(&'"') || raw_string_start(&chars, i + 1)) {
+        } else if c == 'b'
+            && (chars.get(i + 1) == Some(&'"')
+                || chars.get(i + 1) == Some(&'\'')
+                || raw_string_start(&chars, i + 1))
+        {
             if chars.get(i + 1) == Some(&'"') {
-                let (content, next) = parse_plain_string(&chars, i + 2);
+                let (content, next, newlines) = parse_plain_string(&chars, i + 2);
                 tokens.push(Token::Str { line, content });
+                line += newlines;
                 i = next;
+            } else if chars.get(i + 1) == Some(&'\'') {
+                // A byte char literal (`b'-'`, `b'\n'`): without this branch
+                // the `b` lexes as an identifier and the quote misfires as a
+                // lifetime/char scan that can swallow lines of source
+                // (registered in the header: `b'-'`/`b'_'` used to derail
+                // the line counter and leak comment text into the tokens).
+                i = skip_char_or_lifetime(&chars, i + 1);
             } else {
-                let (content, next) = parse_raw_string(&chars, i + 1);
+                let (content, next, newlines) = parse_raw_string(&chars, i + 1);
                 tokens.push(Token::RawStr { line, content });
+                line += newlines;
                 i = next;
             }
         } else if c == '\'' {
@@ -241,28 +300,143 @@ fn tokenize(display_path: &str, source: &str) -> SourceTokens {
     }
 }
 
-/// Collects a plain `"..."` string, honoring `\` escapes and the
-/// backslash-newline continuation.
-fn parse_plain_string(chars: &[char], start: usize) -> (String, usize) {
+/// Decodes a `\xNN` escape whose `\` sits at `escape_index`: exactly two
+/// hex digits must follow, else `None` (the compiler would reject the
+/// literal anyway).
+fn decode_hex_escape(chars: &[char], escape_index: usize) -> Option<(char, usize)> {
+    let hi = chars.get(escape_index + 2)?.to_digit(16)?;
+    let lo = chars.get(escape_index + 3)?.to_digit(16)?;
+    let byte = u8::try_from(hi * 16 + lo).ok()?;
+    Some((char::from(byte), escape_index + 4))
+}
+
+/// Decodes a `\u{...}` escape whose `\` sits at `escape_index`: the braces
+/// must hold one to six hex digits, else `None` (the compiler would reject
+/// the literal anyway).
+fn decode_unicode_escape(chars: &[char], escape_index: usize) -> Option<(char, usize)> {
+    let open = escape_index + 2;
+    if chars.get(open) != Some(&'{') {
+        return None;
+    }
+    let close = open + 1 + chars[open + 1..].iter().position(|c| *c == '}')?;
+    if close - open - 1 > 6 {
+        return None;
+    }
+    let digits: String = chars[open + 1..close].iter().collect();
+    let value = u32::from_str_radix(&digits, 16).ok()?;
+    let decoded = char::from_u32(value)?;
+    Some((decoded, close + 1))
+}
+
+/// Collects a plain `"..."` string, decoding the escapes the compiler
+/// would (`\\`, `\'`, `\"`, `\n`, `\r`, `\t`, `\0`, `\xNN`, `\u{...}`, and
+/// the backslash-newline continuation) so the returned content is the
+/// literal's *compiled* value — a PEM block spelled with `\x2D` hyphens or
+/// `\u{50}` is the block the [R2] rule must see. Unknown escape sequences
+/// (which the compiler would reject) are passed through verbatim. The
+/// return value also carries the number of *real* newlines consumed (the
+/// `\<newline>` continuation), which the caller adds to its line counter.
+fn parse_plain_string(chars: &[char], start: usize) -> (String, usize, usize) {
     let mut content = String::new();
+    let mut newlines = 0usize;
     let mut i = start;
     while i < chars.len() {
         if chars[i] == '\\' {
-            content.push('\\');
-            if i + 1 < chars.len() {
-                content.push(chars[i + 1]);
-                i += 2;
-            } else {
+            let Some(&escaped) = chars.get(i + 1) else {
+                content.push('\\');
                 i += 1;
+                continue;
+            };
+            match escaped {
+                '\\' => {
+                    content.push('\\');
+                    i += 2;
+                }
+                '\'' => {
+                    content.push('\'');
+                    i += 2;
+                }
+                '"' => {
+                    content.push('"');
+                    i += 2;
+                }
+                'n' => {
+                    content.push('\n');
+                    i += 2;
+                }
+                'r' => {
+                    content.push('\r');
+                    i += 2;
+                }
+                't' => {
+                    content.push('\t');
+                    i += 2;
+                }
+                '0' => {
+                    content.push('\0');
+                    i += 2;
+                }
+                'x' => {
+                    // `\xNN`: exactly two hex digits.
+                    if let Some((decoded, next)) = decode_hex_escape(chars, i) {
+                        content.push(decoded);
+                        i = next;
+                    } else {
+                        content.push('\\');
+                        content.push('x');
+                        i += 2;
+                    }
+                }
+                'u' => {
+                    // `\u{...}`: up to six hex digits inside braces.
+                    if let Some((decoded, next)) = decode_unicode_escape(chars, i) {
+                        content.push(decoded);
+                        i = next;
+                    } else {
+                        content.push('\\');
+                        content.push('u');
+                        i += 2;
+                    }
+                }
+                '\n' => {
+                    // Backslash-newline continuation: the newline and the
+                    // next line's leading whitespace compile to nothing.
+                    newlines += 1;
+                    i += 2;
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        if chars[i] == '\n' {
+                            newlines += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                '\r' if chars.get(i + 2) == Some(&'\n') => {
+                    newlines += 1;
+                    i += 3;
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        if chars[i] == '\n' {
+                            newlines += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    content.push('\\');
+                    content.push(escaped);
+                    i += 2;
+                }
             }
         } else if chars[i] == '"' {
-            return (content, i + 1);
+            return (content, i + 1, newlines);
         } else {
             content.push(chars[i]);
+            if chars[i] == '\n' {
+                newlines += 1;
+            }
             i += 1;
         }
     }
-    (content, i)
+    (content, i, newlines)
 }
 
 /// Whether `chars[r_index]` starts a raw string: `r`, optional `#`s, `"`.
@@ -283,32 +457,48 @@ fn raw_string_closes_at(chars: &[char], i: usize, hashes: usize) -> bool {
 }
 
 /// Collects a raw string (`r"..."`, `r#"..."#`, ...) starting at
-/// `chars[r_index]`, returning its content and the index after the closing
-/// delimiter.
-fn parse_raw_string(chars: &[char], r_index: usize) -> (String, usize) {
+/// `chars[r_index]`, returning its content, the index after the closing
+/// delimiter, and the number of real newlines the content spans (raw
+/// strings are the main way a literal spans source lines).
+fn parse_raw_string(chars: &[char], r_index: usize) -> (String, usize, usize) {
     let mut i = r_index + 1;
     while chars.get(i) == Some(&'#') {
         i += 1;
     }
     let hashes = i - r_index - 1;
     let content_start = i + 1;
+    let mut newlines = 0usize;
     i = content_start;
     while i < chars.len() {
         if raw_string_closes_at(chars, i, hashes) {
-            return (chars[content_start..i].iter().collect(), i + 1 + hashes);
+            return (
+                chars[content_start..i].iter().collect(),
+                i + 1 + hashes,
+                newlines,
+            );
+        }
+        if chars[i] == '\n' {
+            newlines += 1;
         }
         i += 1;
     }
-    (String::new(), i)
+    (String::new(), i, newlines)
 }
 
 /// Advances past a `'...'` char literal or a lifetime/placeholder (`'a`,
 /// `'_`) token.
+///
+/// A lifetime is `'` immediately followed by `_` or an alphanumeric run —
+/// but only when the next char is *not* the closing quote: `'_'` is a char
+/// literal (the underscore character), not a lifetime, and misreading it as
+/// `'_` + a stray quote starts a char scan that runs to the next `'` in the
+/// file (registered in the header: `b'_'` and `'_'` used to swallow whole
+/// regions of source and derail the line counter).
 fn skip_char_or_lifetime(chars: &[char], start: usize) -> usize {
     let next = start + 1;
-    let is_lifetime = chars.get(next) == Some(&'_')
-        || (chars.get(next).is_some_and(char::is_ascii_alphanumeric)
-            && chars.get(next + 1) != Some(&'\''));
+    let is_lifetime = (chars.get(next) == Some(&'_')
+        || chars.get(next).is_some_and(char::is_ascii_alphanumeric))
+        && chars.get(next + 1) != Some(&'\'');
     if is_lifetime {
         return next;
     }
@@ -324,7 +514,7 @@ fn skip_char_or_lifetime(chars: &[char], start: usize) -> usize {
 }
 
 /// Identifiers that name a secret, matched case-insensitively.
-const SENSITIVE_IDENTIFIERS: [&str; 16] = [
+const SENSITIVE_IDENTIFIERS: [&str; 17] = [
     "password",
     "passwd",
     "pwd",
@@ -341,13 +531,14 @@ const SENSITIVE_IDENTIFIERS: [&str; 16] = [
     "apikey",
     "master_key",
     "bootstrap_code",
+    "binding_code",
 ];
 
 /// Compound identifier suffixes that make the identifier a secret
-/// (`account_password`, `totp_secret`, ...). `credential_id`/`endpoint_id`
-/// (`_id`), `password_hash` (`_hash`), and friends are deliberately absent:
-/// addresses and digests are not secrets.
-const SENSITIVE_IDENTIFIER_SUFFIXES: [&str; 8] = [
+/// (`account_password`, `totp_secret`, `admin_pwd`, ...).
+/// `credential_id`/`endpoint_id` (`_id`), `password_hash` (`_hash`), and
+/// friends are deliberately absent: addresses and digests are not secrets.
+const SENSITIVE_IDENTIFIER_SUFFIXES: [&str; 12] = [
     "_password",
     "_passphrase",
     "_secret",
@@ -356,7 +547,22 @@ const SENSITIVE_IDENTIFIER_SUFFIXES: [&str; 8] = [
     "_api_key",
     "_master_key",
     "_bootstrap_code",
+    "_pwd",
+    "_passwd",
+    "_pw",
+    "_passcode",
 ];
+
+/// Compound suffixes whose identifiers are secrets only when bound to a
+/// non-empty string literal (`_key`, `_pin`): `DEFAULT_TOTP_KEY` and
+/// `primary_pin` bound to literals are flagged, while `let primary_key =
+/// lookup(id)`, a `fn set_pin(...)` definition, and log arguments are not.
+/// The tension is registered in the gate header — the binding-to-literal
+/// shape is the gate's only signal, so a benign `_key`-named constant bound
+/// to a literal (`CENTER_KEY_FILE`, `DELTA_OEM_KEY`, the backup entry
+/// names) is flagged and re-registered in `ALLOWED_CONSTANT_HITS`. The
+/// suffixes are not part of the [R3] log set.
+const TENSION_IDENTIFIER_SUFFIXES: [&str; 2] = ["_key", "_pin"];
 
 fn is_sensitive_identifier(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -366,6 +572,16 @@ fn is_sensitive_identifier(name: &str) -> bool {
             .any(|suffix| lower.ends_with(suffix))
 }
 
+/// Whether the identifier ends in a `_key`/`_pin` compound suffix — the
+/// tension set, sensitive only in [R1] binding position (see
+/// `TENSION_IDENTIFIER_SUFFIXES`).
+fn is_tension_sensitive_identifier(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TENSION_IDENTIFIER_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
 /// The [R3] identifier set: [R1]'s set plus the bare `credential` object
 /// (logging a resolved credential), but still not `credential_id`/`_name`.
 fn is_sensitive_log_identifier(name: &str) -> bool {
@@ -373,19 +589,52 @@ fn is_sensitive_log_identifier(name: &str) -> bool {
 }
 
 /// Documented carve-outs: production constants whose names read like secrets
-/// but whose values are package-format identifiers, not secret material.
+/// but whose values are package-format identifiers, file names, or vendor
+/// namespace keys, not secret material.
 ///
 /// Each entry binds path + line + name + literal, so any drift (the constant
 /// moving, being renamed, or its value changing) fails the gate: re-read the
 /// constant, confirm it still holds no secret material, then update the
-/// entry — the deny.toml TRIGGER-note discipline. Verified 2026-08-12.
-const ALLOWED_CONSTANT_HITS: [(&str, usize, &str, &str); 2] = [
+/// entry — the deny.toml TRIGGER-note discipline. Verified 2026-08-12;
+/// extended 2026-08-14 when the `_key`/`_pin` tension suffixes started
+/// flagging `_key`-named constants bound to literals.
+const ALLOWED_CONSTANT_HITS: [(&str, usize, &str, &str); 7] = [
     ("app/src/backup.rs", 88, "ENTRY_MASTER_KEY", "master-key"),
     (
         "app/src/backup.rs",
         89,
         "ENTRY_SYSTEM_MASTER_KEY",
         "system-master-key",
+    ),
+    (
+        "app/src/backup.rs",
+        92,
+        "ENTRY_TLS_PRIVATE_KEY",
+        "tls-private-key",
+    ),
+    (
+        "app/src/center_acceptor.rs",
+        68,
+        "CENTER_KEY_FILE",
+        "center-key.pem",
+    ),
+    (
+        "app/src/center_ca.rs",
+        47,
+        "CENTER_CA_KEY_FILE",
+        "center-ca.key",
+    ),
+    (
+        "app/src/site_runtime.rs",
+        965,
+        "SITE_CLIENT_KEY_FILE",
+        "site-client.key",
+    ),
+    (
+        "infra-redfish/src/redfish_gateway.rs",
+        13476,
+        "DELTA_OEM_KEY",
+        "deltaenergysystems",
     ),
 ];
 
@@ -400,8 +649,9 @@ fn is_allowed_constant(display_path: &str, line: usize, name: &str, literal: &st
         })
 }
 
-/// The `[R3]` output macros.
-const OUTPUT_MACROS: [&str; 3] = ["println", "eprintln", "dbg"];
+/// The `[R3]` output macros: `print!`/`eprint!` are output surfaces just
+/// like `println!`/`eprintln!` (R6-S-5).
+const OUTPUT_MACROS: [&str; 5] = ["println", "eprintln", "print", "eprint", "dbg"];
 
 /// The `tracing` event levels whose messages [R3] inspects. Span macros
 /// (`info_span!`, `#[instrument(...)]`) are deliberately not included.
@@ -865,24 +1115,20 @@ fn wrapper_fragments(tokens: &[Token], first_arg: usize) -> Vec<String> {
     fragments
 }
 
-/// Whether one wrapper fragment carries PEM private-key material — the
-/// conservative [R2] fragment signal: a `BEGIN` or `PRIVATE KEY` feature
-/// word. The signal is deliberately broader than a complete block: a block
-/// split across `concat!`/`format!` fragments leaves each fragment without
-/// the full `BEGIN`+`END`+`PRIVATE KEY` triple, so the check must fire on
-/// the fragments' features, not on the assembled text.
-fn pem_fragment_marker(content: &str) -> bool {
-    content.contains("BEGIN") || content.contains("PRIVATE KEY")
-}
-
-/// The [R2] fragment violation of the sensitive-identifier binding at `i`
-/// (T1-4): a PEM block split across `concat!`/`format!` fragments is
-/// invisible to the single-literal [R2] check — no fragment holds the
-/// complete BEGIN+END+PRIVATE KEY triple. When the binding flows through
-/// `concat!`/`format!`, any direct fragment carrying a PEM feature word
-/// (`BEGIN` / `PRIVATE KEY`) is flagged conservatively, whether or not the
-/// assembled text is a complete block; a binding that does not flow through
-/// the wrappers, or whose fragments carry no marker, yields no violation.
+/// The [R2] fragment violation of a `concat!`/`format!` binding at `i`
+/// (T1-4): a PEM block split across fragments is invisible to the
+/// single-literal [R2] check — no fragment holds the complete
+/// BEGIN+END+PRIVATE KEY triple. When the binding flows through
+/// `concat!`/`format!`, the direct fragments are judged as a group: a
+/// fragment carrying `BEGIN`, a fragment carrying `END`, and a fragment
+/// carrying `PRIVATE KEY` must all be present for a violation, whatever the
+/// binding's name (R6-S-7 — the old rule gated on sensitive-identifier
+/// bindings and fired on any single feature fragment). Writer shapes that
+/// carry only the BEGIN side (`concat!("-----BEGIN ", label)`,
+/// `format!("-----BEGIN {label}-----")`) hold no `END` and no `PRIVATE KEY`
+/// fragment and stay unflagged; a binding that does not flow through the
+/// wrappers, or whose fragments do not complete the triple, yields no
+/// violation.
 fn pem_fragment_violation(
     tokens: &[Token],
     i: usize,
@@ -905,24 +1151,28 @@ fn pem_fragment_violation(
     if !is_concat_like {
         return None;
     }
-    if !wrapper_fragments(tokens, j + 3)
+    let fragments = wrapper_fragments(tokens, j + 3);
+    let has_begin = fragments.iter().any(|fragment| fragment.contains("BEGIN"));
+    let has_end = fragments.iter().any(|fragment| fragment.contains("END"));
+    let has_private_key = fragments
         .iter()
-        .any(|fragment| pem_fragment_marker(fragment))
-    {
+        .any(|fragment| fragment.contains("PRIVATE KEY"));
+    if !(has_begin && has_end && has_private_key) {
         return None;
     }
     Some(format!(
-        "{display_path}:{line}: [R2] the sensitive binding `{name}` is assembled from \
-         concat!/format! fragments carrying PEM private-key material"
+        "{display_path}:{line}: [R2] the binding `{name}` is assembled from \
+         concat!/format! fragments carrying a complete PEM private-key block \
+         (BEGIN + END + PRIVATE KEY)"
     ))
 }
 
-/// The [R1] + [R2] violations of the sensitive-identifier binding at `i`
-/// (the `name = value` assignment or `let`-binding statement): the
+/// The [R1] violations of the sensitive-identifier binding at `i` (the
+/// `name = value` assignment or `let`-binding statement): the
 /// hardcoded-secret hit when the value is a literal or a literal-resolving
-/// wrapper or identifier, and the [R2] fragment hit when a `concat!`/
-/// `format!` wrapper carries PEM material. `name`/`line` are the binding
-/// identifier's own token facts, so the violations point at the binding.
+/// wrapper or identifier. `name`/`line` are the binding identifier's own
+/// token facts, so the violations point at the binding. (The [R2] fragment
+/// rule is name-independent and is checked separately in `scan_file`.)
 fn sensitive_binding_violations(
     tokens: &[Token],
     i: usize,
@@ -950,8 +1200,6 @@ fn sensitive_binding_violations(
              non-empty string literal `{literal}`{suffix}",
         ));
     }
-    // [R2] fragment rule (T1-4), see pem_fragment_violation.
-    violations.extend(pem_fragment_violation(tokens, i, name, line, display_path));
     violations
 }
 
@@ -1191,15 +1439,25 @@ fn scan_file(source: &SourceTokens, initial_test: bool) -> Vec<String> {
                     {
                         scope.record_binding(name, literal_after(tokens, i + 1));
                     }
-                    if !scope.current() && !scope.in_catalog() && is_sensitive_identifier(name) {
-                        violations.extend(sensitive_binding_violations(
-                            tokens,
-                            i,
-                            name,
-                            *line,
-                            &scope,
-                            &source.display_path,
-                        ));
+                    if !scope.current() && !scope.in_catalog() {
+                        if is_sensitive_identifier(name) || is_tension_sensitive_identifier(name) {
+                            violations.extend(sensitive_binding_violations(
+                                tokens,
+                                i,
+                                name,
+                                *line,
+                                &scope,
+                                &source.display_path,
+                            ));
+                        }
+                        // [R2] fragment rule (T1-4): the cross-fragment
+                        // BEGIN+END+PRIVATE KEY triple flags whatever the
+                        // binding's name (R6-S-7).
+                        if let Some(violation) =
+                            pem_fragment_violation(tokens, i, name, *line, &source.display_path)
+                        {
+                            violations.push(violation);
+                        }
                     }
                     i += 1;
                 }
@@ -1585,6 +1843,60 @@ fn hardcoded_secret_rule_flags_production_assignments() {
     }
 }
 
+/// R6-S-3: the identifier-set gap. `binding_code` is a full identifier;
+/// `_pwd`/`_passwd`/`_pw`/`_passcode` are unconditional compound suffixes;
+/// `_key`/`_pin` are tension suffixes — flagged only when bound to a
+/// non-empty literal, never in the [R3] log set, never for non-literal
+/// values. The `_key`/`_pin` tension and the `ALLOWED_CONSTANT_HITS`
+/// re-registrations are documented in the gate header.
+#[test]
+fn binding_code_and_new_compound_suffixes_are_flagged() {
+    let flagged: &[&str] = &[
+        "let binding_code = \"B4CF-9D21\";",
+        "let admin_pwd = \"hunter2\";",
+        "let service_passwd = \"hunter2\";",
+        "let totp_pw = \"hunter2\";",
+        "let bootstrap_passcode = \"hunter2\";",
+        // The `_key`/`_pin` tension suffixes fire on the literal-binding
+        // shape only.
+        "let DEFAULT_TOTP_KEY = \"JBSWY3DPEHPK3PXP\";",
+        "let primary_pin = \"1234\";",
+    ];
+    for sample in flagged {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            !violations.is_empty(),
+            "sample `{sample}` must be flagged by [R1]"
+        );
+        assert!(
+            violations.join("\n").contains("[R1]"),
+            "sample `{sample}` must produce an [R1] violation, got:\n{}",
+            violations.join("\n")
+        );
+    }
+    let passing: &[&str] = &[
+        // The tension: `_key`/`_pin` names bound to anything but a
+        // non-empty literal stay unflagged.
+        "let primary_key = lookup(id);",
+        "let default_pin = config.pin();",
+        "fn set_pin(code: u8) {}",
+        "let primary_key = \"\";",
+        // `_key`/`_pin` are not part of the [R3] log set.
+        "println!(\"{}\", primary_key);",
+        // Unconditional suffixes still do not name non-secret values.
+        "let password_hash = \"hunter2\";",
+        "let credential_id = \"hunter2\";",
+    ];
+    for sample in passing {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            violations.is_empty(),
+            "sample `{sample}` must pass [R1], got:\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
 #[test]
 fn test_scope_exempts_fixtures_but_wasm_production_stays_covered() {
     let exempt: &[&str] = &[
@@ -1704,15 +2016,108 @@ fn private_key_rule_requires_a_complete_block() {
     }
 }
 
+/// R6-S-4: plain-string escapes are decoded before the checks run, so a PEM
+/// block spelled with escapes is the compiled text the [R2] rule sees —
+/// `\x2D` is a hyphen, `\u{50}` is `P`, and `\n` is a real newline. Byte
+/// strings share the same parser and are covered by it. A decoded header
+/// without its footer is still incomplete and stays unflagged.
+#[test]
+fn escaped_pem_literals_are_flagged_after_escape_decoding() {
+    let flagged: &[&str] = &[
+        // The header and footer hide `P` behind `\u{50}`.
+        "let pem = \"-----BEGIN \\u{50}RIVATE KEY-----\\nAAAA\\n-----END \\u{50}RIVATE KEY-----\\n\";",
+        // Every hyphen is `\x2D`.
+        "let pem = \"\\x2D\\x2D\\x2D\\x2D\\x2DBEGIN PRIVATE KEY\\x2D\\x2D\\x2D\\x2D\\x2D\\nAAAA\\n\\x2D\\x2D\\x2D\\x2D\\x2DEND PRIVATE KEY\\x2D\\x2D\\x2D\\x2D\\x2D\\n\";",
+        // A byte string spelling the same block.
+        "let pem = b\"-----BEGIN \\u{50}RIVATE KEY-----\\nAAAA\\n-----END \\u{50}RIVATE KEY-----\\n\";",
+    ];
+    for sample in flagged {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("[R2]")),
+            "sample `{sample}` must be flagged by [R2] after escape decoding, got:\n{}",
+            violations.join("\n")
+        );
+    }
+    let passing: &[&str] = &[
+        // Decoded, but only the header: not a complete block.
+        "let pem = \"-----BEGIN \\u{50}RIVATE KEY-----\";",
+        "let pem = \"\\x2D\\x2D\\x2D\\x2D\\x2DBEGIN PRIVATE KEY\";",
+    ];
+    for sample in passing {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.contains("[R2]")),
+            "an incomplete escaped PEM must pass [R2], got:\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+/// A multi-line literal (a raw string, or a `\<newline>` continuation) must
+/// not drift the reported lines of the tokens after it: the line counter
+/// catches up over the literal's real newlines, so a binding on the next
+/// source line reports that line, not a stale one.
+#[test]
+fn multi_line_literals_do_not_drift_reported_lines() {
+    let sample = "let pem = r\"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\";\nlet password = \"hunter2\";\n";
+    let violations = scan_source_sample(sample, false);
+    let r1: Vec<_> = violations.iter().filter(|v| v.contains("[R1]")).collect();
+    assert_eq!(r1.len(), 1, "got:\n{}", violations.join("\n"));
+    // The raw string spans lines 1-3, so the binding sits on source line 4.
+    assert!(
+        r1[0].contains(":4:"),
+        "the binding after the multi-line literal must report its true line, got: {}",
+        r1[0]
+    );
+}
+
+/// Byte char literals (`b'_'`, `b'-'`, `b'\n'`) and the `'_'` char literal
+/// must not derail the tokenizer: `b'_'` used to misread as identifier `b`
+/// plus lifetime `'_` plus a stray quote whose char scan swallowed whole
+/// regions of source (`redfish_gateway.rs:7435` was the first casualty)
+/// and, across newlines, drifted the reported lines by the swallowed span.
+#[test]
+fn byte_char_literals_do_not_derail_the_tokenizer() {
+    let samples: &[&str] = &[
+        "let x = b'_';\nlet password = \"hunter2\";\n",
+        "let x = b'-';\nlet password = \"hunter2\";\n",
+        "let x = '_';\nlet password = \"hunter2\";\n",
+        "let x = b'\\n';\nlet password = \"hunter2\";\n",
+    ];
+    for sample in samples {
+        let violations = scan_source_sample(sample, false);
+        let r1: Vec<_> = violations.iter().filter(|v| v.contains("[R1]")).collect();
+        assert_eq!(
+            r1.len(),
+            1,
+            "sample `{sample}` must flag exactly the binding, got:\n{}",
+            violations.join("\n")
+        );
+        assert!(
+            r1[0].contains(":2:"),
+            "sample `{sample}` must report the binding's true line, got: {}",
+            r1[0]
+        );
+    }
+}
+
 /// T1-4: a PEM block split across `concat!`/`format!` fragments used to
 /// escape [R2] — no single literal held the complete BEGIN+END+PRIVATE KEY
 /// triple, so each fragment passed the single-literal check. The fragment
-/// rule closes that: a sensitive binding assembled from `concat!`/`format!`
-/// is flagged when any fragment carries a PEM feature word (`BEGIN` or
-/// `PRIVATE KEY`). The check is deliberately conservative (a fragment marker
-/// flags even when the assembled text is no complete block) and applies only
-/// to sensitive bindings, so the label-driven writer pattern under a
-/// non-sensitive name stays unflagged — both registered in the gate header.
+/// rule closes that with a name-independent cross-fragment judgement
+/// (R6-S-7): the direct fragments of one `concat!`/`format!` invocation
+/// must jointly carry a `BEGIN` fragment, an `END` fragment, and a
+/// `PRIVATE KEY` fragment to flag — so a split block under a *non-sensitive*
+/// name (`let pem = concat!(...)`) is caught too, while a fragment set
+/// without the full triple (the label-driven writer's BEGIN side, a
+/// BEGIN+PRIVATE KEY pair without END) stays unflagged. The prose-word
+/// triple (`concat!("BEGIN", "END", "PRIVATE KEY")`) is the registered
+/// false-positive edge — all registered in the gate header.
 #[test]
 fn concat_format_fragments_with_pem_material_are_flagged() {
     let flagged: &[&str] = &[
@@ -1720,9 +2125,14 @@ fn concat_format_fragments_with_pem_material_are_flagged() {
         "let password = concat!(\"-----BEGIN PRIVATE KEY-----\\n\", \"AAAA\\n\", \"-----END PRIVATE KEY-----\\n\");",
         "let token = concat!(\"-----BEGIN RSA PRIVATE KEY-----\", \"AAAA\", \"-----END RSA PRIVATE KEY-----\");",
         "let secret = format!(\"{}{}{}\", \"-----BEGIN EC PRIVATE KEY-----\", \"AAAA\", \"-----END EC PRIVATE KEY-----\");",
-        // A single feature fragment suffices — conservative by design.
-        "let api_key = concat!(\"-----BEGIN \", \"PRIVATE KEY-----\");",
-        "let session_token = format!(\"x {} y\", \"-----BEGIN\");",
+        // The rule is name-independent: a non-sensitive binding assembled
+        // from the full BEGIN+END+PRIVATE KEY triple is still a split PEM
+        // block (R6-S-7).
+        "let pem = concat!(\"-----BEGIN PRIVATE KEY-----\", body, \"-----END PRIVATE KEY-----\");",
+        "let pem = format!(\"{}{}{}\", \"-----BEGIN PRIVATE KEY-----\", body, \"-----END PRIVATE KEY-----\");",
+        // The BEGIN + END pair whose END side carries PRIVATE KEY still
+        // completes the triple across two fragments — conservative.
+        "let pem = concat!(\"-----BEGIN \", \"-----END PRIVATE KEY-----\");",
     ];
     for sample in flagged {
         let violations = scan_source_sample(sample, false);
@@ -1738,10 +2148,14 @@ fn concat_format_fragments_with_pem_material_are_flagged() {
         // No fragment carries a PEM feature word.
         "let password = concat!(prefix, suffix);",
         "let password = format!(\"{}{}\", 1, 2);",
-        // The label-driven writer under a NON-sensitive name stays
-        // unflagged — the registered boundary of the fragment rule.
+        // The label-driven writer pattern holds only the BEGIN side: no
+        // END, no PRIVATE KEY — unflagged whatever the binding name.
         "let pem = concat!(\"-----BEGIN \", label, \"-----\");",
         "let header = format!(\"-----BEGIN {label}-----\");",
+        // A BEGIN + PRIVATE KEY pair without an END fragment is not a
+        // complete block (the old rule flagged this on the name alone).
+        "let api_key = concat!(\"-----BEGIN \", \"PRIVATE KEY-----\");",
+        "let session_token = format!(\"x {} y\", \"-----BEGIN\");",
         // A PEM marker in a comment or prose literal is not a fragment.
         "let password = concat!(\"a\", \"b\"); // -----BEGIN PRIVATE KEY-----",
     ];
@@ -1789,6 +2203,47 @@ fn output_macro_rule_flags_secret_identifiers() {
         "tracing::info!(endpoint_id = 7, \"a structured record\");",
         "println!(\"{{password}}\");",
         "println!(\"Enter the code to set the administrator password.\");",
+    ];
+    for sample in passing {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            violations.is_empty(),
+            "sample `{sample}` must pass [R3], got:\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+/// R6-S-5: `print!`/`eprint!` are output surfaces like `println!`/
+/// `eprintln!` — a secret-named format capture or argument in them is a
+/// plaintext disclosure.
+#[test]
+fn print_and_eprint_macros_are_output_surfaces() {
+    let flagged: &[(&str, &str)] = &[
+        ("print!(\"{}\", password);", "`password`"),
+        ("print!(\"{password}\");", "`password`"),
+        ("eprint!(\"{secret:?}\");", "`secret`"),
+        ("eprint!(\"{}\", session_token);", "`session_token`"),
+    ];
+    for (sample, needle) in flagged {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("[R3]")),
+            "sample `{sample}` must be flagged by [R3], got:\n{}",
+            violations.join("\n")
+        );
+        assert!(
+            violations.join("\n").contains(needle),
+            "sample `{sample}` must mention `{needle}`, got:\n{}",
+            violations.join("\n")
+        );
+    }
+    let passing: &[&str] = &[
+        "print!(\"progress: {count}\");",
+        "eprint!(\"failed to reach the center: {error}\");",
+        "print!(\"Rutilus bootstrap code: {raw_code}\");",
     ];
     for sample in passing {
         let violations = scan_source_sample(sample, false);

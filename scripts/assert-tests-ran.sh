@@ -15,8 +15,9 @@
 # (.github/workflows/ci.yml "Secret leak gate") and the migration gate
 # ("Migration test") had no assertion that their tests actually ran. The
 # pinned minimums live next to each gate in .github/workflows/ci.yml; they
-# were measured on master (2026-08-12 gate re-run, documented in
-# docs/release-readiness.md §五 门禁复跑: security 门禁 8, migration 38).
+# were measured on master (2026-08-12 gate re-run; re-measured 2026-08-13
+# wave-four V4I-3: security 门禁 10, migration 50 — documented in
+# docs/release-readiness.md §五 门禁复跑).
 #
 # NOTE: the min-passed case below keeps `[1-9]` as its own alternative —
 # the double-bracket glob `[1-9][0-9]*` alone rejects single-digit values
@@ -24,10 +25,19 @@
 # legitimate pins. Do not merge the three patterns back into two.
 #
 # Usage:
-#   scripts/assert-tests-ran.sh <min-passed> [cargo test args...]
+#   scripts/assert-tests-ran.sh <min-passed> [--expect-tests name1,name2,...] [cargo test args...]
 #
 # `cargo test` is implicit: the args are exactly what the gate step used to
 # pass to it (e.g. `--locked -p rutilus-security --test secret_leak_gate`).
+# `--expect-tests` (R6-W-7, 2026-08-14) adds a NAME-level assertion on top of
+# the count: every listed test name must appear in the run output as a
+# passed test (`test <name> ... ok`). This closes the count-only hole where
+# a suite is hollowed out but the floor is still met — the count pin is a
+# lower bound, so deleting a non-gate test file while keeping >= min passing
+# tests passes it; a name that is deleted, #[ignore]d, or cfg-emptied fails
+# regardless of the remaining count. A unit-test name inside a module is
+# matched by its bare fn name (`foo` matches `module::tests::foo`); expected
+# names must be plain identifiers [A-Za-z0-9_].
 #
 # The count is the sum of the `test result: ok. N passed; ...` lines libtest
 # prints per test binary (one per binary; doc-test harnesses included). A
@@ -36,8 +46,9 @@
 # `test result: ok.` line at all, or a sum below the pin — fails the
 # assertion.
 #
-# Exit codes: 0 = >= min-passed tests passed; 1 = fewer passed (or no
-# `test result` line seen); otherwise cargo's own exit code.
+# Exit codes: 0 = >= min-passed tests passed and every expected name ran;
+# 1 = fewer passed (or no `test result` line seen) or an expected name is
+# missing; otherwise cargo's own exit code.
 set -uo pipefail
 # (no `-e` by design: cargo's exit status is captured below so its output
 # can be echoed to the log before the step fails — an `-e` abort would
@@ -45,13 +56,31 @@ set -uo pipefail
 
 die() { echo "assert-tests-ran.sh: ERROR: $*" >&2; exit 1; }
 
-[ "$#" -ge 2 ] || die "usage: scripts/assert-tests-ran.sh <min-passed> [cargo test args...]"
+[ "$#" -ge 2 ] || die "usage: scripts/assert-tests-ran.sh <min-passed> [--expect-tests name1,name2,...] [cargo test args...]"
 min="$1"
 shift
 case "$min" in
     0 | [1-9] | [1-9][0-9]*) ;;
     *) die "min-passed must be a non-negative integer without a leading zero (bash arithmetic parses leading zeros as octal), got: $min" ;;
 esac
+
+# Split off --expect-tests <list>; everything else is a cargo test argument.
+expect=""
+args=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --expect-tests)
+            [ "$#" -ge 2 ] || die "--expect-tests requires a comma-separated test-name list"
+            expect="$2"
+            shift 2
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${args[@]}"
 
 out="$(cargo test "$@" 2>&1)"
 status=$?
@@ -65,4 +94,25 @@ passed="$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) pa
 if [ "$passed" -lt "$min" ]; then
     die "expected >= $min tests to pass, only $passed did — a test file was deleted, #[ignore]d, or cfg-emptied?"
 fi
-echo "assert-tests-ran.sh: $passed tests passed (pinned minimum: $min)"
+
+# Name-level assertion (R6-W-7): every expected name must appear in a
+# `test <name> ... ok` line. #[ignore]d tests print `... ignored` and do not
+# count as having run.
+if [ -n "$expect" ]; then
+    ran="$(printf '%s\n' "$out" | sed -n 's/^test \([^ ]*\) \.\.\. ok$/\1/p')"
+    missing=""
+    IFS=',' read -ra names <<< "$expect"
+    for name in "${names[@]}"; do
+        case "$name" in
+            '' | *[!A-Za-z0-9_]*) die "invalid expected test name '$name' — expected names must be plain identifiers [A-Za-z0-9_]" ;;
+        esac
+        if ! printf '%s\n' "$ran" | grep -qx "$name" && ! printf '%s\n' "$ran" | grep -qxE ".*::$name"; then
+            missing="$missing $name"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        die "expected tests did not run (deleted, #[ignore]d, or cfg-emptied?):$missing"
+    fi
+fi
+
+echo "assert-tests-ran.sh: $passed tests passed (pinned minimum: $min${expect:+, expected names all ran})"

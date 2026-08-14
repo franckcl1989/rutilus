@@ -259,20 +259,35 @@ fn skip_char_or_lifetime(chars: &[char], start: usize) -> usize {
 // Raw-SQL statement helpers.
 // ---------------------------------------------------------------------------
 
-/// The bare SQL identifier of one whitespace-delimited word: bracket/quote
-/// characters stripped, and everything from an opening `(` (a column list
-/// like `batch_operations(id)`) discarded.
+/// The bare SQL identifier of one whitespace-delimited word: surrounding
+/// whitespace trimmed, bracket/quote characters stripped, a trailing
+/// statement terminator (`;`) removed — a raw string may carry several
+/// statements, so the terminator must never stick to the identifier — and
+/// everything from an opening `(` (a column list like
+/// `batch_operations(id)`) discarded.
 fn sql_identifier(word: &str) -> &str {
     let word = word
+        .trim()
         .trim_start_matches(['[', '"', '`'])
-        .trim_end_matches([']', '"', '`']);
+        .trim_end_matches([']', '"', '`'])
+        .trim_end_matches(';');
     word.split('(').next().unwrap_or(word)
 }
 
 /// The tables a raw SQL string drops, in statement order: every `DROP TABLE`
 /// (optionally `IF EXISTS`) occurrence with the following identifier.
 fn drop_table_names(sql: &str) -> Vec<String> {
-    let words: Vec<&str> = sql.split_whitespace().collect();
+    // A raw string can carry several statements (`"DROP TABLE parents;
+    // DROP TABLE children"`), so every whitespace word is split at the `;`
+    // boundaries first — the statement terminator is not whitespace, and a
+    // terminator glued to the next keyword (`parents;DROP`) must not hide
+    // the second statement. Empty segments from a trailing terminator are
+    // dropped.
+    let words: Vec<&str> = sql
+        .split_whitespace()
+        .flat_map(|word| word.split(';'))
+        .filter(|word| !word.is_empty())
+        .collect();
     let mut drops = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -1179,6 +1194,102 @@ fn gate_checks_raw_sql_drop_order_in_down_body() -> Result<(), Box<dyn Error>> {
     assert!(
         violations.is_empty(),
         "raw child-first drops must pass, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// A two-table migration whose `down` drops both tables through ONE raw
+/// `execute_unprepared` string carrying the two statements separated by a
+/// semicolon, in the requested order.
+fn semicolon_drop_source(parent_first: bool) -> String {
+    let drops = if parent_first {
+        r#"connection.execute_unprepared("DROP TABLE parents; DROP TABLE children").await"#
+    } else {
+        r#"connection.execute_unprepared("DROP TABLE children; DROP TABLE parents").await"#
+    };
+    format!(
+        r#"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {{
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        manager
+            .create_table(
+                Table::create()
+                    .table(Parent::Table)
+                    .col(ColumnDef::new(Parent::Id).uuid().not_null().primary_key())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Child::Table)
+                    .col(ColumnDef::new(Child::ParentId).uuid().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Child::Table, Child::ParentId)
+                            .to(Parent::Table, Parent::Id)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }}
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        {drops}
+    }}
+}}
+
+#[derive(DeriveIden)]
+enum Parent {{
+    #[sea_orm(iden = "parents")]
+    Table,
+    Id,
+}}
+
+#[derive(DeriveIden)]
+enum Child {{
+    #[sea_orm(iden = "children")]
+    Table,
+    Id,
+    ParentId,
+}}
+"#
+    )
+}
+
+/// The semicolon blind spot (R6-D-1): a raw string carrying several `DROP
+/// TABLE` statements separated by `;` used to leave the terminator glued to
+/// the identifier (`parents;`), so the drop never matched its FK edge and
+/// the parent-first order passed silently. The statements must be split and
+/// checked in statement order — a parent-first pair inside one string is a
+/// violation exactly like the same pair in two calls.
+#[test]
+fn gate_checks_multi_statement_raw_drops_separated_by_semicolons() -> Result<(), Box<dyn Error>> {
+    let source = tokenize("synthetic_semicolon.rs", &semicolon_drop_source(true));
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations
+            .iter()
+            .any(|violation| { violation.contains("parents") && violation.contains("children") }),
+        "parent-first drops inside one semicolon-separated string must be rejected, got:\n{}",
+        violations.join("\n"),
+    );
+    let source = tokenize("synthetic_semicolon.rs", &semicolon_drop_source(false));
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations.is_empty(),
+        "child-first drops inside one semicolon-separated string must pass, got:\n{}",
         violations.join("\n"),
     );
     Ok(())

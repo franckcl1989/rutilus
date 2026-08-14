@@ -94,7 +94,7 @@ mod auth;
 
 pub use auth::{
     AuthContext, AuthGate, AuthPolicy, AuthServices, BOOTSTRAP_PRINCIPAL_NAME, IssuedSessionTokens,
-    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_NAME, SessionRevocation,
 };
 
 /// The HTTP body limit of one chunk request: the 4 MiB base64 protocol limit
@@ -158,6 +158,17 @@ pub trait AuditEventQuery: Send + Sync {
         &self,
         limit: NonZeroU64,
     ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>>;
+
+    /// Lists recent events with an explicit offset into the newest-first
+    /// history (E-11): `offset == 0` is the same page as
+    /// [`AuditEventQuery::list_recent_events`], while a positive offset
+    /// pages deeper history. The response shape is unchanged — the same
+    /// newest-first events, bounded by `limit`, never a paging envelope.
+    fn list_recent_events_with_offset(
+        &self,
+        limit: NonZeroU64,
+        offset: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>>;
 }
 
 impl<Query> AuditEventQuery for &Query
@@ -171,6 +182,14 @@ where
         limit: NonZeroU64,
     ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
         Query::list_recent_events(*self, limit)
+    }
+
+    fn list_recent_events_with_offset(
+        &self,
+        limit: NonZeroU64,
+        offset: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        Query::list_recent_events_with_offset(*self, limit, offset)
     }
 }
 
@@ -6546,6 +6565,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6567,6 +6587,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6589,6 +6610,7 @@ mod tests {
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6611,6 +6633,7 @@ mod tests {
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -9470,6 +9493,12 @@ mod tests {
         /// failed session revocation surfaces as an explicit error instead
         /// of being swallowed.
         revoke_sessions_fail: bool,
+        /// Whether the mock one-session `revoke_session` boundary answers a
+        /// storage-class failure (R6-S-1): `true` makes the route surface
+        /// the explicit 500 with its failed management event; `false` lets
+        /// the boundary classify the settled states from the in-memory
+        /// sessions (missing, already revoked, revoked).
+        revoke_session_fail: bool,
         /// The in-memory authentication state behind the §16.2 auth tests:
         /// the Open test routers never touch it (the auth boundary answers
         /// "nothing found"), while the guarded tests populate it through
@@ -9982,16 +10011,25 @@ mod tests {
             &self,
             session_id: SessionId,
             at: OffsetDateTime,
-        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        ) -> BoundaryFuture<'_, Result<SessionRevocation, Self::Error>> {
             let inner = Arc::clone(&self.auth_state.inner);
+            let fail = self.revoke_session_fail;
             Box::pin(async move {
+                if fail {
+                    return Err(MockWriteError);
+                }
                 let mut inner = inner.lock().map_err(|_| MockWriteError)?;
-                let session = inner
+                let Some(session) = inner
                     .sessions
                     .iter_mut()
                     .find(|session| session.id() == session_id)
-                    .ok_or(MockWriteError)?;
-                session.revoke(at).map_err(|_| MockWriteError)
+                else {
+                    return Ok(SessionRevocation::NotFound);
+                };
+                if session.revoke(at).is_err() {
+                    return Ok(SessionRevocation::AlreadyRevoked);
+                }
+                Ok(SessionRevocation::Revoked)
             })
         }
         fn revoke_sessions_for_principal(
@@ -10356,6 +10394,14 @@ mod tests {
         fn list_recent_events(
             &self,
             _limit: NonZeroU64,
+        ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_recent_events_with_offset(
+            &self,
+            _limit: NonZeroU64,
+            _offset: u64,
         ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
@@ -10925,6 +10971,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state,
             }),
@@ -10950,6 +10997,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state,
                 center_state,
             }),
@@ -11129,6 +11177,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state,
                 center_state: CenterTestState::default(),
             }),
@@ -11396,6 +11445,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: center.clone(),
             }),
@@ -11449,6 +11499,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: center.clone(),
             }),
@@ -11627,6 +11678,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: center.clone(),
             }),
@@ -11704,6 +11756,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: true,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: center.clone(),
             }),
@@ -11974,6 +12027,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: state.clone(),
                 center_state: center.clone(),
             }),
@@ -12214,6 +12268,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: true,
+                revoke_session_fail: false,
                 auth_state: state.clone(),
                 center_state: center.clone(),
             }),
@@ -12389,6 +12444,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: CenterTestState::default(),
             }),
@@ -12723,6 +12779,347 @@ mod tests {
             )
             .await?;
         assert_eq!(closed.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// The id of the newest session the sign-in flow created, as the wire
+    /// uuid the session-revocation route expects.
+    fn newest_session_id(state: &AuthTestState) -> Option<String> {
+        state
+            .inner
+            .lock()
+            .ok()?
+            .sessions
+            .last()
+            .map(|session| session.id().to_string())
+    }
+
+    /// Revokes one session through the administration route.
+    async fn revoke_session_route(
+        router: &Router,
+        cookie: &str,
+        csrf: &str,
+        body: &str,
+    ) -> Result<Response, Box<dyn Error>> {
+        Ok(router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/sessions")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(body.to_owned()))?,
+            )
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn revoke_session_surfaces_a_storage_failure_as_500_with_audit()
+    -> Result<(), Box<dyn Error>> {
+        // R6-S-1: a storage-class revocation failure must not answer the
+        // unknown-session 404 — that would hide a revocation that did not
+        // happen. The route answers an explicit 500 and records the failed
+        // session-management outcome (B3 discipline), like the password
+        // paths' failed revocation.
+        let auth = seeded_auth_state();
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                revoke_session_fail: true,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let session_id = newest_session_id(&auth).ok_or("the sign-in must create a session")?;
+
+        let failed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/sessions")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(format!(r#"{{"session_id": "{session_id}"}}"#)))?,
+            )
+            .await?;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                4,
+                "the sign-in pair plus the failed revocation pair"
+            );
+            assert_eq!(events[2].context().action().as_str(), "manage-sessions");
+            assert_eq!(events[2].outcome().kind().as_str(), "started");
+            assert_eq!(events[3].outcome().kind().as_str(), "failed");
+            assert_eq!(events[3].context().action().as_str(), "manage-sessions");
+            assert_eq!(events[3].context().permission().as_str(), "manage-users");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoke_session_answers_not_found_for_an_unknown_id() -> Result<(), Box<dyn Error>> {
+        // R6-S-1: an unknown session id answers 404 with no audit — the
+        // settled-state outcome of the boundary classification, not a
+        // failure.
+        let auth = seeded_auth_state();
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                revoke_session_fail: false,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let missing = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/sessions")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(format!(
+                        r#"{{"session_id": "{}"}}"#,
+                        SessionId::generate()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            audit.lock().map_err(|_| MockWriteError)?.len(),
+            2,
+            "the 404 is the settled-state answer, not an audited failure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoke_session_treats_a_repeat_revocation_as_idempotent() -> Result<(), Box<dyn Error>>
+    {
+        // R6-S-1: revoking an already-revoked session is the idempotent
+        // repeat of a settled revocation — the caller's goal already holds
+        // — so it answers success and is audited like the first revocation,
+        // instead of the old unknown-answer 404.
+        let auth = seeded_auth_state();
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                revoke_session_fail: false,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (_cookie, _csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let first_session_id =
+            newest_session_id(&auth).ok_or("the sign-in must create a session")?;
+        // A second sign-in opens a fresh presenting session, so the revoke
+        // below can target the first session without killing its own
+        // presenting cookie.
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let revoke_body = format!(r#"{{"session_id": "{first_session_id}"}}"#);
+
+        let first = revoke_session_route(&router, &cookie, &csrf, &revoke_body).await?;
+        assert_eq!(first.status(), StatusCode::OK);
+        let repeat = revoke_session_route(&router, &cookie, &csrf, &revoke_body).await?;
+        assert_eq!(
+            repeat.status(),
+            StatusCode::OK,
+            "the repeat revocation is the idempotent success"
+        );
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                8,
+                "the two sign-in pairs plus the two successful revocation pairs"
+            );
+            assert_eq!(events[5].outcome().kind().as_str(), "succeeded");
+            assert_eq!(events[6].context().action().as_str(), "manage-sessions");
+            assert_eq!(events[7].outcome().kind().as_str(), "succeeded");
+            assert_eq!(events[7].context().action().as_str(), "manage-sessions");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_and_password_change_carry_exactly_one_set_cookie() -> Result<(), Box<dyn Error>>
+    {
+        // R6-S-2: the handlers that clear the session cookie own the
+        // `Set-Cookie` header — the middleware must not append its
+        // re-issue over the clear, or the browser would hold both the
+        // `Max-Age=0` clear and a fresh session cookie (and the fresh one
+        // would win).
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let logout = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/logout")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(logout.status(), StatusCode::OK);
+        let logout_cookies: Vec<_> = logout.headers().get_all(SET_COOKIE).iter().collect();
+        assert_eq!(
+            logout_cookies.len(),
+            1,
+            "the logout response must not re-issue the session cookie over the clear"
+        );
+        assert!(
+            logout_cookies[0].to_str()?.contains("Max-Age=0"),
+            "the single cookie is the clear"
+        );
+
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let changed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::OK);
+        let changed_cookies: Vec<_> = changed.headers().get_all(SET_COOKIE).iter().collect();
+        assert_eq!(
+            changed_cookies.len(),
+            1,
+            "the password-change response must not re-issue the session cookie over the clear"
+        );
+        assert!(changed_cookies[0].to_str()?.contains("Max-Age=0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_state_and_role_404_floods_are_rate_limited() -> Result<(), Box<dyn Error>> {
+        // R6-S-10: the administration state and role surfaces consume the
+        // credential-change budget before the lookup — keyed on the acting
+        // administrator and presenting address, never refunded — so a flood
+        // of unknown-id probes cannot run the dummy derivation gate for
+        // free: the 404s exhaust the shared budget and the next call
+        // answers 429.
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let missing_id = "00000000-0000-0000-0000-000000000000";
+
+        for _ in 0..crate::auth::USERNAME_FAILURE_LIMIT {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/admin/users/{missing_id}/state"))
+                        .header("content-type", "application/json")
+                        .header("cookie", &cookie)
+                        .header("x-csrf-token", &csrf)
+                        .body(Body::from(r#"{"state": "disabled"}"#))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        }
+        let throttled = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{missing_id}/state"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(r#"{"state": "disabled"}"#))?,
+            )
+            .await?;
+        assert_eq!(
+            throttled.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the state-probe flood must exhaust the administrator's budget"
+        );
+        // The role surface shares the same budget: it is throttled too,
+        // until the window slides.
+        let throttled_role = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{missing_id}/role"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(r#"{"role": "viewer"}"#))?,
+            )
+            .await?;
+        assert_eq!(
+            throttled_role.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the role surface shares the credential-change budget"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn me_answers_429_under_a_per_address_query_flood() -> Result<(), Box<dyn Error>> {
+        // R6-W-9: the Public session-state endpoint carries a per-address
+        // query throttle — the cap is a page-load frequency bound, so a
+        // probe flood answers 429 instead of running free store lookups,
+        // and a sessionless client is throttled the same as any other.
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        for _ in 0..crate::auth::ME_IP_QUERY_LIMIT {
+            let answered = router
+                .clone()
+                .oneshot(Request::get("/api/v1/auth/me").body(Body::empty())?)
+                .await?;
+            assert_eq!(answered.status(), StatusCode::OK);
+        }
+        let throttled = router
+            .oneshot(Request::get("/api/v1/auth/me").body(Body::empty())?)
+            .await?;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
         Ok(())
     }
 
@@ -13079,6 +13476,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: state.clone(),
             }),
@@ -13200,6 +13598,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: failing,
             }),
@@ -13259,6 +13658,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: state.clone(),
             }),
@@ -13331,6 +13731,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: state.clone(),
             }),
@@ -13445,6 +13846,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: true,
                 revoke_sessions_fail: false,
+                revoke_session_fail: false,
                 auth_state: auth.clone(),
                 center_state: state.clone(),
             }),

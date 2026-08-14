@@ -38,6 +38,7 @@ mod m20260813_000001_audit_center_actions;
 mod m20260813_000002_endpoint_health_checks;
 mod m20260813_000003_audit_failure_vocabulary;
 mod m20260813_000004_audit_operation_vocabulary;
+mod m20260814_000001_center_outbox_operation_ids;
 
 /// The 000004 down's restore DDL, exposed for the migration test that pins
 /// the restored shape byte for byte against the 000003 forward shape
@@ -77,6 +78,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000002_endpoint_health_checks::Migration),
             Box::new(m20260813_000003_audit_failure_vocabulary::Migration),
             Box::new(m20260813_000004_audit_operation_vocabulary::Migration),
+            Box::new(m20260814_000001_center_outbox_operation_ids::Migration),
         ]
     }
 }

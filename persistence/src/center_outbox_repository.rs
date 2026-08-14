@@ -1,6 +1,6 @@
 use rutilus_center_protocol::{Envelope, EnvelopeMessage};
 use rutilus_domain::{
-    InstanceId, OutboxEntry, OutboxEntryError, OutboxEntryId, OutboxEntryState,
+    InstanceId, OperationId, OutboxEntry, OutboxEntryError, OutboxEntryId, OutboxEntryState,
     OutboxEntryStateParseError,
 };
 use rutilus_entity::center_outbox;
@@ -16,6 +16,7 @@ use sea_orm::{
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::SqliteStore;
 
@@ -90,7 +91,13 @@ impl SqliteStore {
         // queued a message, never a ciphertext — while the stored row holds
         // the protected envelope.
         let entry = OutboxEntry::new(entry_id, instance_id, sequence, payload_json, created_at);
-        insert_outbox_entry(&transaction, &entry, &protected).await?;
+        insert_outbox_entry(
+            &transaction,
+            &entry,
+            &protected,
+            payload_operation_id(entry.payload_json()),
+        )
+        .await?;
         transaction
             .commit()
             .await
@@ -123,7 +130,13 @@ impl SqliteStore {
             .await
             .map_err(CenterOutboxRepositoryError::Coordinate)?;
         let payload_json = self.protect_outbox_payload(entry.id(), entry.payload_json())?;
-        insert_outbox_entry(&self.database, entry, &payload_json).await
+        insert_outbox_entry(
+            &self.database,
+            entry,
+            &payload_json,
+            payload_operation_id(entry.payload_json()),
+        )
+        .await
     }
 
     /// Computes the next per-instance envelope sequence: the stored maximum
@@ -312,6 +325,15 @@ impl SqliteStore {
     /// as [`AckOutcome::AlreadyAcknowledged`] instead of failing — the
     /// center may deliver its `Ack` more than once.
     ///
+    /// An acknowledged offer row is delivered history (§15.4) — the retry
+    /// and the reply-site fallback read the *newest* row per operation, so
+    /// the older acknowledged rows of the same operation are dead weight.
+    /// The ack therefore prunes them (R6-E-04): the newest acknowledged row
+    /// of the operation is kept, every other acknowledged row of the same
+    /// operation is deleted — the queue never grows one row per retry of a
+    /// settled operation. Rows without an operation id (the site-side
+    /// content queue) are never pruned, and pending rows are never pruned.
+    ///
     /// # Errors
     ///
     /// Returns [`CenterOutboxRepositoryError::NotFound`] for an unknown
@@ -355,11 +377,99 @@ impl SqliteStore {
             map_stored_outbox_entry(self, entry_id, &model)?;
             AckOutcome::AlreadyAcknowledged
         };
+        // R6-E-04: prune the acknowledged history of the just-acked row's
+        // operation, keeping the newest acknowledged row. The just-updated
+        // row participates (it is acked by now), so the keeper is the
+        // newest acknowledged row whether it is this one or a newer
+        // retry's.
+        let acked_operation_id = center_outbox::Entity::find_by_id(entry_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?
+            .and_then(|model| model.operation_id);
+        if let Some(operation_id) = acked_operation_id {
+            prune_acked_operation_history(&transaction, operation_id).await?;
+        }
         transaction
             .commit()
             .await
             .map_err(CenterOutboxRepositoryError::Database)?;
         Ok(outcome)
+    }
+
+    /// Finds the newest outbox row of one operation — the directed repair
+    /// read over the plaintext `operation_id` column (R6-E-04).
+    ///
+    /// The dispatch retry's fall-through, the V5E-1 reply-site fallback, and
+    /// the ack-time pruning all address one operation's rows directly, so
+    /// none of them needs to decrypt the site's whole queue. Rows written
+    /// before the `operation_id` migration carry `NULL`: the read then
+    /// falls back to a payload scan of the instance's rows, backfills the
+    /// column of the found row, and returns it — so a pre-migration
+    /// acknowledged offer is never mistaken for a never-enqueued record
+    /// (the F1 double-execution guard holds across the upgrade), and the
+    /// column self-heals on first access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterOutboxRepositoryError::Corrupt`] when any scanned
+    /// stored row violates domain invariants or its payload ciphertext
+    /// cannot be authenticated, and
+    /// [`CenterOutboxRepositoryError::CommandKeyMissing`] when a ciphertext
+    /// row is read through a keyless store.
+    pub async fn find_outbox_entry_by_operation(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> Result<Option<OutboxEntry>, CenterOutboxRepositoryError> {
+        let model = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .filter(center_outbox::Column::OperationId.eq(operation_id.into_uuid()))
+            .order_by_desc(center_outbox::Column::Sequence)
+            .order_by_desc(center_outbox::Column::Id)
+            .one(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        if let Some(model) = model {
+            let entry_id = OutboxEntryId::from_uuid(model.id);
+            return map_stored_outbox_entry(self, entry_id, &model).map(Some);
+        }
+        // Pre-migration rows carry `NULL` in the column: find the newest
+        // offer row of the operation by decrypting the payloads, backfill
+        // the column, and return it.
+        let models = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .order_by_desc(center_outbox::Column::Sequence)
+            .order_by_desc(center_outbox::Column::Id)
+            .all(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        for model in models {
+            let entry_id = OutboxEntryId::from_uuid(model.id);
+            let entry = map_stored_outbox_entry(self, entry_id, &model)?;
+            if payload_operation_id(entry.payload_json()) != Some(operation_id) {
+                continue;
+            }
+            // The backfill is a write, so it runs under the write gate like
+            // every other queue write; it cannot deadlock — no caller of
+            // this read holds the gate.
+            let _write_permit = self
+                .write_gate
+                .acquire()
+                .await
+                .map_err(CenterOutboxRepositoryError::Coordinate)?;
+            center_outbox::Entity::update_many()
+                .filter(center_outbox::Column::Id.eq(entry_id.into_uuid()))
+                .set(center_outbox::ActiveModel {
+                    operation_id: Set(Some(operation_id.into_uuid())),
+                    ..Default::default()
+                })
+                .exec(&self.database)
+                .await
+                .map_err(CenterOutboxRepositoryError::Database)?;
+            return Ok(Some(entry));
+        }
+        Ok(None)
     }
 
     /// Returns the command encryption key, refusing outbox work on a keyless
@@ -443,6 +553,7 @@ async fn insert_outbox_entry<C>(
     database: &C,
     entry: &OutboxEntry,
     payload_json: &str,
+    operation_id: Option<OperationId>,
 ) -> Result<(), CenterOutboxRepositoryError>
 where
     C: ConnectionTrait,
@@ -456,10 +567,66 @@ where
         retry_count: Set(entry.retry_count()),
         created_at: Set(entry.created_at()),
         acked_at: Set(entry.acked_at()),
+        operation_id: Set(operation_id.map(OperationId::into_uuid)),
     }
     .insert(database)
     .await
     .map_err(CenterOutboxRepositoryError::Database)?;
+    Ok(())
+}
+
+/// The plaintext §15.6 operation id of one outbound envelope payload
+/// (R6-E-04): `Some(id)` for an offer row, `None` for every other row. The
+/// `operation_id` column mirrors this value, so a stored `operation_id`
+/// always agrees with the decrypted payload of its row.
+fn payload_operation_id(payload_json: &str) -> Option<OperationId> {
+    let envelope: Envelope = serde_json::from_str(payload_json).ok()?;
+    let EnvelopeMessage::OperationOffer(offer) = envelope.message? else {
+        return None;
+    };
+    offer.operation_id.parse().ok()
+}
+
+/// Prunes the acknowledged history of one operation (R6-E-04): the newest
+/// acknowledged row of the operation is kept, every other acknowledged row
+/// of the same operation is deleted.
+///
+/// The keeper is the newest row of the whole queue for the operation — the
+/// just-acknowledged row included — so a retry that re-delivered a fresh
+/// offer under the same id keeps the newest acknowledged row and the older
+/// ones disappear. Rows without an operation id (the site-side content
+/// queue) are never touched — this helper only runs for a row that carries
+/// one — and pending rows are never pruned: a pending row is still
+/// deliverable.
+///
+/// # Errors
+///
+/// Returns [`CenterOutboxRepositoryError::Database`] when a query fails.
+async fn prune_acked_operation_history<C>(
+    database: &C,
+    operation_id: Uuid,
+) -> Result<(), CenterOutboxRepositoryError>
+where
+    C: ConnectionTrait,
+{
+    let Some(keeper) = center_outbox::Entity::find()
+        .filter(center_outbox::Column::OperationId.eq(operation_id))
+        .filter(center_outbox::Column::State.eq("acked"))
+        .order_by_desc(center_outbox::Column::Sequence)
+        .order_by_desc(center_outbox::Column::Id)
+        .one(database)
+        .await
+        .map_err(CenterOutboxRepositoryError::Database)?
+    else {
+        return Ok(());
+    };
+    center_outbox::Entity::delete_many()
+        .filter(center_outbox::Column::OperationId.eq(operation_id))
+        .filter(center_outbox::Column::State.eq("acked"))
+        .filter(center_outbox::Column::Id.ne(keeper.id))
+        .exec(database)
+        .await
+        .map_err(CenterOutboxRepositoryError::Database)?;
     Ok(())
 }
 
@@ -547,7 +714,7 @@ pub enum StoredCenterOutboxError {
 mod tests {
     use std::{error::Error, sync::Arc};
 
-    use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
+    use rutilus_center_protocol::{Envelope, EnvelopeMessage, Heartbeat, OperationOffer};
     use rutilus_domain::{
         AccountCommand, AccountPassword, AccountUserName, CreateAccount, EndpointId, InstanceId,
         InstanceKind, OperationId, OutboxEntry, OutboxEntryId, OutboxEntryState, RedfishCommand,
@@ -916,6 +1083,7 @@ mod tests {
             retry_count: Set(entry.retry_count()),
             created_at: Set(entry.created_at()),
             acked_at: Set(entry.acked_at()),
+            operation_id: Set(None),
         }
         .insert(&store.database)
         .await?;
@@ -1035,6 +1203,7 @@ mod tests {
             retry_count: Set(legacy.retry_count()),
             created_at: Set(legacy.created_at()),
             acked_at: Set(legacy.acked_at()),
+            operation_id: Set(None),
         }
         .insert(&store.database)
         .await?;
@@ -1043,6 +1212,223 @@ mod tests {
             .await?
             .ok_or("legacy outbox entry is missing")?;
         assert_eq!(stored.payload_json(), legacy.payload_json());
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// One `OperationOffer` under a caller-chosen operation id — the offer
+    /// shape the center's dispatch enqueues (R6-E-04 tests need two offers
+    /// of the same operation to exercise the directed read and the ack
+    /// pruning).
+    fn offer_for(site: &SiteInstance, operation_id: OperationId) -> EnvelopeMessage {
+        let command = RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+            AccountUserName::parse("jane").unwrap_or_else(|_| unreachable!("valid user name")),
+            AccountPassword::parse("correct-horse-battery-staple".to_owned())
+                .unwrap_or_else(|_| unreachable!("valid password")),
+            RoleId::parse("Operator").unwrap_or_else(|_| unreachable!("valid role")),
+        )));
+        EnvelopeMessage::OperationOffer(OperationOffer {
+            operation_id: operation_id.to_string(),
+            endpoint_id: EndpointId::generate().to_string(),
+            site_id: site.id().to_string(),
+            command_json: serde_json::to_vec(&command)
+                .unwrap_or_else(|_| unreachable!("serializable command")),
+            target: String::from("/redfish/v1/Systems/1"),
+            expires_at_unix: 0,
+            actor_context: String::from("actor"),
+        })
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_the_plaintext_operation_id_and_the_directed_read_returns_the_newest()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-04: the offer's operation id lands in the plaintext column
+        // at enqueue time, and the directed read returns the newest row of
+        // the operation without scanning the queue — while a content row
+        // (no operation id) is never mistaken for an offer.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site = site_instance(base);
+        store.create_instance(&site).await?;
+        let operation_id = OperationId::generate();
+
+        store
+            .enqueue_outbox_entry(site.id(), &offer_for(&site, operation_id), base)
+            .await?;
+        store
+            .enqueue_outbox_entry(
+                site.id(),
+                &offer_for(&site, operation_id),
+                base + Duration::SECOND,
+            )
+            .await?;
+        let model = center_outbox::Entity::find()
+            .filter(center_outbox::Column::OperationId.eq(operation_id.into_uuid()))
+            .one(&store.database)
+            .await?
+            .ok_or("no row carries the plaintext operation id")?;
+        assert_eq!(
+            model.operation_id,
+            Some(operation_id.into_uuid()),
+            "the offer's operation id must be written in the clear at insert time"
+        );
+
+        let newest = store
+            .find_outbox_entry_by_operation(site.id(), operation_id)
+            .await?
+            .ok_or("the directed read missed the operation")?;
+        assert_eq!(
+            newest.sequence(),
+            2,
+            "the directed read returns the newest row"
+        );
+
+        let content = EnvelopeMessage::Heartbeat(Heartbeat::default());
+        store
+            .enqueue_outbox_entry(site.id(), &content, base)
+            .await?;
+        let unknown = OperationId::generate();
+        assert!(
+            store
+                .find_outbox_entry_by_operation(site.id(), unknown)
+                .await?
+                .is_none(),
+            "an operation with no offer row reads as absent"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_prunes_the_older_acked_rows_of_the_same_operation() -> Result<(), Box<dyn Error>> {
+        // R6-E-04: an acknowledged offer row is delivered history, and the
+        // retry reads only the newest row per operation — so the older
+        // acknowledged rows of the same operation are pruned at ack time,
+        // while pending rows (still deliverable) and other operations' rows
+        // survive untouched.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site = site_instance(base);
+        store.create_instance(&site).await?;
+        let operation_id = OperationId::generate();
+        let other_id = OperationId::generate();
+
+        let first = store
+            .enqueue_outbox_entry(site.id(), &offer_for(&site, operation_id), base)
+            .await?;
+        let second = store
+            .enqueue_outbox_entry(
+                site.id(),
+                &offer_for(&site, operation_id),
+                base + Duration::SECOND,
+            )
+            .await?;
+        let other = store
+            .enqueue_outbox_entry(
+                site.id(),
+                &offer_for(&site, other_id),
+                base + Duration::seconds(2),
+            )
+            .await?;
+
+        // Acknowledging the older row prunes nothing yet — it IS the newest
+        // acknowledged row of the operation, so it is kept.
+        store
+            .ack_outbox_entry(first.id(), base + Duration::seconds(3))
+            .await?;
+        assert_eq!(store.list_outbox_entries(site.id()).await?.len(), 3);
+
+        // Acknowledging the retry's row prunes the older acknowledged one:
+        // one acked row per operation remains, and the other operation's
+        // pending row is untouched.
+        store
+            .ack_outbox_entry(second.id(), base + Duration::seconds(4))
+            .await?;
+        let rows = store.list_outbox_entries(site.id()).await?;
+        assert_eq!(rows.len(), 2, "the older acked row must be pruned");
+        assert!(
+            rows.iter().any(|row| row.id() == second.id()),
+            "the newest acked row of the operation is the keeper"
+        );
+        assert!(
+            rows.iter().any(|row| row.id() == other.id()),
+            "another operation's pending row must survive the pruning"
+        );
+        assert!(
+            rows.iter().all(|row| row.id() != first.id()),
+            "the older acked row must be gone"
+        );
+        assert_eq!(rows[1].state(), OutboxEntryState::Pending);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_directed_read_backfills_rows_written_before_the_operation_id_column()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-04: rows written before the migration carry `NULL` in the
+        // operation_id column. The directed read must still find the newest
+        // offer row of the operation — a pre-migration acknowledged offer
+        // must never be mistaken for a never-enqueued record (the F1
+        // double-execution guard) — and it backfills the column, so the
+        // next read is the indexed query.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site = site_instance(base);
+        store.create_instance(&site).await?;
+        let operation_id = OperationId::generate();
+        let message = offer_for(&site, operation_id);
+        let envelope = Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: Some(message.clone()),
+        };
+        let legacy = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            site.id(),
+            1,
+            serde_json::to_string(&envelope)?,
+            base,
+        );
+        // A pre-migration row: written straight into the table without the
+        // operation id, exactly as the pre-migration repository did.
+        center_outbox::ActiveModel {
+            id: Set(legacy.id().into_uuid()),
+            sequence: Set(legacy.sequence()),
+            instance_id: Set(legacy.instance_id().into_uuid()),
+            payload_json: Set(legacy.payload_json().to_owned()),
+            state: Set(legacy.state().as_str().to_owned()),
+            retry_count: Set(legacy.retry_count()),
+            created_at: Set(legacy.created_at()),
+            acked_at: Set(legacy.acked_at()),
+            operation_id: Set(None),
+        }
+        .insert(&store.database)
+        .await?;
+
+        let found = store
+            .find_outbox_entry_by_operation(site.id(), operation_id)
+            .await?
+            .ok_or("the directed read must find the pre-migration offer")?;
+        assert_eq!(found.id(), legacy.id());
+
+        // The column is backfilled, so the directed read is now the indexed
+        // query.
+        let model = center_outbox::Entity::find_by_id(legacy.id().into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the legacy row is missing")?;
+        assert_eq!(
+            model.operation_id,
+            Some(operation_id.into_uuid()),
+            "the directed read must backfill the plaintext operation id"
+        );
 
         store.close().await?;
         drop(directory);

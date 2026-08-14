@@ -45,7 +45,7 @@ use rutilus_domain::{
 use rutilus_web::{
     AuditEventQuery, CenterEndpointView, CenterOperationRefusal, CenterOperationView,
     CenterServices, CenterSiteView, DispatchedCenterOperation, RegisteredCenterSite,
-    WebProductInfo, router,
+    SessionRevocation, WebProductInfo, router,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -421,6 +421,14 @@ impl AuditEventQuery for MockServices {
     fn list_recent_events(
         &self,
         _limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn list_recent_events_with_offset(
+        &self,
+        _limit: NonZeroU64,
+        _offset: u64,
     ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -1143,7 +1151,7 @@ impl rutilus_web::AuthServices for MockServices {
         &self,
         _session_id: rutilus_domain::SessionId,
         _at: time::OffsetDateTime,
-    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+    ) -> rutilus_application::BoundaryFuture<'_, Result<SessionRevocation, Self::Error>> {
         Box::pin(async move { Err(MockError::Persistence) })
     }
     fn revoke_sessions_for_principal(

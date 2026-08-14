@@ -71,6 +71,10 @@ webbrowser.workspace = true
 rutilus-infra-redfish.workspace = true
 rutilus-test-support.workspace = true
 tokio.workspace = true
+# The audit warm-up test injects a corrupt row with raw SQL through a
+# separate connection, bypassing the store's validated append surface (the
+# production path of the warm-up failure flag).
+sea-orm.workspace = true
 
 [lints]
 workspace = true

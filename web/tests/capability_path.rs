@@ -37,7 +37,7 @@ use rutilus_domain::{
 use rutilus_web::{
     AuditEventQuery, CenterEndpointView, CenterOperationRefusal, CenterOperationView,
     CenterServices, CenterSiteView, DispatchedCenterOperation, RegisteredCenterSite,
-    WebProductInfo, router,
+    SessionRevocation, WebProductInfo, router,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -309,13 +309,23 @@ impl AuditEventQuery for MockServices {
         &self,
         limit: NonZeroU64,
     ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        self.list_recent_events_with_offset(limit, 0)
+    }
+
+    fn list_recent_events_with_offset(
+        &self,
+        limit: NonZeroU64,
+        offset: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
         Box::pin(async move {
             let state = self.state.lock().map_err(|_| MockError::Lock)?;
             let take = usize::try_from(limit.get()).map_err(|_| MockError::Lock)?;
+            let offset = usize::try_from(offset).map_err(|_| MockError::Lock)?;
             Ok(state
                 .audit_events
                 .iter()
                 .rev()
+                .skip(offset)
                 .take(take)
                 .cloned()
                 .collect())
@@ -1072,7 +1082,7 @@ impl rutilus_web::AuthServices for MockServices {
         &self,
         _session_id: rutilus_domain::SessionId,
         _at: time::OffsetDateTime,
-    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+    ) -> rutilus_application::BoundaryFuture<'_, Result<SessionRevocation, Self::Error>> {
         Box::pin(async move { Err(MockError::Persistence) })
     }
     fn revoke_sessions_for_principal(

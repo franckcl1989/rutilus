@@ -22,7 +22,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     future::Future,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage};
@@ -301,10 +301,16 @@ impl std::fmt::Display for CenterSessionRegistryError {
 impl Error for CenterSessionRegistryError {}
 
 /// One registered online connection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct OnlineSession {
     site: ResolvedSite,
     last_seen: OffsetDateTime,
+    /// The per-session disconnect signal (R6-C-6): the connection task
+    /// observes it beside the shared shutdown watch, so a binding
+    /// revocation ([`CenterSessionRegistry::disconnect`]) ends the
+    /// established session promptly instead of leaving the site's flush and
+    /// reply path alive.
+    disconnect: Arc<tokio::sync::Notify>,
 }
 
 /// Tracks which bound sites currently hold an online connection (§15.1).
@@ -317,6 +323,11 @@ struct OnlineSession {
 /// guaranteed even on a crashed task — a panic unwind runs the guard's
 /// `Drop` — and the site's next reconnect succeeds instead of a stale
 /// [`CenterSessionRegistryError::AlreadyConnected`] refusal.
+///
+/// [`Self::disconnect`] ends one site's established session on a binding
+/// revocation (R6-C-6): the registry entry is removed and the session's
+/// disconnect signal fires, so the connection task closes the connection
+/// instead of keeping the revoked site online.
 #[derive(Debug)]
 pub struct CenterSessionRegistry {
     online: Mutex<HashMap<InstanceId, OnlineSession>>,
@@ -357,9 +368,40 @@ impl CenterSessionRegistry {
             OnlineSession {
                 site,
                 last_seen: now,
+                disconnect: Arc::new(tokio::sync::Notify::new()),
             },
         );
         Ok(())
+    }
+
+    /// Returns the disconnect signal of one online site (R6-C-6): the
+    /// connection task awaits it beside the shared shutdown watch, so a
+    /// binding revocation ([`Self::disconnect`]) ends the established
+    /// session. The signal is armed inside [`Self::mark_connected`], so a
+    /// revocation racing the task's setup still fires: `Notify` stores the
+    /// notification for the task's first `notified()` await.
+    #[must_use]
+    pub fn disconnect_watch(&self, site: InstanceId) -> Option<Arc<tokio::sync::Notify>> {
+        self.online.lock().ok().and_then(|online| {
+            online
+                .get(&site)
+                .map(|session| Arc::clone(&session.disconnect))
+        })
+    }
+
+    /// Ends one site's established session (R6-C-6): the registry entry is
+    /// removed and the session's disconnect signal fires, so the connection
+    /// task closes the connection — a revoked site must not keep its flush
+    /// and its reply path alive. A site that is not online is a no-op, and
+    /// the later [`Self::mark_disconnected`] of the closing task is
+    /// idempotent.
+    pub fn disconnect(&self, site: InstanceId) {
+        let Ok(mut online) = self.online.lock() else {
+            return;
+        };
+        if let Some(session) = online.remove(&site) {
+            session.disconnect.notify_one();
+        }
     }
 
     /// Advances the liveness stamp of one online site.
@@ -396,12 +438,15 @@ impl CenterSessionRegistry {
     /// first.
     #[must_use]
     pub fn list_online(&self) -> Vec<ResolvedSite> {
-        let mut sessions = self
-            .online
-            .lock()
-            .map_or_else(|_| Vec::new(), |online| online.values().cloned().collect());
+        let mut sessions = self.online.lock().map_or_else(
+            |_| Vec::new(),
+            |online| online.values().cloned().collect::<Vec<_>>(),
+        );
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_seen));
-        sessions.into_iter().map(|session| session.site).collect()
+        sessions
+            .into_iter()
+            .map(|session| session.site.clone())
+            .collect()
     }
 }
 
@@ -1287,6 +1332,55 @@ mod tests {
         registry.mark_connected(site, base)?;
         assert!(registry.is_online(site_id));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnecting_a_site_fires_its_disconnect_signal_and_removes_it()
+    -> Result<(), Box<dyn Error>> {
+        // R6-C-6: a binding revocation ends the revoked site's established
+        // session — the registry entry is removed and the connection task's
+        // disconnect signal fires, so the connection closes instead of
+        // keeping the site's flush and reply path alive.
+        let registry = CenterSessionRegistry::new();
+        let base = base_time();
+        let site = ResolvedSite::new(
+            InstanceId::generate(),
+            CenterBindingId::generate(),
+            site_fingerprint(),
+        );
+        registry.mark_connected(site.clone(), base)?;
+        let watch = registry
+            .disconnect_watch(site.instance_id())
+            .ok_or("the online site must expose its disconnect signal")?;
+        let connection = tokio::spawn(async move {
+            watch.notified().await;
+        });
+        assert!(registry.is_online(site.instance_id()));
+
+        registry.disconnect(site.instance_id());
+        assert!(
+            !registry.is_online(site.instance_id()),
+            "the disconnect must remove the registry entry"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+            .await
+            .map_err(|_| "the disconnect signal never fired")??;
+        Ok(())
+    }
+
+    #[test]
+    fn disconnect_of_a_site_that_is_not_online_is_a_no_op() {
+        // R6-C-6: the disconnect is idempotent — the closing connection
+        // task's own cleanup must never conflict with the revocation.
+        let registry = CenterSessionRegistry::new();
+        let site = ResolvedSite::new(
+            InstanceId::generate(),
+            CenterBindingId::generate(),
+            site_fingerprint(),
+        );
+        registry.disconnect(site.instance_id());
+        assert!(!registry.is_online(site.instance_id()));
+        assert!(registry.disconnect_watch(site.instance_id()).is_none());
     }
 
     /// A fixed clock for the engine tests.

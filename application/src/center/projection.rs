@@ -863,10 +863,9 @@ where
                         site.instance_id(),
                         event.id()
                     );
-                    if let Ok(dead_letter) =
-                        absorption_dead_letter(&event, site.instance_id(), reason)
-                    {
-                        records.push(dead_letter);
+                    match absorption_dead_letter(&event, site.instance_id(), reason) {
+                        Ok(dead_letter) => records.push(dead_letter),
+                        Err(failure) => log_missing_dead_letter(site, &event, failure, reason),
                     }
                 }
                 None => {
@@ -876,10 +875,9 @@ where
                         site.instance_id(),
                         event.id()
                     );
-                    if let Ok(dead_letter) =
-                        absorption_dead_letter(&event, site.instance_id(), reason)
-                    {
-                        records.push(dead_letter);
+                    match absorption_dead_letter(&event, site.instance_id(), reason) {
+                        Ok(dead_letter) => records.push(dead_letter),
+                        Err(failure) => log_missing_dead_letter(site, &event, failure, reason),
                     }
                 }
             }
@@ -1320,6 +1318,12 @@ fn decode_resource(
 /// through the existing decode-failure classification (logged and skipped
 /// once, the cursor advancing): refusing to advance would wedge the event
 /// stream on a permanently mis-clocked report and block every later event.
+///
+/// The `Center.` message-id namespace is reserved for the center's own
+/// dead-letter reflections (R6-D-7): a site reporting an event under the
+/// reserved prefix would spoof an internal administrative row, and its dedup
+/// key could collide with a real dead-letter's. A record under the reserved
+/// prefix is refused exactly like any other undecodable report.
 fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'static str> {
     let id = record
         .event_id
@@ -1330,6 +1334,9 @@ fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'st
         .parse::<EndpointId>()
         .map_err(|_| "unparseable endpoint id")?;
     let message_id = MessageId::parse(&record.message_id).map_err(|_| "unusable message id")?;
+    if message_id.as_str().starts_with("Center.") {
+        return Err("reserved message id namespace");
+    }
     let severity = match rutilus_center_protocol::EventSeverity::try_from(record.severity) {
         Ok(rutilus_center_protocol::EventSeverity::Ok) => EventSeverity::Ok,
         Ok(rutilus_center_protocol::EventSeverity::Warning) => EventSeverity::Warning,
@@ -1369,8 +1376,8 @@ fn decode_event(record: &EventRecord, now: OffsetDateTime) -> Result<Event, &'st
 ///
 /// Returns `Err` when the reserved message id is unusable (a build defect —
 /// the constant is fixed) or the row cannot be built (a timeline defect the
-/// decoded record cannot carry); the caller then logs the absorption
-/// without the durable row.
+/// decoded record cannot carry); the caller then logs the absorption at
+/// error level, naming the missing durable reflection ([`log_missing_dead_letter`]).
 fn absorption_dead_letter(
     event: &Event,
     site: InstanceId,
@@ -1392,6 +1399,26 @@ fn absorption_dead_letter(
         event.observed_at(),
     )
     .map_err(|_| "the absorption dead-letter row cannot be built")
+}
+
+/// Logs an absorbed event record whose durable dead-letter reflection could
+/// not be built (R6-D-6) — without the error the record would be lost
+/// without a durable row, silently. The construction failure is a build
+/// defect (the reserved message id constant is fixed; the timeline the
+/// decoded record cannot carry was already refused at decode), so the log is
+/// at error level and names the missing durable reflection.
+fn log_missing_dead_letter(
+    site: &ResolvedSite,
+    event: &Event,
+    failure: &'static str,
+    reason: &str,
+) {
+    tracing::error!(
+        "site {}: absorbed event record {} has no durable dead-letter reflection \
+         (durable 反射缺失): {failure}; absorption reason: {reason}",
+        site.instance_id(),
+        event.id()
+    );
 }
 
 /// Decodes one artifact manifest into the domain artifact under the site's
@@ -3064,6 +3091,48 @@ mod tests {
                 .any(|event| event.message_id().as_str() == "ResourceEvent.1.0.ResourceUpdated"),
             "the legitimate owner's report is stored beside the dead-letter"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_reporting_the_reserved_center_namespace_are_refused()
+    -> Result<(), Box<dyn Error>> {
+        // R6-D-7: the `Center.` message-id namespace is reserved for the
+        // center's own dead-letter reflections — a site reporting an event
+        // under the reserved prefix would spoof an internal administrative
+        // row, and its dedup key could collide with a real dead-letter's.
+        // The decode refuses the record like any other undecodable report:
+        // logged and skipped once, the cursor advancing past it.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor.clone());
+        let site = resolved_site();
+        let now = base_time();
+        let owned = EndpointId::generate();
+        state.claim_endpoint(owned, site.instance_id());
+
+        let mut record = event_record(&owned, now.unix_timestamp() - 10);
+        record.message_id = String::from("Center.1.0.EventAbsorbed");
+        projection
+            .on_frame(
+                &site,
+                3,
+                &EnvelopeMessage::EventBatch(EventBatch {
+                    events: vec![record],
+                }),
+                now,
+            )
+            .await?;
+
+        assert!(
+            state.events_owned().is_empty(),
+            "a record under the reserved `Center.` namespace must not be stored"
+        );
+        let stored = cursor
+            .get(site.instance_id(), SyncStream::Event)
+            .await?
+            .ok_or("the cursor was not stored")?;
+        assert_eq!(stored.cursor_value(), "3");
         Ok(())
     }
 }

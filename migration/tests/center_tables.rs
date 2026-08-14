@@ -242,6 +242,7 @@ async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn
         retry_count: Set(0),
         created_at: Set(now),
         acked_at: Set(None),
+        operation_id: Set(None),
     }
     .insert(&database)
     .await?;
@@ -254,6 +255,7 @@ async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn
         retry_count: Set(0),
         created_at: Set(now),
         acked_at: Set(None),
+        operation_id: Set(None),
     }
     .insert(&database)
     .await;
@@ -272,6 +274,7 @@ async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn
         retry_count: Set(0),
         created_at: Set(now),
         acked_at: Set(None),
+        operation_id: Set(None),
     }
     .insert(&database)
     .await?;
@@ -284,6 +287,7 @@ async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn
         retry_count: Set(0),
         created_at: Set(now),
         acked_at: Set(None),
+        operation_id: Set(None),
     }
     .insert(&database)
     .await;
@@ -300,6 +304,7 @@ async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn
         retry_count: Set(-1),
         created_at: Set(now),
         acked_at: Set(None),
+        operation_id: Set(None),
     }
     .insert(&database)
     .await;
