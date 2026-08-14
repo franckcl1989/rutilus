@@ -616,6 +616,13 @@ pub enum CenterOperationRefusal {
     },
     /// The typed command could not be serialized into its wire payload.
     CommandSerialization,
+    /// The target site's binding is not in force — a revoked (or never
+    /// bound) site must not receive a new dispatch (§16.1, R6-E-02).
+    SiteBindingRevoked,
+    /// A dispatch of the same operation is pending an unknown terminal
+    /// outcome; the retry is refused with the existing operation id, so the
+    /// site's inbox deduplication sees the same identity (R6-E-01).
+    UnknownOutcomePending { operation_id: OperationId },
     /// The center store failed.
     Store,
 }
@@ -1679,6 +1686,11 @@ where
 
 /// Maximum accepted `limit` for one bounded audit query.
 const AUDIT_QUERY_MAX_LIMIT: u64 = 1000;
+/// Maximum accepted `offset` for one bounded audit query (E-11): a skip
+/// beyond ten million events is indistinguishable from the end of history
+/// for any product-realistic trail and would only force a wasted store
+/// scan, so the query refuses it exactly like an over-limit `limit`.
+const AUDIT_QUERY_MAX_OFFSET: u64 = 10_000_000;
 /// Default `limit` for one bounded audit query without an explicit value.
 const AUDIT_QUERY_DEFAULT_LIMIT: u64 = 100;
 
@@ -2119,6 +2131,13 @@ fn project_refresh_outcome(outcome: &EndpointRefreshOutcome) -> EndpointRefreshR
 }
 
 /// Returns recent immutable audit events, newest first, bounded by `limit`.
+///
+/// An explicit `offset` pages the older history (E-11): `offset == 0` is the
+/// warmed in-memory tail, while a positive offset reads the persisted
+/// store's bounded listing — so the tail cache's bounded window never hides
+/// paginated history. The response's `has_more` flag reports whether the
+/// returned page is exactly as long as the requested limit, the console's
+/// signal that an older page exists.
 async fn audit_query<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     uri: Uri,
@@ -2126,17 +2145,26 @@ async fn audit_query<Services, Gateway, Time>(
 where
     Services: AuditEventQuery,
 {
-    let Ok(limit) = parse_audit_limit(uri.query()) else {
+    let Ok((limit, offset)) = parse_audit_query(uri.query()) else {
         return json_error(
             StatusCode::BAD_REQUEST,
             format!("audit limit must be between 1 and {AUDIT_QUERY_MAX_LIMIT}"),
         );
     };
-    let Ok(events) = state.services.list_recent_events(limit).await else {
+    let events = if offset == 0 {
+        state.services.list_recent_events(limit)
+    } else {
+        state.services.list_recent_events_with_offset(limit, offset)
+    };
+    let Ok(events) = events.await else {
         return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
     };
+    // A page exactly as long as the requested limit means older events may
+    // still exist; a shorter page is the end of history.
+    let has_more = u64::try_from(events.len()).unwrap_or(u64::MAX) == limit.get();
     let mut response = Json(AuditQueryResponse::new(
         events.iter().map(project_audit_event).collect(),
+        has_more,
     ))
     .into_response();
     no_store(&mut response);
@@ -2262,6 +2290,14 @@ where
 /// one ordinary single-target child operation per endpoint, all persisted
 /// atomically — and acknowledge a `BatchOperationResponse` carrying the
 /// batch id and the children's operation ids in the submitted order.
+///
+/// The source is pinned server-side (R6-W-3): this console surface accepts
+/// exactly the local-management sources — `standalone` and `site` (a Site
+/// posture console submits `site`, a Standalone posture console `standalone`)
+/// — while `center` is reserved for operations written by the center offer
+/// flow (application dispatch). A forged `source: "center"` on the wire is
+/// refused before anything is persisted, so no HTTP request can mint a
+/// center-marked operation.
 async fn create_operation<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     Json(request): Json<CreateOperationRequest>,
@@ -2273,6 +2309,12 @@ where
     let source = match request.source() {
         None => OperationSource::Standalone,
         Some(raw) => match raw.parse() {
+            Ok(OperationSource::Center) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "operation source center is reserved for center dispatches".to_owned(),
+                );
+            }
             Ok(source) => source,
             Err(_) => {
                 return json_error(
@@ -2520,6 +2562,10 @@ where
             StatusCode::BAD_REQUEST,
             "artifact size must be at least one byte".to_owned(),
         ),
+        Err(ArtifactStoreError::SizeExceedsLimit { .. }) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact size exceeds the server's per-artifact limit".to_owned(),
+        ),
         Err(ArtifactStoreError::Repository(_)) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "artifact persistence failed".to_owned(),
@@ -2647,6 +2693,7 @@ where
             ArtifactStoreError::InvalidName(_)
             | ArtifactStoreError::InvalidSha256(_)
             | ArtifactStoreError::ZeroSize
+            | ArtifactStoreError::SizeExceedsLimit { .. }
             | ArtifactStoreError::AlreadyFailed { .. }
             | ArtifactStoreError::FinalizeFailed { .. }
             | ArtifactStoreError::Domain(_)
@@ -2710,6 +2757,7 @@ where
             ArtifactStoreError::InvalidName(_)
             | ArtifactStoreError::InvalidSha256(_)
             | ArtifactStoreError::ZeroSize
+            | ArtifactStoreError::SizeExceedsLimit { .. }
             | ArtifactStoreError::InvalidBase64(_)
             | ArtifactStoreError::ChunkTooLarge { .. }
             | ArtifactStoreError::ChunkExceedsSize { .. }
@@ -3371,13 +3419,31 @@ fn default_event_limit() -> Result<NonZeroU64, ParseEventLimitError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParseEventLimitError;
 
-fn parse_audit_limit(query: Option<&str>) -> Result<NonZeroU64, ParseAuditLimitError> {
+fn parse_audit_query(query: Option<&str>) -> Result<(NonZeroU64, u64), ParseAuditLimitError> {
     let Some(query) = query else {
-        return default_audit_limit();
+        return Ok((default_audit_limit()?, 0));
     };
-    let Some(value) = query.strip_prefix("limit=") else {
-        return Err(ParseAuditLimitError);
-    };
+    let mut limit = None;
+    let mut offset = None;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("limit=") {
+            if limit.is_some() {
+                return Err(ParseAuditLimitError);
+            }
+            limit = Some(parse_audit_limit_value(value)?);
+        } else if let Some(value) = pair.strip_prefix("offset=") {
+            if offset.is_some() {
+                return Err(ParseAuditLimitError);
+            }
+            offset = Some(parse_audit_offset_value(value)?);
+        } else {
+            return Err(ParseAuditLimitError);
+        }
+    }
+    Ok((limit.unwrap_or(default_audit_limit()?), offset.unwrap_or(0)))
+}
+
+fn parse_audit_limit_value(value: &str) -> Result<NonZeroU64, ParseAuditLimitError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(ParseAuditLimitError);
     }
@@ -3388,6 +3454,19 @@ fn parse_audit_limit(query: Option<&str>) -> Result<NonZeroU64, ParseAuditLimitE
         return Err(ParseAuditLimitError);
     }
     NonZeroU64::new(limit).ok_or(ParseAuditLimitError)
+}
+
+fn parse_audit_offset_value(value: &str) -> Result<u64, ParseAuditLimitError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseAuditLimitError);
+    }
+    let Ok(offset) = value.parse::<u64>() else {
+        return Err(ParseAuditLimitError);
+    };
+    if offset > AUDIT_QUERY_MAX_OFFSET {
+        return Err(ParseAuditLimitError);
+    }
+    Ok(offset)
 }
 
 fn default_audit_limit() -> Result<NonZeroU64, ParseAuditLimitError> {
@@ -4192,48 +4271,67 @@ where
 ///
 /// The coded body lets the console distinguish why a dispatch was refused —
 /// authorization, an unknown endpoint, a foreign endpoint, an unknown
-/// target, an unserializable command, or a center-store failure — without
-/// parsing the human-readable message. The console only checks the status
-/// of a refused submission, so the coded body is purely additive.
+/// target, an unserializable command, a revoked site binding, a pending
+/// unknown outcome, or a center-store failure — without parsing the
+/// human-readable message. The console only checks the status of a refused
+/// submission, so the coded body is purely additive.
+///
+/// The family's status semantics: `403` is reserved for the
+/// actor-authorization verdicts (`NotAuthorized`, the handler-side scope
+/// gate), and `422` for body-referenced unknowns. A revoked binding and a
+/// pending unknown outcome are neither: the request is well-formed and the
+/// actor authorized, but the addressed site's current state — a binding
+/// that is no longer in force, or an undecided operation on the same key —
+/// conflicts with the dispatch, so both map to `409 Conflict` (R6-E-01,
+/// R6-E-02). The console can re-register the site or surface the existing
+/// operation from the refusal message instead of retrying blindly.
 fn center_dispatch_refusal_response(refusal: &CenterOperationRefusal) -> Response {
     let (status, code, message) = match refusal {
         CenterOperationRefusal::NotAuthorized => (
             StatusCode::FORBIDDEN,
             CenterOperationRefusalCode::NotAuthorized,
-            "this role cannot dispatch to the requested site",
+            "this role cannot dispatch to the requested site".to_owned(),
         ),
         CenterOperationRefusal::UnknownEndpoint { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             CenterOperationRefusalCode::UnknownEndpoint,
-            "the endpoint is not in the center's projection",
+            "the endpoint is not in the center's projection".to_owned(),
         ),
         CenterOperationRefusal::EndpointNotInSite { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             CenterOperationRefusalCode::EndpointNotInSite,
-            "the endpoint does not belong to the requested site",
+            "the endpoint does not belong to the requested site".to_owned(),
         ),
         CenterOperationRefusal::UnknownTarget { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             CenterOperationRefusalCode::UnknownTarget,
-            "the target is not part of the endpoint's projection",
+            "the target is not part of the endpoint's projection".to_owned(),
         ),
         CenterOperationRefusal::CommandSerialization => (
             StatusCode::INTERNAL_SERVER_ERROR,
             CenterOperationRefusalCode::CommandSerialization,
-            "the operation command could not be serialized",
+            "the operation command could not be serialized".to_owned(),
+        ),
+        CenterOperationRefusal::SiteBindingRevoked => (
+            StatusCode::CONFLICT,
+            CenterOperationRefusalCode::SiteBindingRevoked,
+            "the site's binding is not in force; re-register the site before dispatching"
+                .to_owned(),
+        ),
+        CenterOperationRefusal::UnknownOutcomePending { operation_id } => (
+            StatusCode::CONFLICT,
+            CenterOperationRefusalCode::UnknownOutcomePending,
+            format!("operation {operation_id} is pending an unknown outcome; the retry is refused"),
         ),
         CenterOperationRefusal::Store => (
             StatusCode::SERVICE_UNAVAILABLE,
             CenterOperationRefusalCode::StoreFailed,
-            "the center store failed",
+            "the center store failed".to_owned(),
         ),
     };
     json_error_with_status(
         status,
-        Json(CenterOperationDispatchRefusalResponse::new(
-            code,
-            message.to_owned(),
-        )),
+        Json(CenterOperationDispatchRefusalResponse::new(code, message)),
     )
 }
 
@@ -10786,6 +10884,9 @@ mod tests {
         dispatched: Arc<Mutex<Vec<DispatchedSubmission>>>,
         /// When armed, every center boundary fails (the 503 verdicts).
         fail: bool,
+        /// When armed, `dispatch_center_operation` answers this refusal
+        /// (the typed-verdict HTTP mapping tests).
+        refusal: Option<CenterOperationRefusal>,
         /// When armed, the appended audit events are recorded here (audit
         /// follow-up F3 assertions).
         audit: Option<Arc<Mutex<Vec<AuditEvent>>>>,
@@ -10936,6 +11037,9 @@ mod tests {
             let target = target.to_string();
             let command = command.clone();
             Box::pin(async move {
+                if let Some(refusal) = state.refusal {
+                    return Err(refusal);
+                }
                 if state.fail {
                     return Err(CenterOperationRefusal::Store);
                 }
@@ -13631,6 +13735,129 @@ mod tests {
             assert_eq!(events.len(), 2, "a refused dispatch must still audit");
             assert_eq!(events[1].outcome().kind().as_str(), "failed");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn the_site_binding_and_unknown_outcome_refusals_map_to_conflict_with_stable_codes()
+    -> Result<(), Box<dyn Error>> {
+        // R6-E-01 / R6-E-02 (A1 → A6 wiring): the two typed refusals are
+        // neither actor-authorization failures (403) nor body-referenced
+        // unknowns (422) — they conflict with the addressed site's current
+        // state — so both map to 409 Conflict with their stable refusal
+        // codes, and the message names the site binding or the pending
+        // operation so the console can act without parsing the code.
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let pending_operation = OperationId::generate();
+        let body = |site: InstanceId, endpoint: EndpointId| {
+            format!(
+                r#"{{"site_id": "{}", "endpoint_id": "{}", "target": "/redfish/v1/Systems/1", "command": {{"System": {{"Reset": "PowerCycle"}}}}}}"#,
+                site.into_uuid(),
+                endpoint.into_uuid()
+            )
+        };
+
+        let revoked_router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                revoke_session_fail: false,
+                auth_state: auth.clone(),
+                center_state: CenterTestState {
+                    refusal: Some(CenterOperationRefusal::SiteBindingRevoked),
+                    ..CenterTestState::default()
+                },
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) =
+            sign_in_center(&revoked_router, &auth, "admin", "admin-password").await?;
+        let refused = revoked_router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(body(site, endpoint)))?,
+            )
+            .await?;
+        assert_eq!(
+            refused.status(),
+            StatusCode::CONFLICT,
+            "a revoked binding is a state conflict, not an authorization failure"
+        );
+        let refused_body = json_body(refused).await?;
+        assert_eq!(refused_body["code"], "site_binding_revoked");
+        assert!(
+            refused_body["message"]
+                .as_str()
+                .ok_or("the refusal must carry a message")?
+                .contains("binding"),
+            "the refusal message must name the binding"
+        );
+
+        let pending_router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                revoke_session_fail: false,
+                auth_state: auth.clone(),
+                center_state: CenterTestState {
+                    refusal: Some(CenterOperationRefusal::UnknownOutcomePending {
+                        operation_id: pending_operation,
+                    }),
+                    ..CenterTestState::default()
+                },
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) =
+            sign_in_center(&pending_router, &auth, "admin", "admin-password").await?;
+        let refused = pending_router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(body(site, endpoint)))?,
+            )
+            .await?;
+        assert_eq!(
+            refused.status(),
+            StatusCode::CONFLICT,
+            "a pending unknown outcome conflicts with the retried dispatch"
+        );
+        let refused_body = json_body(refused).await?;
+        assert_eq!(refused_body["code"], "unknown_outcome_pending");
+        assert!(
+            refused_body["message"]
+                .as_str()
+                .ok_or("the refusal must carry a message")?
+                .contains(&pending_operation.to_string()),
+            "the refusal message must name the pending operation"
+        );
         Ok(())
     }
 

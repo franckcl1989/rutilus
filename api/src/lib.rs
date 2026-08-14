@@ -2829,21 +2829,38 @@ impl AuditEventResponse {
 }
 
 /// Stable envelope for a bounded, newest-first audit query.
+///
+/// `has_more` reports whether the returned page is exactly as long as the
+/// requested limit — the console's signal that an older page exists and can
+/// be fetched with an `offset` (E-11). The response direction never rejects
+/// unknown fields (W3C-1): an additive field in a newer payload must not
+/// break a console built before the field existed, so the envelope tolerates
+/// keys this build does not know. The new field itself is `#[serde(default)]`
+/// so a console built after the field existed still parses a response from a
+/// server that predates it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuditQueryResponse {
     events: Vec<AuditEventResponse>,
+    #[serde(default)]
+    has_more: bool,
 }
 
 impl AuditQueryResponse {
     #[must_use]
-    pub const fn new(events: Vec<AuditEventResponse>) -> Self {
-        Self { events }
+    pub const fn new(events: Vec<AuditEventResponse>, has_more: bool) -> Self {
+        Self { events, has_more }
     }
 
     #[must_use]
     pub fn events(&self) -> &[AuditEventResponse] {
         &self.events
+    }
+
+    /// Whether an older page exists: the returned page is exactly as long
+    /// as the requested limit.
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
     }
 }
 
@@ -6086,6 +6103,14 @@ pub enum CenterOperationRefusalCode {
     UnknownTarget,
     /// The typed command could not be serialized into its wire payload.
     CommandSerialization,
+    /// The target site's binding is not in force — a revoked (or never
+    /// bound) site must not receive a new dispatch (§16.1, R6-E-02); the
+    /// binding must be re-established before the dispatch can proceed.
+    SiteBindingRevoked,
+    /// A dispatch of the same operation is pending an unknown terminal
+    /// outcome; the retry is refused with the existing operation id so the
+    /// site's inbox deduplication sees the same identity (R6-E-01).
+    UnknownOutcomePending,
     /// The center store failed.
     StoreFailed,
     /// A refusal code this build does not know — the fallback of a future
@@ -10653,11 +10678,12 @@ mod tests {
             "local-operator enroll-endpoint started for endpoint-address https://bmc.example.test/ (sequence 1)"
                 .to_owned(),
         );
-        let response = AuditQueryResponse::new(vec![event]);
+        let response = AuditQueryResponse::new(vec![event], true);
 
         assert_eq!(
             serde_json::to_value(&response)?,
             json!({
+                "has_more": true,
                 "events": [{
                     "occurred_at": "2026-08-05T10:16:00Z",
                     "actor": "local-operator",
@@ -10681,6 +10707,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AuditQueryResponse>(serde_json::to_value(&response)?)?,
             response
+        );
+        // E-11: a payload from a server that predates `has_more` parses as
+        // `false` (the field's serde default), and an unknown envelope key
+        // is tolerated in the response direction (W3C-1).
+        assert_eq!(
+            serde_json::from_value::<AuditQueryResponse>(json!({
+                "events": [],
+                "extra": true
+            }))?,
+            AuditQueryResponse::new(Vec::new(), false)
         );
         let encoded = serde_json::to_string(&response)?;
         assert!(!encoded.contains("password"));

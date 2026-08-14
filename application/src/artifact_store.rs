@@ -63,6 +63,18 @@ use crate::BoundaryFuture;
 /// decoding work.
 pub const ARTIFACT_CHUNK_BASE64_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The server-side cap on one artifact's declared total size (2 GiB).
+///
+/// The §14.3 firmware-artifact store accepts server BMC firmware images,
+/// which are at most a few hundred MiB in practice; 2 GiB keeps an
+/// order-of-magnitude headroom while bounding one artifact's disk footprint
+/// and the memory the upload can occupy in flight. The cap is a *declared
+/// total* limit enforced at `create` — the per-chunk wire limit bounds each
+/// request, and `append_chunk`'s `ChunkExceedsSize` check keeps the
+/// cumulative received bytes at or below the declared size, so an upload can
+/// never accumulate past this cap.
+pub const ARTIFACT_MAX_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// The persistence boundary of the artifact lifecycle (§9.3, §14.3).
 ///
 /// The five methods mirror the concrete `SqliteStore` surface exactly, so the
@@ -205,19 +217,22 @@ where
     /// Declares a new artifact manifest before any byte is transferred.
     ///
     /// `name` and `sha256` are validated and normalized by their domain
-    /// types; `size_bytes` must be positive — a zero-byte firmware file is a
-    /// client error, never a valid §14.3 update (the domain still models
-    /// zero-size artifacts so persistence can restore any stored row). The
-    /// artifact starts `Uploading` with zero bytes received, and `now` is the
-    /// manifest's creation and update time.
+    /// types; `size_bytes` must be positive and no larger than
+    /// [`ARTIFACT_MAX_SIZE_BYTES`] — a zero-byte firmware file is a client
+    /// error, never a valid §14.3 update (the domain still models
+    /// zero-size artifacts so persistence can restore any stored row), and
+    /// an oversized declaration is refused before it can claim a large disk
+    /// footprint (R6-W-6). The artifact starts `Uploading` with zero bytes
+    /// received, and `now` is the manifest's creation and update time.
     ///
     /// # Errors
     ///
     /// Returns [`ArtifactStoreError::InvalidName`] for an unusable label,
     /// [`ArtifactStoreError::InvalidSha256`] for an unusable digest,
-    /// [`ArtifactStoreError::ZeroSize`] for a zero-byte declaration, or
-    /// [`ArtifactStoreError::Repository`] when the manifest cannot be
-    /// persisted.
+    /// [`ArtifactStoreError::ZeroSize`] for a zero-byte declaration,
+    /// [`ArtifactStoreError::SizeExceedsLimit`] for a declaration above
+    /// [`ARTIFACT_MAX_SIZE_BYTES`], or [`ArtifactStoreError::Repository`]
+    /// when the manifest cannot be persisted.
     pub async fn create(
         &self,
         name: &str,
@@ -227,6 +242,12 @@ where
     ) -> Result<Artifact, ArtifactStoreError<Repository::Error>> {
         if size_bytes == 0 {
             return Err(ArtifactStoreError::ZeroSize);
+        }
+        if size_bytes > ARTIFACT_MAX_SIZE_BYTES {
+            return Err(ArtifactStoreError::SizeExceedsLimit {
+                size_bytes,
+                maximum: ARTIFACT_MAX_SIZE_BYTES,
+            });
         }
         let name = ArtifactName::parse(name).map_err(ArtifactStoreError::InvalidName)?;
         let sha256 = Sha256Hex::parse(sha256).map_err(ArtifactStoreError::InvalidSha256)?;
@@ -643,6 +664,9 @@ where
     /// A firmware artifact must declare at least one byte.
     #[error("artifact size must be at least one byte")]
     ZeroSize,
+    /// The declared size exceeds the server's per-artifact cap.
+    #[error("artifact size of {size_bytes} bytes exceeds the limit of {maximum} bytes")]
+    SizeExceedsLimit { size_bytes: u64, maximum: u64 },
     /// The chunk text is not valid RFC 4648 §4 base64.
     #[error("artifact chunk is not valid base64: {0}")]
     InvalidBase64(#[source] base64::DecodeError),
@@ -991,6 +1015,116 @@ mod tests {
                 .map_err(|_| MockError::Lock)?
                 .is_empty(),
             "a refused declaration must not persist a manifest"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_declared_size_above_the_artifact_cap() -> Result<(), Box<dyn Error>> {
+        // R6-W-6: the server pins one artifact's total size at
+        // ARTIFACT_MAX_SIZE_BYTES — an over-cap declaration is refused
+        // before any manifest is persisted, so a declared size can never
+        // claim a larger disk footprint than the product accepts.
+        let repository = created_repository()?;
+        let store = ArtifactStore::new(&repository);
+        let digest = declared_digest().to_string();
+
+        assert!(matches!(
+            store
+                .create(
+                    "firmware.bin",
+                    ARTIFACT_MAX_SIZE_BYTES + 1,
+                    &digest,
+                    now(),
+                )
+                .await,
+            Err(ArtifactStoreError::SizeExceedsLimit {
+                size_bytes,
+                maximum,
+            }) if size_bytes == ARTIFACT_MAX_SIZE_BYTES + 1
+                && maximum == ARTIFACT_MAX_SIZE_BYTES
+        ));
+        assert!(
+            repository
+                .rows
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .is_empty(),
+            "an over-cap declaration must not persist a manifest"
+        );
+
+        // The boundary value itself is a valid declaration: the manifest is
+        // pure metadata — no byte is written at `create`, so the cap is
+        // enforced as a declared-total bound.
+        let artifact = store
+            .create("firmware.bin", ARTIFACT_MAX_SIZE_BYTES, &digest, now())
+            .await?;
+        assert_eq!(artifact.size_bytes(), ARTIFACT_MAX_SIZE_BYTES);
+        assert_eq!(artifact.uploaded_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunks_at_the_cap_boundary_stay_bounded_by_the_declared_size()
+    -> Result<(), Box<dyn Error>> {
+        // R6-W-6: the cumulative chunk total is bounded by the *declared*
+        // size (ChunkExceedsSize), and `create` refuses declarations above
+        // the cap — so an upload can never accumulate past
+        // ARTIFACT_MAX_SIZE_BYTES without a chunk-level refusal. A
+        // declaration at the cap boundary is accepted (the manifest is pure
+        // metadata) and its first chunk lands at the exact offset; the
+        // declared-size bound itself is proven against a small declaration,
+        // where a range crossing the declared end is refused before any
+        // byte is written (the same check that protects any cap-bounded
+        // declaration).
+        let repository = created_repository()?;
+        let store = ArtifactStore::new(&repository);
+        let boundary = store
+            .create(
+                "firmware.bin",
+                ARTIFACT_MAX_SIZE_BYTES,
+                &declared_digest().to_string(),
+                now(),
+            )
+            .await?;
+        let progress = store
+            .append_chunk(boundary.id(), 0, "aGVs", now() + Duration::SECOND)
+            .await?;
+        assert_eq!(
+            progress,
+            ArtifactProgress::new(boundary.id(), 3, ARTIFACT_MAX_SIZE_BYTES)
+        );
+        assert_eq!(std::fs::read(repository.file_path(boundary.id()))?, b"hel");
+
+        // The cumulative bound at the small scale: two chunks whose total
+        // would cross the declared end are refused by ChunkExceedsSize and
+        // the received total stays at the acknowledged 3 bytes.
+        let artifact = store
+            .create("small.bin", 6, &digest_of(b"hello!").to_string(), now())
+            .await?;
+        let artifact_id = artifact.id();
+        store
+            .append_chunk(artifact_id, 0, "aGVs", now() + Duration::SECOND)
+            .await?;
+        assert!(matches!(
+            store
+                .append_chunk(
+                    artifact_id,
+                    3,
+                    &STANDARD.encode(b"world"),
+                    now() + Duration::SECOND,
+                )
+                .await,
+            Err(ArtifactStoreError::ChunkExceedsSize {
+                offset: 3,
+                chunk: 5,
+                size: 6,
+            })
+        ));
+        assert_eq!(
+            store.progress(artifact_id).await?,
+            ArtifactProgress::new(artifact_id, 3, 6),
+            "the refused range must leave the received total at 3 bytes"
         );
         Ok(())
     }

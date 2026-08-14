@@ -1166,6 +1166,12 @@ async fn rejects_an_over_limit_batch_without_persisting() -> Result<(), Box<dyn 
 
 #[tokio::test]
 async fn accepts_an_explicit_operation_source() -> Result<(), Box<dyn Error>> {
+    // R6-W-3: the HTTP console surface pins the operation source to the
+    // local-management vocabulary — `standalone` and `site` are accepted
+    // (a Standalone posture console submits `standalone`, a Site posture
+    // console `site`) — while `center` is reserved for operations written
+    // by the center offer flow (application dispatch) and must never be
+    // accepted from the wire.
     let state = Arc::new(Mutex::new(MockState::default()));
     let endpoint = managed_endpoint()?;
     state
@@ -1175,7 +1181,32 @@ async fn accepts_an_explicit_operation_source() -> Result<(), Box<dyn Error>> {
         .push(endpoint.clone());
     let router = test_router(MockServices::new(Arc::clone(&state)));
 
-    let response = post_json(
+    for source in ["standalone", "site"] {
+        let response = post_json(
+            &router,
+            "/api/v1/operations",
+            json!({
+                "source": source,
+                "targets": [endpoint.id().to_string()],
+                "command": { "Manager": { "Reset": "GracefulRestart" } }
+            }),
+        )
+        .await?;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CREATED,
+            "source {source} must be accepted"
+        );
+        let body = json_body(response).await?;
+        assert_eq!(body["source"], source);
+        assert_eq!(
+            body["command"],
+            json!({ "Manager": { "Reset": "GracefulRestart" } })
+        );
+    }
+
+    // A forged `source: "center"` is refused and nothing is persisted.
+    let forged = post_json(
         &router,
         "/api/v1/operations",
         json!({
@@ -1185,23 +1216,38 @@ async fn accepts_an_explicit_operation_source() -> Result<(), Box<dyn Error>> {
         }),
     )
     .await?;
-
-    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
-    let body = json_body(response).await?;
-    assert_eq!(body["source"], "center");
     assert_eq!(
-        body["command"],
-        json!({ "Manager": { "Reset": "GracefulRestart" } })
+        forged.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "a forged center source must be rejected"
     );
-    let stored = state
+    let body = json_body(forged).await?;
+    assert!(
+        body["message"]
+            .as_str()
+            .ok_or("error response must carry a message")?
+            .contains("center"),
+        "the refusal must name the reserved source"
+    );
+
+    let stored: Vec<_> = state
         .lock()
         .map_err(|_| MockError::Lock)?
         .operations
         .values()
-        .next()
-        .ok_or("the operation must be persisted")?
-        .clone();
-    assert_eq!(stored.source(), OperationSource::Center);
+        .cloned()
+        .collect();
+    assert_eq!(
+        stored.len(),
+        2,
+        "only the two accepted submissions may be persisted"
+    );
+    assert!(
+        stored
+            .iter()
+            .all(|operation| operation.source() != OperationSource::Center),
+        "no persisted operation may carry the forged center source"
+    );
     Ok(())
 }
 

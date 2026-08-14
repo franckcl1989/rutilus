@@ -229,6 +229,8 @@ strings_catalog! {
 
     /// The refresh action button.
     action_refresh: "Refresh", zh: "刷新",
+    /// The button that loads the next older page of the audit history (E-11).
+    action_load_earlier: "Load earlier", zh: "加载更早",
     /// The enable action button.
     action_enable: "Enable", zh: "启用",
     /// The disable action button.
@@ -1628,8 +1630,10 @@ strings_catalog! {
     hint_enrollment_refresh: "The first complete core-resource refresh succeeded during enrollment.", zh: "注册期间首次完整核心资源刷新已成功。",
     /// The import hint describing the CSV columns.
     hint_import_one_row: "One row per BMC: display_name, address, credential_id, tls_sha256", zh: "每行一个 BMC：display_name, address, credential_id, tls_sha256",
-    /// The audit section hint.
-    hint_audit: "Immutable secret-free records, newest first", zh: "不可变且不含机密的记录，按最新优先",
+    /// The audit section hint: the newest-first window with paged older
+    /// history (E-11).
+    hint_audit: "Immutable secret-free records, newest first; older history loads in pages",
+        zh: "不可变且不含机密的记录，最新优先；更早历史分页载入",
     /// The events section hint.
     hint_events: "BMC event records, newest first", zh: "BMC 事件记录，按最新优先",
     /// The telemetry section hint.

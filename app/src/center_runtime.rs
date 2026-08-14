@@ -498,11 +498,12 @@ impl CenterServices for StandaloneState {
             let binding_in_force =
                 binding.is_some_and(|binding| binding.state() == CenterBindingState::Bound);
             if !binding_in_force {
-                // TODO(R6-A6): the interim verdict is the authorization
-                // refusal until the typed `SiteBindingRevoked` refusal
-                // variant lands in the web mapping (see
-                // docs/r6-findings/A1.md).
-                return Err(CenterOperationRefusal::NotAuthorized);
+                // The typed verdict is the site-binding refusal (R6-E-02):
+                // the actor may be fully authorized, but the addressed
+                // site's binding is no longer in force, so the dispatch
+                // conflicts with the site's state. The web layer maps it to
+                // 409 with the stable `site_binding_revoked` code.
+                return Err(CenterOperationRefusal::SiteBindingRevoked);
             }
             let request = CenterOperationRequest::new(site, endpoint, target, command, actor);
             match dispatch.dispatch(&request, now).await {
@@ -536,14 +537,13 @@ impl CenterServices for StandaloneState {
                     | CenterDispatchError::Operation(_)
                     | CenterDispatchError::Outbox(_)
                     | CenterDispatchError::Role(_) => CenterOperationRefusal::Store,
-                    // TODO(R6-A6): the interim verdict is the
-                    // unknown-endpoint refusal until the typed
-                    // `UnknownOutcomePending` refusal variant lands in the
-                    // web mapping (see docs/r6-findings/A1.md).
-                    CenterDispatchError::UnknownOutcomePending { .. } => {
-                        CenterOperationRefusal::UnknownEndpoint {
-                            endpoint_id: endpoint,
-                        }
+                    // The typed verdict carries the existing operation id
+                    // (R6-E-01): a retry of an undecided dispatch is refused
+                    // with the identity the site's deduplication already
+                    // knows, and the web layer maps it to 409 with the
+                    // stable `unknown_outcome_pending` code.
+                    CenterDispatchError::UnknownOutcomePending { operation_id } => {
+                        CenterOperationRefusal::UnknownOutcomePending { operation_id }
                     }
                 }),
             }
@@ -1642,16 +1642,19 @@ mod tests {
             .await
             .map_err(|_| "the revocation never closed the session")??;
 
-        // The dispatch gate refuses the revoked site; the interim verdict
-        // is the authorization refusal (TODO(R6-A6) — see
-        // docs/r6-findings/A1.md).
+        // The dispatch gate refuses the revoked site with the typed
+        // site-binding verdict (R6-E-02), not an authorization refusal —
+        // the actor is authorized; the site's binding state is the obstacle.
         let Err(refusal) = state
             .dispatch_center_operation(site.id(), endpoint_id, &target, &command, actor, now)
             .await
         else {
             unreachable!("a revoked site must refuse dispatch")
         };
-        assert!(matches!(refusal, CenterOperationRefusal::NotAuthorized));
+        assert!(matches!(
+            refusal,
+            CenterOperationRefusal::SiteBindingRevoked
+        ));
         assert!(
             rutilus_operation_engine::OperationStore::list_operations(&state.store, None)
                 .await?

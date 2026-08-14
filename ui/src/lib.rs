@@ -4452,8 +4452,43 @@ impl RefreshFailure {
 enum AuditListState {
     Idle,
     Loading,
-    Ready(AuditQueryResponse),
+    Ready(AuditPage),
     Failed,
+}
+
+/// One loaded window of the newest-first audit history plus the offset of
+/// the next older page (E-11).
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuditPage {
+    query: AuditQueryResponse,
+    /// The offset of the next older page; only meaningful while the loaded
+    /// window's response reported `has_more`.
+    next_offset: u64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl AuditPage {
+    const fn new(query: AuditQueryResponse, next_offset: u64) -> Self {
+        Self { query, next_offset }
+    }
+
+    /// Whether the server reported an older page exists behind this window.
+    const fn has_older_events(&self) -> bool {
+        self.query.has_more()
+    }
+
+    /// Appends one older page below the current window (E-11): the older
+    /// events follow the newest-first window, and the older page's own
+    /// `has_more` decides whether yet another page exists.
+    fn with_older(&self, older: &AuditQueryResponse, page_size: u32) -> Self {
+        let mut events = self.query.events().to_vec();
+        events.extend(older.events().iter().cloned());
+        Self {
+            query: AuditQueryResponse::new(events, older.has_more()),
+            next_offset: self.next_offset + u64::from(page_size),
+        }
+    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -4471,12 +4506,12 @@ impl AuditListState {
     }
 
     fn has_empty_events(&self) -> bool {
-        matches!(self, Self::Ready(query) if query.events().is_empty())
+        matches!(self, Self::Ready(page) if page.query.events().is_empty())
     }
 
     fn count_text(&self) -> String {
         let count = match self {
-            Self::Ready(query) => query.events().len(),
+            Self::Ready(page) => page.query.events().len(),
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
@@ -4487,7 +4522,8 @@ impl AuditListState {
 
     fn event_cards(&self) -> Vec<AuditEventCardProjection> {
         match self {
-            Self::Ready(query) => query
+            Self::Ready(page) => page
+                .query
                 .events()
                 .iter()
                 .map(AuditEventCardProjection::from)
@@ -14825,6 +14861,7 @@ mod browser {
 
     #[component]
     fn AuditView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        use crate::AuditPage;
         let active = move || view.get() == ConsoleView::Audit;
         let (state, set_state) = signal(AuditListState::Idle);
         let (triggered, set_triggered) = signal(false);
@@ -14834,8 +14871,11 @@ mod browser {
                 set_triggered.set(true);
                 set_state.set(AuditListState::Loading);
                 spawn_local(async move {
-                    let state = match fetch_audit().await {
-                        Some(query) => AuditListState::Ready(query),
+                    let state = match fetch_audit(0).await {
+                        Some(query) => AuditListState::Ready(AuditPage::new(
+                            query,
+                            u64::from(AUDIT_QUERY_LIMIT),
+                        )),
                         None => AuditListState::Failed,
                     };
                     set_state.set(state);
@@ -14846,11 +14886,33 @@ mod browser {
         let on_refresh = move |_| {
             set_state.set(AuditListState::Loading);
             spawn_local(async move {
-                let state = match fetch_audit().await {
-                    Some(query) => AuditListState::Ready(query),
+                let state = match fetch_audit(0).await {
+                    Some(query) => {
+                        AuditListState::Ready(AuditPage::new(query, u64::from(AUDIT_QUERY_LIMIT)))
+                    }
                     None => AuditListState::Failed,
                 };
                 set_state.set(state);
+            });
+        };
+
+        // E-11: loads the next older page below the current newest-first
+        // window. A failed page load restores the previous window, so a
+        // transient failure never discards the history already loaded.
+        let on_load_earlier = move |_| {
+            let AuditListState::Ready(page) = state.get() else {
+                return;
+            };
+            let offset = page.next_offset;
+            set_state.set(AuditListState::Loading);
+            spawn_local(async move {
+                let Some(older) = fetch_audit(offset).await else {
+                    set_state.set(AuditListState::Ready(page));
+                    return;
+                };
+                set_state.set(AuditListState::Ready(
+                    page.with_older(&older, AUDIT_QUERY_LIMIT),
+                ));
             });
         };
 
@@ -14893,6 +14955,21 @@ mod browser {
                         on:click=on_refresh
                     >
                         {L().action_refresh}
+                    </button>
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || state.get().is_loading()
+                        hidden=move || {
+                            !matches!(
+                                state.get(),
+                                AuditListState::Ready(ref page)
+                                    if page.has_older_events()
+                            )
+                        }
+                        on:click=on_load_earlier
+                    >
+                        {L().action_load_earlier}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -15725,8 +15802,19 @@ mod browser {
         }
     }
 
-    async fn fetch_audit() -> Option<AuditQueryResponse> {
-        let response = Request::get("/api/v1/audit")
+    /// How many audit events the console requests per page of the
+    /// newest-first history window (E-11); the same bound seeds the
+    /// "load earlier" paging offset.
+    const AUDIT_QUERY_LIMIT: u32 = 50;
+
+    /// Loads one page of the newest-first audit history starting at `offset`
+    /// (E-11): `offset == 0` is the newest window, and each later page
+    /// skips that many events into the older history. The response's
+    /// `has_more` flag decides whether the "load earlier" button stays
+    /// visible.
+    async fn fetch_audit(offset: u64) -> Option<AuditQueryResponse> {
+        let url = format!("/api/v1/audit?limit={AUDIT_QUERY_LIMIT}&offset={offset}");
+        let response = Request::get(&url)
             .header("Accept", "application/json")
             .send()
             .await
@@ -21478,7 +21566,10 @@ mod tests {
                 }
             ]
         }))?;
-        let state = AuditListState::Ready(query);
+        // The JSON carries no `has_more` — the field's serde default reads
+        // it as `false`, exactly what a response from a server that predates
+        // the field must mean (E-11).
+        let state = AuditListState::Ready(AuditPage::new(query, 0));
         assert!(state.is_ready());
         assert!(!state.is_failed());
         assert_eq!(state.count_text(), "2 audit events");
@@ -21505,9 +21596,81 @@ mod tests {
         );
         assert_eq!(AuditListState::Idle.event_cards().len(), 0);
         assert_eq!(AuditListState::Idle.count_text(), "0 audit events");
-        assert!(AuditListState::Ready(AuditQueryResponse::new(Vec::new())).has_empty_events());
+        assert!(
+            AuditListState::Ready(AuditPage::new(
+                AuditQueryResponse::new(Vec::new(), false),
+                0
+            ))
+            .has_empty_events()
+        );
         assert!(AuditListState::Failed.is_failed());
         assert!(AuditListState::Loading.is_loading());
+        Ok(())
+    }
+
+    #[test]
+    fn audit_paging_appends_older_pages_and_tracks_the_next_offset() -> Result<(), Box<dyn Error>> {
+        // E-11: the console window is newest-first, and each "load earlier"
+        // page skips `offset` events into the older history — the appended
+        // page follows the loaded window, the offset advances by the page
+        // size, and `has_older_events` follows the server's `has_more`.
+        let newest = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": true,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:10:11Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 2,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e0",
+                    "message": "newest"
+                }
+            ]
+        }))?;
+        let older = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": false,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:09:00Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 1,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e1",
+                    "message": "older"
+                }
+            ]
+        }))?;
+        let page = AuditPage::new(newest, 50);
+        assert!(page.has_older_events());
+
+        let merged = page.with_older(&older, 50);
+        assert_eq!(
+            merged.query.events().len(),
+            2,
+            "the older page appends below the window"
+        );
+        assert_eq!(
+            merged.query.events()[0].sequence(),
+            2,
+            "the newest stays on top"
+        );
+        assert_eq!(
+            merged.query.events()[1].sequence(),
+            1,
+            "the older page follows"
+        );
+        assert_eq!(
+            merged.next_offset, 100,
+            "the offset advances by the page size"
+        );
+        assert!(
+            !merged.has_older_events(),
+            "has_more follows the loaded page's own verdict"
+        );
         Ok(())
     }
 

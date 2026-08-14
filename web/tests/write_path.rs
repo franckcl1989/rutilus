@@ -27,11 +27,13 @@ use rutilus_application::{
     TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityState, Credential,
-    CredentialId, CredentialName, CredentialUsername, CredentialVersionId, DeploymentPosture,
-    Endpoint, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
-    EndpointDisplayName, EndpointId, Event, InstanceId, Operation, OperationId, OperationState,
-    PrincipalId, RedfishCommand, RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId,
+    Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent,
+    AuditOperationContext, AuditOperationId, AuditParameterSummary, AuditRedfishOperation,
+    AuditSequence, AuditTarget, CapabilityState, Credential, CredentialId, CredentialName,
+    CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event,
+    InstanceId, Operation, OperationId, OperationState, PrincipalId, ProductPermission,
+    RedfishCommand, RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId,
     ResourceSnapshot, ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries,
     TelemetrySeriesId, TlsCertificate, TlsTrust,
 };
@@ -1374,7 +1376,18 @@ async fn bounds_the_audit_query_limit() -> Result<(), Box<dyn Error>> {
         MockGateway::verified(certificate),
     );
 
-    for query in ["?limit=0", "?limit=1001", "?limit=abc", "?page=2"] {
+    for query in [
+        "?limit=0",
+        "?limit=1001",
+        "?limit=abc",
+        "?page=2",
+        // E-11: the offset is a non-negative integer bounded like the limit.
+        "?offset=abc",
+        "?offset=-1",
+        "?offset=10000001",
+        "?limit=10&limit=20",
+        "?offset=1&offset=2",
+    ] {
         let response = get(&router, &format!("/api/v1/audit{query}")).await?;
         assert_eq!(
             response.status(),
@@ -1390,6 +1403,7 @@ async fn bounds_the_audit_query_limit() -> Result<(), Box<dyn Error>> {
         body["events"].as_array().ok_or("events must exist")?.len(),
         0
     );
+    assert_eq!(body["has_more"], false);
 
     let response = get(&router, "/api/v1/audit").await?;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
@@ -1399,6 +1413,83 @@ async fn bounds_the_audit_query_limit() -> Result<(), Box<dyn Error>> {
         0,
         "a missing limit must default to a bounded query"
     );
+    assert_eq!(body["has_more"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pages_the_audit_history_with_an_offset() -> Result<(), Box<dyn Error>> {
+    // E-11: a positive `offset` skips the newest events and reads the older
+    // persisted history — `has_more` reports whether an older page exists,
+    // and a page shorter than the requested limit is the end of history.
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let mut seeded = Vec::new();
+    for index in 0..5_u32 {
+        let context = AuditOperationContext::try_new(
+            AuditOperationId::generate(),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuditTarget::Product,
+            AuditParameterSummary::csv_endpoint_import(1)?,
+            ProductPermission::ManageEndpoints,
+            AuditAction::ImportEndpoints,
+            AuditRedfishOperation::None,
+        )?;
+        // Terminal events carry a distinct per-event sequence (2..=6), so
+        // the page assertions can identify exactly which events each
+        // offset serves.
+        seeded.push(AuditEvent::succeeded(
+            context,
+            AuditSequence::try_new(index + 2)?,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index.into()),
+        )?);
+    }
+    state.lock().map_err(|_| MockError::Lock)?.audit_events = seeded;
+    let router = test_router(
+        MockServices::new(Arc::clone(&state)),
+        MockGateway::verified(TlsCertificate::from_der(
+            b"audit paging certificate".to_vec(),
+        )?),
+    );
+    let sequences = |body: &Value| -> Vec<Value> {
+        body["events"]
+            .as_array()
+            .map(|events| {
+                events
+                    .iter()
+                    .map(|event| event["sequence"].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Page one: the newest two events of five; an older page exists.
+    let first = get(&router, "/api/v1/audit?limit=2").await?;
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+    let first_body = json_body(first).await?;
+    assert_eq!(sequences(&first_body), [json!(6), json!(5)]);
+    assert_eq!(first_body["has_more"], true);
+
+    // Page two: offset 2 skips the newest two and serves the next pair.
+    let second = get(&router, "/api/v1/audit?limit=2&offset=2").await?;
+    assert_eq!(second.status(), axum::http::StatusCode::OK);
+    let second_body = json_body(second).await?;
+    assert_eq!(sequences(&second_body), [json!(4), json!(3)]);
+    assert_eq!(second_body["has_more"], true);
+
+    // Page three: the final page is shorter than the limit — no more.
+    let third = get(&router, "/api/v1/audit?offset=4&limit=2").await?;
+    assert_eq!(third.status(), axum::http::StatusCode::OK);
+    let third_body = json_body(third).await?;
+    assert_eq!(sequences(&third_body), [json!(2)]);
+    assert_eq!(third_body["has_more"], false);
+
+    // Past the end of history: an empty page with no `has_more`.
+    let empty = get(&router, "/api/v1/audit?limit=2&offset=6").await?;
+    assert_eq!(empty.status(), axum::http::StatusCode::OK);
+    let empty_body = json_body(empty).await?;
+    assert_eq!(sequences(&empty_body), Vec::<Value>::new());
+    assert_eq!(empty_body["has_more"], false);
     Ok(())
 }
 
