@@ -60,7 +60,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::{ArtifactRepository, BoundaryFuture, CenterCursor, center::session::ResolvedSite};
+use crate::{
+    ArtifactRepository, BoundaryFuture, CenterCursor, artifact_store::ARTIFACT_MAX_SIZE_BYTES,
+    center::session::ResolvedSite,
+};
 
 /// The reserved message id of the §15.5 absorption dead-letter rows
 /// (V5E-3).
@@ -1434,6 +1437,21 @@ fn decode_manifest(
     if manifest.total_bytes == 0 {
         return Err("a zero-byte artifact cannot be transferred");
     }
+    // S1: the center enforces the same declared-total cap as the site-side
+    // `create` (`ARTIFACT_MAX_SIZE_BYTES`), so a trusted site can never
+    // declare a manifest that fills the center's disk past the cap. The
+    // rejection flows through the same absorb-skip-warn path as every other
+    // undecodable manifest — the center protocol has no HTTP status to
+    // answer with, and a refused declaration leaves no row behind, so the
+    // site's next delivery of the same identity re-declares and is refused
+    // again (the at-least-once outbox keeps the frame until the site learns
+    // of the skip) while the warning names the reason in the center log.
+    // Once the declared total is capped, the chunk path's
+    // `end <= artifact.size_bytes()` check bounds the accumulated bytes the
+    // same way the site side's `append_chunk` does (§14.3).
+    if manifest.total_bytes > ARTIFACT_MAX_SIZE_BYTES {
+        return Err("the artifact exceeds the 2 GiB declared-size cap");
+    }
     let name = ArtifactName::parse(&manifest.name).map_err(|_| "unusable artifact name")?;
     let sha256 = Sha256Hex::from_bytes(
         <[u8; 32]>::try_from(manifest.sha256.as_slice())
@@ -2129,6 +2147,86 @@ mod tests {
             )
             .await?;
         Ok(artifact_id)
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_manifest_is_absorbed_without_a_row() -> Result<(), Box<dyn Error>> {
+        // S1: the center enforces the site-side declared-total cap at the
+        // manifest decode, so a trusted site can never declare an artifact
+        // that fills the center's disk past `ARTIFACT_MAX_SIZE_BYTES`. The
+        // over-cap declaration follows the same absorb-skip-warn handling
+        // as every other undecodable manifest (the protocol stream has no
+        // HTTP status to answer with): the frame is absorbed, the cursor
+        // advances, and no row — and therefore no `Uploading` file slot —
+        // is ever created for the identity.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor);
+        let site = resolved_site();
+        let now = base_time();
+        let artifact_id = ArtifactId::generate();
+
+        projection
+            .on_frame(
+                &site,
+                1,
+                &EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+                    artifact_id: artifact_id.to_string(),
+                    name: String::from("firmware.bin"),
+                    total_bytes: ARTIFACT_MAX_SIZE_BYTES + 1,
+                    sha256: [0x5a; 32].to_vec(),
+                }),
+                now,
+            )
+            .await?;
+
+        assert!(
+            state.find_artifact_owned(artifact_id).is_none(),
+            "an over-cap declaration must leave no artifact row"
+        );
+        assert!(
+            state.artifact_bytes(artifact_id).is_empty(),
+            "an over-cap declaration must never touch a file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_exactly_cap_manifest_is_accepted() -> Result<(), Box<dyn Error>> {
+        // S1 boundary: a declaration at exactly `ARTIFACT_MAX_SIZE_BYTES`
+        // decodes, exactly like the site-side `create` cap. The chunk path
+        // then bounds the accumulated bytes by the declared size (`end <=
+        // artifact.size_bytes()`), so a transfer can never accumulate past
+        // the capped total — the over-declared chunk absorption is pinned
+        // by `out_of_order_chunks_are_absorbed_without_touching_the_file`.
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor);
+        let site = resolved_site();
+        let now = base_time();
+        let artifact_id = ArtifactId::generate();
+
+        projection
+            .on_frame(
+                &site,
+                1,
+                &EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+                    artifact_id: artifact_id.to_string(),
+                    name: String::from("firmware.bin"),
+                    total_bytes: ARTIFACT_MAX_SIZE_BYTES,
+                    sha256: [0x5a; 32].to_vec(),
+                }),
+                now,
+            )
+            .await?;
+
+        let stored = state
+            .find_artifact_owned(artifact_id)
+            .ok_or("the artifact is missing")?;
+        assert_eq!(stored.size_bytes(), ARTIFACT_MAX_SIZE_BYTES);
+        assert_eq!(stored.state(), ArtifactState::Uploading);
+        assert_eq!(stored.uploaded_bytes(), 0);
+        Ok(())
     }
 
     #[tokio::test]

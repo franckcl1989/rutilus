@@ -1,7 +1,7 @@
 use rutilus_domain::{
-    BatchOperation, BatchOperationId, FailureKind, FailureKindParseError, Operation, OperationId,
-    OperationSource, OperationSourceParseError, OperationState, OperationStateParseError,
-    OperationTarget, OperationTimelineError, RedfishCommand,
+    BatchOperation, BatchOperationId, EndpointId, FailureKind, FailureKindParseError, Operation,
+    OperationId, OperationSource, OperationSourceParseError, OperationState,
+    OperationStateParseError, OperationTarget, OperationTimelineError, RedfishCommand,
 };
 use rutilus_entity::{batch_operation, operation, operation_target};
 use rutilus_security::{
@@ -10,7 +10,7 @@ use rutilus_security::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -594,6 +594,82 @@ impl SqliteStore {
             .await
             .map_err(OperationRepositoryError::Database)?;
         let mut query = operation::Entity::find();
+        if let Some(state) = state {
+            query = query.filter(operation::Column::State.eq(state.as_str()));
+        }
+        let models = query
+            .order_by_asc(operation::Column::CreatedAt)
+            .order_by_asc(operation::Column::Id)
+            .all(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut operations = Vec::with_capacity(models.len());
+        for model in models {
+            let operation_id = OperationId::from_uuid(model.id);
+            operations.push(map_stored_operation(self, &transaction, operation_id, model).await?);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(operations)
+    }
+
+    /// Lists the operations of one exact state addressed to one endpoint —
+    /// the endpoint-scoped idempotency scan of the center dispatch
+    /// (W7-P-1).
+    ///
+    /// The center's dispatch retry previously listed *every* operation of
+    /// each candidate state (five global listings per dispatch) and
+    /// filtered the endpoint in memory — each row's command rehydrated
+    /// through its `XChaCha20-Poly1305` envelope — so one site's dispatch
+    /// decrypted the whole global operation table. This read drives the
+    /// SQL through the endpoint index (`ix_operation_targets_endpoint`)
+    /// first: the endpoint's operation ids, then the operations by id, so
+    /// only the endpoint's own rows are fetched and decrypted; the state
+    /// filter is then a residual predicate over that bounded set.
+    ///
+    /// An operation whose *any* target names the endpoint is returned
+    /// (once, whether one or several of its targets do — the deduplication
+    /// mirrors the target-identity join of the aggregate), in the same
+    /// acceptance order as [`Self::list_operations`]. The dispatch's
+    /// in-memory first-target check remains the authoritative candidate
+    /// filter; the two agree on the single-target center-sourced
+    /// operations the scan is built for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or any
+    /// persisted operation violates domain invariants.
+    pub async fn list_operations_for_endpoint(
+        &self,
+        state: Option<OperationState>,
+        endpoint_id: EndpointId,
+    ) -> Result<Vec<Operation>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let ids = operation_target::Entity::find()
+            .filter(operation_target::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .select_only()
+            .column(operation_target::Column::OperationId)
+            .into_tuple::<(Uuid,)>()
+            .all(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut ids = ids.into_iter().map(|(id,)| id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            transaction
+                .commit()
+                .await
+                .map_err(OperationRepositoryError::Database)?;
+            return Ok(Vec::new());
+        }
+        let mut query = operation::Entity::find().filter(operation::Column::Id.is_in(ids));
         if let Some(state) = state {
             query = query.filter(operation::Column::State.eq(state.as_str()));
         }
@@ -1550,6 +1626,110 @@ mod tests {
                 .list_operations(Some(OperationState::Verifying))
                 .await?
                 .is_empty()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_operations_for_endpoint_filters_by_endpoint_in_acceptance_order()
+    -> Result<(), Box<dyn Error>> {
+        // W7-P-1: the dispatch idempotency scan must never list — and
+        // decrypt — the global operation table: the endpoint-scoped read
+        // drives the SQL through the endpoint index, so another endpoint's
+        // rows never enter the scan of this endpoint's dispatch.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let endpoint_a = EndpointId::generate();
+        let endpoint_b = EndpointId::generate();
+        let target =
+            |endpoint_id: EndpointId| vec![OperationTarget::new(TargetId::generate(), endpoint_id)];
+        let queued_a = queued_operation(
+            OperationSource::Center,
+            &target(endpoint_a),
+            one_command(),
+            base,
+        );
+        let queued_b = queued_operation(
+            OperationSource::Center,
+            &target(endpoint_b),
+            one_command(),
+            base + Duration::SECOND,
+        );
+        let foreign_source = queued_operation(
+            OperationSource::Site,
+            &target(endpoint_a),
+            one_command(),
+            base + Duration::SECOND * 2,
+        );
+        let succeeded_a = queued_operation(
+            OperationSource::Center,
+            &target(endpoint_a),
+            one_command(),
+            base + Duration::SECOND * 3,
+        );
+        // A multi-target operation covering both endpoints: returned once
+        // per endpoint scan, never duplicated.
+        let multi = queued_operation(
+            OperationSource::Center,
+            &[
+                OperationTarget::new(TargetId::generate(), endpoint_a),
+                OperationTarget::new(TargetId::generate(), endpoint_b),
+                OperationTarget::new(TargetId::generate(), endpoint_a),
+            ],
+            one_command(),
+            base + Duration::SECOND * 4,
+        );
+        for operation in [&queued_a, &queued_b, &foreign_source, &succeeded_a, &multi] {
+            store.create_operation(operation).await?;
+        }
+        store
+            .apply_transition(
+                succeeded_a.id(),
+                OperationState::Succeeded,
+                base + Duration::SECOND * 3,
+            )
+            .await?;
+
+        let scan_a = store
+            .list_operations_for_endpoint(Some(OperationState::Queued), endpoint_a)
+            .await?;
+        assert_eq!(
+            scan_a.iter().map(Operation::id).collect::<Vec<_>>(),
+            vec![queued_a.id(), foreign_source.id(), multi.id()],
+            "the endpoint-scoped scan must return the endpoint's queued rows only, once each, in acceptance order"
+        );
+        let scan_b = store
+            .list_operations_for_endpoint(Some(OperationState::Queued), endpoint_b)
+            .await?;
+        assert_eq!(
+            scan_b.iter().map(Operation::id).collect::<Vec<_>>(),
+            vec![queued_b.id(), multi.id()],
+            "endpoint B's scan must never see endpoint A's rows"
+        );
+        let finished = store
+            .list_operations_for_endpoint(Some(OperationState::Succeeded), endpoint_a)
+            .await?;
+        assert_eq!(
+            finished.iter().map(Operation::id).collect::<Vec<_>>(),
+            vec![succeeded_a.id()],
+            "the state filter still applies within the endpoint"
+        );
+        assert!(
+            store
+                .list_operations_for_endpoint(Some(OperationState::Verifying), endpoint_a)
+                .await?
+                .is_empty()
+        );
+        let untouched = EndpointId::generate();
+        assert!(
+            store
+                .list_operations_for_endpoint(Some(OperationState::Queued), untouched)
+                .await?
+                .is_empty(),
+            "an endpoint with no operations scans as empty"
         );
 
         store.close().await?;

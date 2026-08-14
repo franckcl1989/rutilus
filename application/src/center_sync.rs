@@ -209,6 +209,36 @@ pub trait CenterOutbox: Send + Sync {
         })
     }
 
+    /// Finds the newest durable outbox row of one operation across every
+    /// instance — the cross-instance confirmation read of the R6-E-01
+    /// dispatch refusal (W7-E-3).
+    ///
+    /// The R6-E-01 unknown-outcome refusal confirms an `Unknown`
+    /// operation's offer before refusing a same-key dispatch. An endpoint
+    /// can be re-homed while the outcome is unresolved, and the offer that
+    /// may have executed the write lives in the *original* site's queue —
+    /// so the confirmation must address any instance, or the re-home
+    /// silently unblocks the retry and the same physical write executes
+    /// twice.
+    ///
+    /// `instance_id` is the dispatch's addressed site: the default
+    /// implementation resolves the cross-instance question through that
+    /// site's queue — the per-site semantics of the R6-E-01 confirmation
+    /// before the W7-E-3 fix, correct on every store without instance
+    /// enumeration — while the production center outbox overrides it with
+    /// the true cross-instance read (the pre-migration rows are backfilled
+    /// lazily by that read, exactly like [`Self::find_offer_by_operation`]).
+    fn find_offer_by_operation_across_instances(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Box::pin(async move {
+            self.find_offer_by_operation(instance_id, operation_id)
+                .await
+        })
+    }
+
     /// Marks one entry acknowledged. The write is idempotent: a repeated
     /// acknowledgement (the center may deliver its `Ack` more than once) is
     /// a successful no-op.
@@ -255,6 +285,22 @@ where
         limit: u64,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
         Outbox::list_offers_bounded(*self, instance_id, limit)
+    }
+
+    fn find_offer_by_operation(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Outbox::find_offer_by_operation(*self, instance_id, operation_id)
+    }
+
+    fn find_offer_by_operation_across_instances(
+        &self,
+        instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Outbox::find_offer_by_operation_across_instances(*self, instance_id, operation_id)
     }
 
     fn acknowledge(

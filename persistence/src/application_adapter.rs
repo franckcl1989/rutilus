@@ -255,6 +255,16 @@ impl OperationStore for SqliteStore {
         Box::pin(async move { SqliteStore::list_operations(self, state).await })
     }
 
+    fn list_operations_for_endpoint(
+        &self,
+        state: Option<OperationState>,
+        endpoint_id: EndpointId,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::list_operations_for_endpoint(self, state, endpoint_id).await
+        })
+    }
+
     fn create_batch<'a>(
         &'a self,
         batch: &'a BatchOperation,
@@ -536,6 +546,16 @@ impl rutilus_application::CenterOutbox for SqliteStore {
     ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
         Box::pin(async move {
             SqliteStore::find_outbox_entry_by_operation(self, instance_id, operation_id).await
+        })
+    }
+
+    fn find_offer_by_operation_across_instances(
+        &self,
+        _instance_id: InstanceId,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::find_offer_by_operation_across_instances(self, operation_id).await
         })
     }
 

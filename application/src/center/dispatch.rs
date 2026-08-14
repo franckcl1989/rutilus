@@ -445,14 +445,17 @@ where
     ///   re-delivers under the same id exactly like the multi-candidate
     ///   path (W3F-5).
     ///
-    /// The tracking scan queries every candidate state on the state index
-    /// (`ix_operations_state`, §13.6) instead of listing the whole table,
-    /// and the offer scan reads only the pending queue (bounded by
-    /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`]), so a retry of a live dispatch
-    /// never decrypts an acknowledged offer row; the rare fall-through
-    /// branch resolves each candidate the pending scan cannot see through
-    /// [`Self::resolve_candidate`]'s directed read — one row per candidate,
-    /// never a scan of the site's queue.
+    /// The tracking scan queries every candidate state scoped to the
+    /// endpoint (W7-P-1: the SQL rides the endpoint index first, so the
+    /// scan lists — and decrypts — the endpoint's own rows instead of the
+    /// global operation table; the state filter is then a residual
+    /// predicate over that bounded set), and the offer scan reads only the
+    /// pending queue (bounded by [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`]), so
+    /// a retry of a live dispatch never decrypts an acknowledged offer
+    /// row; the rare fall-through branch resolves each candidate the
+    /// pending scan cannot see through [`Self::resolve_candidate`]'s
+    /// directed read — one row per candidate, never a scan of the site's
+    /// queue.
     async fn find_undecided(
         &self,
         request: &CenterOperationRequest,
@@ -462,7 +465,7 @@ where
         for state in IDEMPOTENCY_CANDIDATE_STATES {
             operations.extend(
                 self.store
-                    .list_operations(Some(state))
+                    .list_operations_for_endpoint(Some(state), request.endpoint_id)
                     .await
                     .map_err(CenterDispatchError::Operation)?,
             );
@@ -654,18 +657,27 @@ where
     /// Finds a terminal `Unknown` operation covering the dispatch key
     /// (R6-E-01, §13.5): a center-sourced operation on the same endpoint
     /// and command that ended `Unknown` — the site could not prove whether
-    /// the write landed. The addressed site is confirmed through the
-    /// durable offer row, so an `Unknown` operation whose offer lives in
-    /// another site's queue (the endpoint was re-homed since) does not
-    /// block this site's dispatch; the newest row per operation survives
-    /// the ack-time pruning, so the confirmation is the directed read.
+    /// the write landed.
+    ///
+    /// The confirmation is the directed read over the plaintext
+    /// `operation_id` column across *every* instance's queue (W7-E-3): an
+    /// endpoint can be re-homed between the `Unknown` outcome and the
+    /// retry, and the write risk travels with the endpoint — the offer
+    /// that may have executed it lives in the original site's queue, not
+    /// the retry's. A per-site confirmation would find no row there and
+    /// silently unblock the re-homed retry, double-executing the same
+    /// physical BMC write. A confirmed offer whose target disagrees with
+    /// the request (W7-F-3) is a different operation on the same endpoint
+    /// and command, and its dispatch starts fresh below. The newest row
+    /// per operation survives the ack-time pruning, so the confirmation
+    /// is the directed read.
     async fn find_unknown_outcome(
         &self,
         request: &CenterOperationRequest,
     ) -> Result<Option<OperationId>, DispatchErrorOf<Store, Outbox, Roles>> {
         let unknown = self
             .store
-            .list_operations(Some(OperationState::Unknown))
+            .list_operations_for_endpoint(Some(OperationState::Unknown), request.endpoint_id)
             .await
             .map_err(CenterDispatchError::Operation)?;
         let mut matches = unknown
@@ -681,12 +693,20 @@ where
             .collect::<Vec<_>>();
         matches.sort_by_key(|operation| (operation.created_at(), operation.id()));
         for operation in matches {
-            if self
+            let Some(entry) = self
                 .outbox
-                .find_offer_by_operation(request.site_id, operation.id())
+                .find_offer_by_operation_across_instances(request.site_id, operation.id())
                 .await
                 .map_err(CenterDispatchError::Outbox)?
-                .is_some()
+            else {
+                continue;
+            };
+            // W7-F-3: the offer's target is the dispatch key's target —
+            // an `Unknown` outcome on another target is a different
+            // operation on the same endpoint and command, and its
+            // dispatch starts fresh below.
+            if offer_facts(&entry)
+                .is_some_and(|fact| fact.target == request.target_odata_id.as_str())
             {
                 return Ok(Some(operation.id()));
             }
@@ -844,6 +864,17 @@ impl ReplyTarget {
             Self::Succeeded => &[
                 OperationEvent::ValidationStarted,
                 OperationEvent::ValidationPassed,
+                // W7-E-1: the remote-task completion leads the succeeded
+                // path — the site's terminal report for an operation
+                // tracked as `WaitingRemote` (§13.6, R6-E-06) is
+                // `OperationCompleted{succeeded:true}` (the remote task
+                // finished successfully), and the lead-in must carry the
+                // completion or every event is absorbed as invalid and the
+                // record stays on the remote-task path forever. The event
+                // does not apply on the plain running path (or the
+                // queued/validating healing paths) and is absorbed exactly
+                // like the other non-applicable lead-ins.
+                OperationEvent::RemoteTaskCompleted,
                 OperationEvent::ExecutionAccepted,
                 OperationEvent::VerificationPassed,
             ],
@@ -2030,6 +2061,40 @@ mod tests {
             })
         }
 
+        fn find_offer_by_operation_across_instances(
+            &self,
+            _instance_id: InstanceId,
+            operation_id: OperationId,
+        ) -> BoundaryFuture<'_, Result<Option<OutboxEntry>, Self::Error>> {
+            // W7-E-3: the production store's cross-instance read finds the
+            // offer in *any* instance's queue — the mock mirrors that by
+            // scanning every entry regardless of its instance.
+            Box::pin(async move {
+                let mut rows = self
+                    .state
+                    .entries
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|entry| {
+                        serde_json::from_str::<Envelope>(entry.payload_json())
+                            .ok()
+                            .and_then(|envelope| envelope.message)
+                            .is_some_and(|message| {
+                                matches!(
+                                    message,
+                                    EnvelopeMessage::OperationOffer(offer)
+                                        if offer.operation_id == operation_id.to_string()
+                                )
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(OutboxEntry::sequence);
+                Ok(rows.into_iter().next())
+            })
+        }
+
         fn acknowledge(
             &self,
             entry_id: OutboxEntryId,
@@ -2174,6 +2239,33 @@ mod tests {
                     message: Some(EnvelopeMessage::OperationAccepted(OperationAccepted {
                         operation_id: operation_id.to_string(),
                         accepted_at_unix: now.unix_timestamp(),
+                    })),
+                },
+                now,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Sends one successful `OperationCompleted` reply for the operation —
+    /// the site's terminal report of a task that finished (§15.6: the
+    /// `succeeded: true` completion, W7-E-1).
+    async fn succeed_reply(
+        tracking: &CenterOperationTracking<MockDispatchStore, MockDispatchStore>,
+        site: InstanceId,
+        operation_id: OperationId,
+        now: OffsetDateTime,
+    ) -> Result<(), Box<dyn Error>> {
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationCompleted(OperationCompleted {
+                        operation_id: operation_id.to_string(),
+                        succeeded: true,
+                        summary: String::from("succeeded"),
                     })),
                 },
                 now,
@@ -4192,6 +4284,269 @@ mod tests {
                 .ok_or("the tracking record is missing")?
                 .state(),
             OperationState::WaitingRemote
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_report_closes_a_waiting_remote_record() -> Result<(), Box<dyn Error>> {
+        // W7-E-1: the site's terminal report after a `waiting-remote`
+        // progress is `OperationCompleted{succeeded:true}` (§15.6 — the
+        // site reports the remote task's success as a plain succeeded
+        // completion). The Succeeded lead-in must carry the remote-task
+        // completion, or every event is absorbed as invalid and the record
+        // stays on the remote-task path forever — the center then never
+        // learns the operation finished.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let operation_id = dispatched.operation_id();
+
+        // The site reports the asynchronous task, then its success: the
+        // record must close as `Succeeded`.
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                        operation_id: operation_id.to_string(),
+                        state: String::from("waiting-remote"),
+                        detail: String::from("monitoring the BMC task"),
+                    })),
+                },
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::WaitingRemote
+        );
+        succeed_reply(&tracking, site, operation_id, now + Duration::seconds(2)).await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Succeeded,
+            "the succeeded report must advance the waiting-remote record to Succeeded"
+        );
+
+        // A re-delivered succeeded report is absorbed: the record stays
+        // terminal.
+        succeed_reply(&tracking, site, operation_id, now + Duration::seconds(3)).await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Succeeded
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_report_closes_a_waiting_remote_record() -> Result<(), Box<dyn Error>> {
+        // W7-E-1 regression: the `Failed` path of a `waiting-remote`
+        // record — the site's unsuccessful completion report lands directly
+        // on the remote-task path.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let operation_id = dispatched.operation_id();
+
+        tracking
+            .on_reply(
+                site,
+                &Envelope {
+                    sequence: 1,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::OperationProgress(OperationProgress {
+                        operation_id: operation_id.to_string(),
+                        state: String::from("waiting-remote"),
+                        detail: String::from("monitoring the BMC task"),
+                    })),
+                },
+                now + Duration::SECOND,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            operation_id,
+            "failed",
+            now + Duration::seconds(2),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(operation_id)
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Failed,
+            "the failed report must close the waiting-remote record"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_blocks_the_re_homed_endpoints_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        // W7-E-3: the R6-E-01 confirmation is endpoint-scoped, not
+        // site-scoped. When the endpoint was re-homed after the `Unknown`
+        // outcome, the new site's queue holds no offer row for the
+        // operation — but the original site's queue does, and that is
+        // where the write may have landed. The refusal must confirm the
+        // offer across every instance's queue, or the re-home silently
+        // bypasses the protection and the same physical BMC is dispatched
+        // twice.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site_a, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let first = dispatch
+            .dispatch(
+                &request(site_a, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site_a,
+            first.operation_id(),
+            "unknown",
+            now + Duration::SECOND,
+        )
+        .await?;
+
+        // The endpoint moves to site B: the dispatch to B is refused with
+        // the existing operation id even though B's queue holds no offer —
+        // A's queue does, and that is where the write may have landed.
+        *state.endpoint.lock().map_err(|_| MockStoreError)? = Some((endpoint_id, site_b));
+        let retry = dispatch
+            .dispatch(
+                &request(site_b, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await;
+        assert!(
+            matches!(
+                retry,
+                Err(CenterDispatchError::UnknownOutcomePending { operation_id })
+                    if operation_id == first.operation_id()
+            ),
+            "the re-homed dispatch must be refused with the existing operation id"
+        );
+        assert_eq!(
+            state.offers_owned().len(),
+            1,
+            "no second offer is enqueued for the refused retry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_on_one_target_does_not_block_another_targets_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        // W7-F-3: the R6-E-01 refusal is per dispatch key — a terminal
+        // `Unknown` on the same endpoint and command but a different
+        // target is a different operation, and its dispatch starts fresh;
+        // the same target keeps refusing with the existing operation id.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        // The endpoint projects a second resource: the target-B dispatch
+        // is a valid route of the same endpoint.
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Systems/2")));
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            first.operation_id(),
+            "unknown",
+            now + Duration::SECOND,
+        )
+        .await?;
+
+        // The same target keeps refusing with the existing operation id.
+        let same_target = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await;
+        assert!(
+            matches!(
+                same_target,
+                Err(CenterDispatchError::UnknownOutcomePending { operation_id })
+                    if operation_id == first.operation_id()
+            ),
+            "the same target must keep refusing with the existing operation id"
+        );
+
+        // A different target of the same endpoint and command dispatches
+        // fresh: the `Unknown` outcome of target A cannot have executed
+        // the target-B write.
+        let second = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/2", actor)?,
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_ne!(
+            second.operation_id(),
+            first.operation_id(),
+            "the other target's dispatch must mint a fresh operation"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "the fresh dispatch records its own operation"
         );
         Ok(())
     }

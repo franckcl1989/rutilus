@@ -110,6 +110,15 @@ impl SqliteStore {
     /// history; E-11: the `offset` is the pagination primitive of that
     /// surface).
     ///
+    /// The sort keys `(occurred_at DESC, event_sequence DESC)` are not a
+    /// total order — two events of different operations can share both
+    /// values — so the event id is the third, descending tiebreaker
+    /// (W7-D-1): offset pages partition the history without a well-defined
+    /// boundary, which could otherwise skip or repeat rows across page
+    /// fetches. The three keys match the `ix_audit_events_occurred_at_sequence`
+    /// covering index exactly, so the listing reads the rows in final order
+    /// directly off the index.
+    ///
     /// The console's audit query reads a bounded in-memory tail that is
     /// warmed from this listing at startup, so a restart never hides the
     /// persisted history. Each row is revalidated through the same typed
@@ -135,6 +144,7 @@ impl SqliteStore {
         let models = audit_event::Entity::find()
             .order_by_desc(audit_event::Column::OccurredAt)
             .order_by_desc(audit_event::Column::EventSequence)
+            .order_by_desc(audit_event::Column::Id)
             .offset(offset)
             .limit(limit)
             .all(&self.database)
@@ -149,6 +159,27 @@ impl SqliteStore {
             }
         }
         Ok(events)
+    }
+
+    /// Whether one audit event is already persisted (W7-D-2).
+    ///
+    /// The compensation drain's re-issue path must distinguish an append
+    /// whose write committed before the store reported an error from an
+    /// append that never landed: a primary-key lookup answers that without
+    /// loading or revalidating the operation's whole trail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditRepositoryError::Database`] when the lookup fails.
+    pub async fn audit_event_exists(
+        &self,
+        event_id: AuditEventId,
+    ) -> Result<bool, AuditRepositoryError> {
+        audit_event::Entity::find_by_id(event_id.into_uuid())
+            .one(&self.database)
+            .await
+            .map(|model| model.is_some())
+            .map_err(AuditRepositoryError::Database)
     }
 }
 
@@ -806,6 +837,69 @@ mod tests {
         // An offset past the end lists nothing, like a tail page beyond the
         // history.
         assert!(store.list_recent_audit_events(10, 10).await?.is_empty());
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn equal_key_rows_page_in_a_stable_total_order_by_event_id() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        // W7-D-1: three independent operations all start at the same instant,
+        // so their rows share (occurred_at, event_sequence) — the sort keys
+        // that are not a total order. The id tiebreaker must make the pages
+        // partition the history without an ambiguous boundary.
+        let mut events = Vec::new();
+        for _ in 0..3_u8 {
+            let context =
+                enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+            let started = AuditEvent::started(context, now);
+            store.append_audit_event(&started).await?;
+            events.push(started);
+        }
+
+        let full = store.list_recent_audit_events(10, 0).await?;
+        assert_eq!(full.len(), 3);
+        // The first page carries the highest event id (the id tiebreak is
+        // descending, newest id first).
+        let expected_newest = events
+            .iter()
+            .max_by_key(|event| event.id().into_uuid())
+            .ok_or("three events cannot be empty")?;
+        let first_page = store.list_recent_audit_events(1, 0).await?;
+        assert_eq!(first_page[0].id(), expected_newest.id());
+
+        // The single-row pages partition the full listing: no overlap, no
+        // gap, and the same order in every query.
+        let mut paged = first_page;
+        paged.extend(store.list_recent_audit_events(1, 1).await?);
+        paged.extend(store.list_recent_audit_events(1, 2).await?);
+        assert_eq!(paged, full);
+        assert_eq!(
+            store.list_recent_audit_events(10, 0).await?,
+            full,
+            "the listing order must be stable across queries"
+        );
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_event_exists_answers_by_primary_key() -> Result<(), Box<dyn Error>> {
+        // W7-D-2: the drain's re-issue path distinguishes a committed-but-
+        // errored append from one that never landed through this lookup.
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let context = enrollment_context(AuditOperationId::generate(), CredentialId::generate())?;
+        let started = AuditEvent::started(context, OffsetDateTime::now_utc());
+        assert!(!store.audit_event_exists(started.id()).await?);
+        store.append_audit_event(&started).await?;
+        assert!(store.audit_event_exists(started.id()).await?);
+        assert!(!store.audit_event_exists(AuditEventId::generate()).await?);
         store.close().await?;
         drop(directory);
         Ok(())

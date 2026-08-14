@@ -4447,12 +4447,20 @@ impl RefreshFailure {
 }
 
 /// The lazy-loading state of the bounded audit query section.
+///
+/// A page load in flight is [`AuditListState::Loading`] — carrying the
+/// page of the previous window when the load is a load-earlier (N1), so
+/// the section keeps rendering the loaded events instead of blanking.
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AuditListState {
     Idle,
-    Loading,
+    /// A page load is in flight. `Loading(None)` is a fresh window (the
+    /// initial load or a refresh); `Loading(Some(page))` keeps the loaded
+    /// window on screen while an older page loads (N1).
+    Loading(Option<AuditPage>),
     Ready(AuditPage),
+    /// The initial load failed — no window exists to keep.
     Failed,
 }
 
@@ -4465,12 +4473,20 @@ struct AuditPage {
     /// The offset of the next older page; only meaningful while the loaded
     /// window's response reported `has_more`.
     next_offset: u64,
+    /// Whether the last load-earlier attempt failed (L3): the window is
+    /// kept exactly as loaded and the error hint shows until the next
+    /// load-earlier or refresh clears it.
+    load_failed: bool,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl AuditPage {
     const fn new(query: AuditQueryResponse, next_offset: u64) -> Self {
-        Self { query, next_offset }
+        Self {
+            query,
+            next_offset,
+            load_failed: false,
+        }
     }
 
     /// Whether the server reported an older page exists behind this window.
@@ -4478,15 +4494,28 @@ impl AuditPage {
         self.query.has_more()
     }
 
+    /// Marks the window after a failed load-earlier attempt (L3): the
+    /// events and the offset are untouched — the window stays exactly as
+    /// loaded — and only the error flag changes.
+    fn with_failed_load(&self) -> Self {
+        Self {
+            query: self.query.clone(),
+            next_offset: self.next_offset,
+            load_failed: true,
+        }
+    }
+
     /// Appends one older page below the current window (E-11): the older
     /// events follow the newest-first window, and the older page's own
-    /// `has_more` decides whether yet another page exists.
+    /// `has_more` decides whether yet another page exists. A successful
+    /// load also clears a previous load-earlier failure (L3).
     fn with_older(&self, older: &AuditQueryResponse, page_size: u32) -> Self {
         let mut events = self.query.events().to_vec();
         events.extend(older.events().iter().cloned());
         Self {
             query: AuditQueryResponse::new(events, older.has_more()),
             next_offset: self.next_offset + u64::from(page_size),
+            load_failed: false,
         }
     }
 }
@@ -4497,12 +4526,28 @@ impl AuditListState {
         matches!(self, Self::Ready(_))
     }
 
+    /// Whether the error hint must show: the initial load failed, or the
+    /// last load-earlier attempt failed while the window was kept (L3).
     const fn is_failed(&self) -> bool {
-        matches!(self, Self::Failed)
+        match self {
+            Self::Failed => true,
+            Self::Ready(page) => page.load_failed,
+            Self::Idle | Self::Loading(_) => false,
+        }
     }
 
     const fn is_loading(&self) -> bool {
-        matches!(self, Self::Loading)
+        matches!(self, Self::Loading(_))
+    }
+
+    /// The window that stays on screen: the loaded page of `Ready`, or the
+    /// kept page of a load-earlier in flight (N1) — the events and the
+    /// count stay rendered instead of blanking the section.
+    fn page(&self) -> Option<&AuditPage> {
+        match self {
+            Self::Ready(page) | Self::Loading(Some(page)) => Some(page),
+            Self::Idle | Self::Loading(None) | Self::Failed => None,
+        }
     }
 
     fn has_empty_events(&self) -> bool {
@@ -4510,10 +4555,7 @@ impl AuditListState {
     }
 
     fn count_text(&self) -> String {
-        let count = match self {
-            Self::Ready(page) => page.query.events().len(),
-            Self::Idle | Self::Loading | Self::Failed => 0,
-        };
+        let count = self.page().map_or(0, |page| page.query.events().len());
         match count {
             1 => L().count_audit_events_one.to_owned(),
             _ => catalog_format!(L().count_audit_events_many, count),
@@ -4521,15 +4563,15 @@ impl AuditListState {
     }
 
     fn event_cards(&self) -> Vec<AuditEventCardProjection> {
-        match self {
-            Self::Ready(page) => page
-                .query
-                .events()
-                .iter()
-                .map(AuditEventCardProjection::from)
-                .collect(),
-            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
-        }
+        self.page()
+            .map(|page| {
+                page.query
+                    .events()
+                    .iter()
+                    .map(AuditEventCardProjection::from)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -14869,7 +14911,7 @@ mod browser {
         Effect::new(move |_| {
             if active() && !triggered.get() {
                 set_triggered.set(true);
-                set_state.set(AuditListState::Loading);
+                set_state.set(AuditListState::Loading(None));
                 spawn_local(async move {
                     let state = match fetch_audit(0).await {
                         Some(query) => AuditListState::Ready(AuditPage::new(
@@ -14884,7 +14926,7 @@ mod browser {
         });
 
         let on_refresh = move |_| {
-            set_state.set(AuditListState::Loading);
+            set_state.set(AuditListState::Loading(None));
             spawn_local(async move {
                 let state = match fetch_audit(0).await {
                     Some(query) => {
@@ -14898,16 +14940,19 @@ mod browser {
 
         // E-11: loads the next older page below the current newest-first
         // window. A failed page load restores the previous window, so a
-        // transient failure never discards the history already loaded.
+        // transient failure never discards the history already loaded (L3
+        // adds the error hint that names the failure).
         let on_load_earlier = move |_| {
             let AuditListState::Ready(page) = state.get() else {
                 return;
             };
             let offset = page.next_offset;
-            set_state.set(AuditListState::Loading);
+            // N1: the loaded window stays on screen while the older page
+            // loads — the events and the count are never blanked.
+            set_state.set(AuditListState::Loading(Some(page.clone())));
             spawn_local(async move {
                 let Some(older) = fetch_audit(offset).await else {
-                    set_state.set(AuditListState::Ready(page));
+                    set_state.set(AuditListState::Ready(page.with_failed_load()));
                     return;
                 };
                 set_state.set(AuditListState::Ready(
@@ -14973,7 +15018,16 @@ mod browser {
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
-                    {L().unavailable_audit}
+                    {move || match state.get() {
+                        AuditListState::Failed => L().unavailable_audit,
+                        // L3: the window is kept — the hint names the failed
+                        // load-earlier instead of the unavailable log.
+                        AuditListState::Ready(page) if page.load_failed => {
+                            L().error_audit_load_earlier
+                        }
+                        AuditListState::Ready(_) | AuditListState::Idle
+                        | AuditListState::Loading(_) => L().unavailable_audit,
+                    }}
                 </p>
             </section>
         }
@@ -21604,7 +21658,7 @@ mod tests {
             .has_empty_events()
         );
         assert!(AuditListState::Failed.is_failed());
-        assert!(AuditListState::Loading.is_loading());
+        assert!(AuditListState::Loading(None).is_loading());
         Ok(())
     }
 
@@ -21670,6 +21724,114 @@ mod tests {
         assert!(
             !merged.has_older_events(),
             "has_more follows the loaded page's own verdict"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loading_a_page_keeps_the_loaded_window_rendered() -> Result<(), Box<dyn Error>> {
+        // N1: while an older page loads, the section keeps rendering the
+        // loaded window — the event cards do not blank out and the count
+        // keeps its previous value, so a paging round trip never unmounts
+        // the window.
+        let newest = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": true,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:10:11Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 2,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e0",
+                    "message": "newest"
+                }
+            ]
+        }))?;
+        let page = AuditPage::new(newest, 50);
+        let loading = AuditListState::Loading(Some(page));
+        assert!(loading.is_loading());
+        assert_eq!(
+            loading.event_cards().len(),
+            1,
+            "the kept window's events stay rendered during the load"
+        );
+        assert_eq!(
+            loading.count_text(),
+            "1 audit event",
+            "the count keeps the previous value during the load"
+        );
+        assert!(
+            AuditListState::Loading(None).event_cards().is_empty(),
+            "a fresh load has no window to keep"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_load_earlier_keeps_the_window_and_shows_the_error_until_the_retry_succeeds()
+    -> Result<(), Box<dyn Error>> {
+        // L3: a failed load-earlier restores the previous window (the E-11
+        // contract) and marks it failed, so the error hint shows; a
+        // successful retry appends the page and clears the flag.
+        let newest = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": true,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:10:11Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 2,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e0",
+                    "message": "newest"
+                }
+            ]
+        }))?;
+        let older = serde_json::from_value::<AuditQueryResponse>(json!({
+            "has_more": false,
+            "events": [
+                {
+                    "occurred_at": "2026-08-05T09:09:00Z",
+                    "actor": "local-operator",
+                    "action": "import-endpoints",
+                    "target": { "kind": "product", "identifier": null },
+                    "outcome": { "kind": "succeeded" },
+                    "sequence": 1,
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789e1",
+                    "message": "older"
+                }
+            ]
+        }))?;
+        let page = AuditPage::new(newest, 50);
+        let failed = AuditListState::Ready(page.with_failed_load());
+        assert!(
+            failed.is_failed(),
+            "a failed load-earlier must surface the error hint"
+        );
+        assert_eq!(
+            failed.event_cards().len(),
+            1,
+            "the window must still hold the loaded events"
+        );
+        assert_eq!(failed.count_text(), "1 audit event");
+        let retried = failed.page().ok_or("the kept window must exist")?;
+        let success = AuditListState::Ready(retried.with_older(&older, 50));
+        assert!(
+            !success.is_failed(),
+            "a successful retry must clear the load-earlier error"
+        );
+        assert_eq!(
+            success.event_cards().len(),
+            2,
+            "the retry appends the older page below the kept window"
+        );
+        assert_eq!(
+            success.count_text(),
+            "2 audit events",
+            "the count follows the appended window"
         );
         Ok(())
     }

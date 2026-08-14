@@ -331,8 +331,14 @@ impl SqliteStore {
     /// The ack therefore prunes them (R6-E-04): the newest acknowledged row
     /// of the operation is kept, every other acknowledged row of the same
     /// operation is deleted — the queue never grows one row per retry of a
-    /// settled operation. Rows without an operation id (the site-side
-    /// content queue) are never pruned, and pending rows are never pruned.
+    /// settled operation. The pruning is scoped to the row's own instance
+    /// (W7-F-1): the sequence is per-instance, so the same operation id can
+    /// legitimately ride in two instances' queues (an endpoint re-homed
+    /// between dispatches of the same id), and one instance's ack must
+    /// never prune the other instance's rows — those rows are the R6-E-01
+    /// evidence surface of the other dispatch. Rows without an operation id
+    /// (the site-side content queue) are never pruned, and pending rows are
+    /// never pruned.
     ///
     /// # Errors
     ///
@@ -377,18 +383,22 @@ impl SqliteStore {
             map_stored_outbox_entry(self, entry_id, &model)?;
             AckOutcome::AlreadyAcknowledged
         };
-        // R6-E-04: prune the acknowledged history of the just-acked row's
-        // operation, keeping the newest acknowledged row. The just-updated
-        // row participates (it is acked by now), so the keeper is the
-        // newest acknowledged row whether it is this one or a newer
-        // retry's.
-        let acked_operation_id = center_outbox::Entity::find_by_id(entry_id.into_uuid())
+        // R6-E-04 / W7-F-1: prune the acknowledged history of the
+        // just-acked row's operation, keeping the newest acknowledged row
+        // of *this* instance. The just-updated row participates (it is
+        // acked by now), so the keeper is the newest acknowledged row of
+        // the instance whether it is this one or a newer retry's. The
+        // instance filter is the fix of W7-F-1: without it, an ack on one
+        // instance of a re-homed operation would delete the other
+        // instance's acknowledged rows of the same operation id.
+        let acked_row = center_outbox::Entity::find_by_id(entry_id.into_uuid())
             .one(&transaction)
             .await
-            .map_err(CenterOutboxRepositoryError::Database)?
-            .and_then(|model| model.operation_id);
-        if let Some(operation_id) = acked_operation_id {
-            prune_acked_operation_history(&transaction, operation_id).await?;
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        if let Some(model) = acked_row
+            && let Some(operation_id) = model.operation_id
+        {
+            prune_acked_operation_history(&transaction, model.instance_id, operation_id).await?;
         }
         transaction
             .commit()
@@ -434,12 +444,136 @@ impl SqliteStore {
             let entry_id = OutboxEntryId::from_uuid(model.id);
             return map_stored_outbox_entry(self, entry_id, &model).map(Some);
         }
+        // W7-P-2: the fallback runs only for a queue that can actually hide
+        // the offer. Pre-migration rows carry `NULL` in the column, so a
+        // queue whose rows all carry the column proves the operation was
+        // never enqueued — the miss answers immediately instead of
+        // rescanning (and decrypting) the instance's whole queue on every
+        // call, which a never-queued id would otherwise pay forever. The
+        // existence check rides the (instance_id, operation_id) index:
+        // SQLite indexes NULL keys, so `IS NULL` is an index range scan,
+        // not a table scan.
+        let null_row = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .filter(center_outbox::Column::OperationId.is_null())
+            .select_only()
+            .column(center_outbox::Column::Id)
+            .limit(1)
+            .into_tuple::<(Uuid,)>()
+            .one(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        if null_row.is_none() {
+            return Ok(None);
+        }
         // Pre-migration rows carry `NULL` in the column: find the newest
-        // offer row of the operation by decrypting the payloads, backfill
-        // the column, and return it.
+        // offer row of the operation by decrypting the NULL-column
+        // payloads — a row whose column is set can never hide the target
+        // operation (the indexed query already missed it) — backfill the
+        // column, and return it.
         let models = center_outbox::Entity::find()
             .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .filter(center_outbox::Column::OperationId.is_null())
             .order_by_desc(center_outbox::Column::Sequence)
+            .order_by_desc(center_outbox::Column::Id)
+            .all(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        for model in models {
+            let entry_id = OutboxEntryId::from_uuid(model.id);
+            let entry = map_stored_outbox_entry(self, entry_id, &model)?;
+            if payload_operation_id(entry.payload_json()) != Some(operation_id) {
+                continue;
+            }
+            // The backfill is a write, so it runs under the write gate like
+            // every other queue write; it cannot deadlock — no caller of
+            // this read holds the gate.
+            let _write_permit = self
+                .write_gate
+                .acquire()
+                .await
+                .map_err(CenterOutboxRepositoryError::Coordinate)?;
+            center_outbox::Entity::update_many()
+                .filter(center_outbox::Column::Id.eq(entry_id.into_uuid()))
+                .set(center_outbox::ActiveModel {
+                    operation_id: Set(Some(operation_id.into_uuid())),
+                    ..Default::default()
+                })
+                .exec(&self.database)
+                .await
+                .map_err(CenterOutboxRepositoryError::Database)?;
+            return Ok(Some(entry));
+        }
+        Ok(None)
+    }
+
+    /// Finds the newest outbox row of one operation across every instance —
+    /// the cross-instance confirmation read of the R6-E-01 dispatch refusal
+    /// (W7-E-3).
+    ///
+    /// An endpoint's site can change (re-home) while an `Unknown` outcome
+    /// is unresolved: the offer that may have executed the write lives in
+    /// the *original* site's queue, while the retry addresses the *new*
+    /// site. The unknown-outcome refusal must therefore confirm the offer
+    /// against any instance's queue — an `Unknown` row whose offer exists
+    /// somewhere is the same physical write risk no matter which site's
+    /// queue holds it, and the per-site read would silently unblock the
+    /// re-homed retry and double-execute the BMC write.
+    ///
+    /// The read is the directed lookup over the plaintext `operation_id`
+    /// column (R6-E-04) without the instance filter; the single-column
+    /// `ix_center_outbox_operation` index serves it. Rows written before
+    /// the `operation_id` migration carry `NULL`: exactly like the
+    /// per-instance read, the lookup then falls back to a payload scan of
+    /// the NULL-column rows (across instances — the pre-migration queue of
+    /// any instance can hide the offer), backfills the found row, and
+    /// returns it, so a pre-migration acknowledged offer is never mistaken
+    /// for a never-enqueued record even after the endpoint moved. The
+    /// sequence is per-instance, so the cross-instance "newest" ordering
+    /// is by creation time, not by sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterOutboxRepositoryError::Corrupt`] when any scanned
+    /// stored row violates domain invariants or its payload ciphertext
+    /// cannot be authenticated, and
+    /// [`CenterOutboxRepositoryError::CommandKeyMissing`] when a ciphertext
+    /// row is read through a keyless store.
+    pub async fn find_offer_by_operation_across_instances(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<OutboxEntry>, CenterOutboxRepositoryError> {
+        let model = center_outbox::Entity::find()
+            .filter(center_outbox::Column::OperationId.eq(operation_id.into_uuid()))
+            .order_by_desc(center_outbox::Column::CreatedAt)
+            .order_by_desc(center_outbox::Column::Id)
+            .one(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        if let Some(model) = model {
+            let entry_id = OutboxEntryId::from_uuid(model.id);
+            return map_stored_outbox_entry(self, entry_id, &model).map(Some);
+        }
+        // W7-P-2: the NULL-existence gate of the per-instance read,
+        // across instances — a miss on fully backfilled queues answers
+        // without decrypting anything.
+        let null_row = center_outbox::Entity::find()
+            .filter(center_outbox::Column::OperationId.is_null())
+            .select_only()
+            .column(center_outbox::Column::Id)
+            .limit(1)
+            .into_tuple::<(Uuid,)>()
+            .one(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        if null_row.is_none() {
+            return Ok(None);
+        }
+        // Pre-migration rows: scan the NULL-column rows of every instance,
+        // backfill the first match, and return it.
+        let models = center_outbox::Entity::find()
+            .filter(center_outbox::Column::OperationId.is_null())
+            .order_by_desc(center_outbox::Column::CreatedAt)
             .order_by_desc(center_outbox::Column::Id)
             .all(&self.database)
             .await
@@ -587,29 +721,37 @@ fn payload_operation_id(payload_json: &str) -> Option<OperationId> {
     offer.operation_id.parse().ok()
 }
 
-/// Prunes the acknowledged history of one operation (R6-E-04): the newest
-/// acknowledged row of the operation is kept, every other acknowledged row
-/// of the same operation is deleted.
+/// Prunes the acknowledged history of one operation within one instance
+/// (R6-E-04, W7-F-1): the newest acknowledged row of the operation in the
+/// instance is kept, every other acknowledged row of the same operation
+/// in the same instance is deleted.
 ///
-/// The keeper is the newest row of the whole queue for the operation — the
-/// just-acknowledged row included — so a retry that re-delivered a fresh
-/// offer under the same id keeps the newest acknowledged row and the older
-/// ones disappear. Rows without an operation id (the site-side content
-/// queue) are never touched — this helper only runs for a row that carries
-/// one — and pending rows are never pruned: a pending row is still
-/// deliverable.
+/// The keeper is the newest row of the instance's queue for the operation
+/// — the just-acknowledged row included — so a retry that re-delivered a
+/// fresh offer under the same id keeps the newest acknowledged row and the
+/// older ones disappear. The instance filter is the W7-F-1 fix: the
+/// sequence is per-instance, so the same operation id can legitimately
+/// ride in two instances' queues (an endpoint re-homed between dispatches
+/// of the same id), and the pruning of one instance's history must never
+/// delete the other instance's rows — those rows are the R6-E-01 evidence
+/// surface of the other dispatch. Rows without an operation id (the
+/// site-side content queue) are never touched — this helper only runs for
+/// a row that carries one — and pending rows are never pruned: a pending
+/// row is still deliverable.
 ///
 /// # Errors
 ///
 /// Returns [`CenterOutboxRepositoryError::Database`] when a query fails.
 async fn prune_acked_operation_history<C>(
     database: &C,
+    instance_id: Uuid,
     operation_id: Uuid,
 ) -> Result<(), CenterOutboxRepositoryError>
 where
     C: ConnectionTrait,
 {
     let Some(keeper) = center_outbox::Entity::find()
+        .filter(center_outbox::Column::InstanceId.eq(instance_id))
         .filter(center_outbox::Column::OperationId.eq(operation_id))
         .filter(center_outbox::Column::State.eq("acked"))
         .order_by_desc(center_outbox::Column::Sequence)
@@ -621,6 +763,7 @@ where
         return Ok(());
     };
     center_outbox::Entity::delete_many()
+        .filter(center_outbox::Column::InstanceId.eq(instance_id))
         .filter(center_outbox::Column::OperationId.eq(operation_id))
         .filter(center_outbox::Column::State.eq("acked"))
         .filter(center_outbox::Column::Id.ne(keeper.id))
@@ -1428,6 +1571,293 @@ mod tests {
             model.operation_id,
             Some(operation_id.into_uuid()),
             "the directed read must backfill the plaintext operation id"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_pruning_is_scoped_to_the_acked_rows_instance() -> Result<(), Box<dyn Error>> {
+        // W7-F-1: the ack pruning filters by (instance, operation) — the
+        // sequence is per-instance, so the same operation id can ride in
+        // two instances' queues (an endpoint re-homed between dispatches of
+        // the same id), and one instance's ack must never prune the other
+        // instance's acknowledged rows: those rows are the evidence surface
+        // of the other dispatch (R6-E-01).
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site_a = site_instance(base);
+        let site_b = site_instance(base + Duration::SECOND);
+        store.create_instance(&site_a).await?;
+        store.create_instance(&site_b).await?;
+        let operation_id = OperationId::generate();
+
+        // Site A holds one acknowledged offer row of the operation.
+        let a_row = store
+            .enqueue_outbox_entry(site_a.id(), &offer_for(&site_a, operation_id), base)
+            .await?;
+        store
+            .ack_outbox_entry(a_row.id(), base + Duration::SECOND)
+            .await?;
+
+        // Site B holds two acknowledged rows and a fresh pending one; the
+        // final ack prunes B's own older acknowledged rows but must leave
+        // A's row alone.
+        let b_first = store
+            .enqueue_outbox_entry(site_b.id(), &offer_for(&site_b, operation_id), base)
+            .await?;
+        store
+            .ack_outbox_entry(b_first.id(), base + Duration::SECOND)
+            .await?;
+        let b_second = store
+            .enqueue_outbox_entry(
+                site_b.id(),
+                &offer_for(&site_b, operation_id),
+                base + Duration::SECOND * 2,
+            )
+            .await?;
+        store
+            .ack_outbox_entry(b_second.id(), base + Duration::SECOND * 3)
+            .await?;
+        let b_pending = store
+            .enqueue_outbox_entry(
+                site_b.id(),
+                &offer_for(&site_b, operation_id),
+                base + Duration::SECOND * 4,
+            )
+            .await?;
+        store
+            .ack_outbox_entry(b_pending.id(), base + Duration::SECOND * 5)
+            .await?;
+
+        let rows_a = store.list_outbox_entries(site_a.id()).await?;
+        assert_eq!(
+            rows_a.len(),
+            1,
+            "site A's evidence row must survive the other instance's ack"
+        );
+        assert_eq!(rows_a[0].id(), a_row.id());
+        assert_eq!(rows_a[0].state(), OutboxEntryState::Acked);
+        let rows_b = store.list_outbox_entries(site_b.id()).await?;
+        assert_eq!(
+            rows_b.iter().map(OutboxEntry::id).collect::<Vec<_>>(),
+            vec![b_pending.id()],
+            "site B keeps only its own newest acknowledged row"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_directed_read_miss_on_a_backfilled_queue_never_decrypts_anything()
+    -> Result<(), Box<dyn Error>> {
+        // W7-P-2: once every row of the queue carries the operation_id
+        // column, a directed read for a never-enqueued id returns
+        // immediately — the NULL existence check proves no pre-migration
+        // row can hide the offer, so no payload is decrypted. The corrupted
+        // ciphertext row planted below would surface as `Corrupt` if any
+        // scan touched it; the miss stays clean, proving the scan never
+        // ran.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site = site_instance(base);
+        store.create_instance(&site).await?;
+        let operation_id = OperationId::generate();
+        let other_id = OperationId::generate();
+
+        store
+            .enqueue_outbox_entry(site.id(), &offer_for(&site, operation_id), base)
+            .await?;
+        // A pre-migration NULL row for another operation: the first
+        // directed read backfills it, leaving no NULL rows behind.
+        let legacy = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            site.id(),
+            2,
+            serde_json::to_string(&Envelope {
+                sequence: 2,
+                acked_sequence: 0,
+                message: Some(offer_for(&site, other_id)),
+            })?,
+            base + Duration::SECOND,
+        );
+        center_outbox::ActiveModel {
+            id: Set(legacy.id().into_uuid()),
+            sequence: Set(legacy.sequence()),
+            instance_id: Set(legacy.instance_id().into_uuid()),
+            payload_json: Set(legacy.payload_json().to_owned()),
+            state: Set(legacy.state().as_str().to_owned()),
+            retry_count: Set(legacy.retry_count()),
+            created_at: Set(legacy.created_at()),
+            acked_at: Set(legacy.acked_at()),
+            operation_id: Set(None),
+        }
+        .insert(&store.database)
+        .await?;
+        let found = store
+            .find_outbox_entry_by_operation(site.id(), other_id)
+            .await?
+            .ok_or("the directed read must find the pre-migration offer")?;
+        assert_eq!(found.id(), legacy.id());
+
+        // A corrupted ciphertext row whose column is set: any payload scan
+        // of the queue would decrypt it and fail as Corrupt.
+        let corrupt_id = OutboxEntryId::generate();
+        let corrupt_operation_id = OperationId::generate();
+        center_outbox::ActiveModel {
+            id: Set(corrupt_id.into_uuid()),
+            sequence: Set(3),
+            instance_id: Set(site.id().into_uuid()),
+            payload_json: Set(String::from("RUTC1:not-a-real-envelope")),
+            state: Set(String::from("pending")),
+            retry_count: Set(0),
+            created_at: Set(base + Duration::seconds(2)),
+            acked_at: Set(None),
+            operation_id: Set(Some(corrupt_operation_id.into_uuid())),
+        }
+        .insert(&store.database)
+        .await?;
+
+        // The queue holds no NULL rows: the miss for a never-enqueued id
+        // is answered without decrypting anything — the corrupt row is
+        // never touched.
+        let unknown = OperationId::generate();
+        assert!(
+            store
+                .find_outbox_entry_by_operation(site.id(), unknown)
+                .await?
+                .is_none(),
+            "a miss on a fully backfilled queue must answer None without a payload scan"
+        );
+        // The corrupt row's own operation still reads as Corrupt when
+        // addressed directly — the planted row is genuinely
+        // undecryptable, which is what makes the clean miss above the
+        // proof that no scan ran.
+        assert!(matches!(
+            store
+                .find_outbox_entry_by_operation(site.id(), corrupt_operation_id)
+                .await,
+            Err(CenterOutboxRepositoryError::Corrupt { entry_id, .. })
+                if entry_id == corrupt_id
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cross_instance_offer_lookup_confirms_an_offer_in_any_instances_queue()
+    -> Result<(), Box<dyn Error>> {
+        // W7-E-3: the unknown-outcome confirmation must hold across an
+        // endpoint re-home — the offer may live in the original site's
+        // queue while the retry addresses the new site's. The cross-instance
+        // lookup finds the row the per-site read of the new site cannot
+        // see.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site_a = site_instance(base);
+        let site_b = site_instance(base + Duration::SECOND);
+        store.create_instance(&site_a).await?;
+        store.create_instance(&site_b).await?;
+        let operation_id = OperationId::generate();
+
+        store
+            .enqueue_outbox_entry(site_a.id(), &offer_for(&site_a, operation_id), base)
+            .await?;
+
+        // The new site's queue holds no row; the cross-instance read still
+        // confirms the offer in the original site's queue.
+        assert!(
+            store
+                .find_outbox_entry_by_operation(site_b.id(), operation_id)
+                .await?
+                .is_none(),
+            "the per-site read of the new site must not see the old site's row"
+        );
+        let entry = store
+            .find_offer_by_operation_across_instances(operation_id)
+            .await?
+            .ok_or("the cross-instance read must find the original site's row")?;
+        assert_eq!(entry.instance_id(), site_a.id());
+
+        // A never-enqueued operation reads as absent.
+        assert!(
+            store
+                .find_offer_by_operation_across_instances(OperationId::generate())
+                .await?
+                .is_none()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cross_instance_offer_lookup_backfills_pre_migration_null_rows()
+    -> Result<(), Box<dyn Error>> {
+        // W7-E-3: the cross-instance fallback covers pre-migration NULL
+        // rows — an acknowledged pre-migration offer in the original site's
+        // queue is never mistaken for a never-enqueued record after the
+        // endpoint moved — and backfills the found row like the per-instance
+        // read.
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site_a = site_instance(base);
+        let site_b = site_instance(base + Duration::SECOND);
+        store.create_instance(&site_a).await?;
+        store.create_instance(&site_b).await?;
+        let operation_id = OperationId::generate();
+        let message = offer_for(&site_a, operation_id);
+        let envelope = Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: Some(message),
+        };
+        let legacy = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            site_a.id(),
+            1,
+            serde_json::to_string(&envelope)?,
+            base,
+        );
+        // A pre-migration row: written straight into the table without the
+        // operation id, exactly as the pre-migration repository did.
+        center_outbox::ActiveModel {
+            id: Set(legacy.id().into_uuid()),
+            sequence: Set(legacy.sequence()),
+            instance_id: Set(legacy.instance_id().into_uuid()),
+            payload_json: Set(legacy.payload_json().to_owned()),
+            state: Set(legacy.state().as_str().to_owned()),
+            retry_count: Set(legacy.retry_count()),
+            created_at: Set(legacy.created_at()),
+            acked_at: Set(legacy.acked_at()),
+            operation_id: Set(None),
+        }
+        .insert(&store.database)
+        .await?;
+
+        let found = store
+            .find_offer_by_operation_across_instances(operation_id)
+            .await?
+            .ok_or("the cross-instance read must find the pre-migration offer")?;
+        assert_eq!(found.id(), legacy.id());
+        assert_eq!(found.instance_id(), site_a.id());
+
+        // The column is backfilled, so the read is now the indexed query.
+        let model = center_outbox::Entity::find_by_id(legacy.id().into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the legacy row is missing")?;
+        assert_eq!(
+            model.operation_id,
+            Some(operation_id.into_uuid()),
+            "the cross-instance read must backfill the plaintext operation id"
         );
 
         store.close().await?;

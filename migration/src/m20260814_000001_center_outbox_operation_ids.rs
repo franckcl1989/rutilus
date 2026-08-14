@@ -28,11 +28,29 @@ use sea_orm_migration::prelude::*;
 /// `down` drops the index and the column; every row survives (the column
 /// was derived data). The single-table `down` is never constrained by the
 /// child-first drop discipline (no foreign key pair to order).
+///
+/// # Why the whole migration commits atomically
+///
+/// The migration overrides [`MigrationTrait::use_transaction`] so the whole
+/// `up` — and the symmetric `down` — commits as one unit on `SQLite`, where
+/// the sea-orm-migration runner wraps only `Postgres` by default. `down`
+/// runs two statements (the index drop, then the column drop) that `SQLite`
+/// would otherwise auto-commit one by one: a crash between them would leave
+/// the index dropped while the migration still records as applied, and the
+/// retried `down` would then fail with "no such index" forever. `DROP
+/// INDEX`, `DROP COLUMN`, `ADD COLUMN`, and `CREATE INDEX` are all legal
+/// `SQLite` DDL inside a transaction, so the override costs nothing but the
+/// crash-resume guarantee — the same discipline the rebuild migrations
+/// (000007/000008 and the `m20260813_00000x` slices) already follow.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .alter_table(

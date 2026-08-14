@@ -2145,11 +2145,30 @@ async fn audit_query<Services, Gateway, Time>(
 where
     Services: AuditEventQuery,
 {
-    let Ok((limit, offset)) = parse_audit_query(uri.query()) else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            format!("audit limit must be between 1 and {AUDIT_QUERY_MAX_LIMIT}"),
-        );
+    let (limit, offset) = match parse_audit_query(uri.query()) {
+        Ok(query) => query,
+        // N2: each violation class answers with its own message, so a bad
+        // `offset` (or a duplicated/unknown parameter) is never reported as
+        // a bad `limit`.
+        Err(ParseAuditError::Limit) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("audit limit must be between 1 and {AUDIT_QUERY_MAX_LIMIT}"),
+            );
+        }
+        Err(ParseAuditError::Offset) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("audit offset must be between 0 and {AUDIT_QUERY_MAX_OFFSET}"),
+            );
+        }
+        Err(ParseAuditError::Parameter) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "audit query accepts only the limit and offset parameters, each at most once"
+                    .to_owned(),
+            );
+        }
     };
     let events = if offset == 0 {
         state.services.list_recent_events(limit)
@@ -3419,7 +3438,7 @@ fn default_event_limit() -> Result<NonZeroU64, ParseEventLimitError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParseEventLimitError;
 
-fn parse_audit_query(query: Option<&str>) -> Result<(NonZeroU64, u64), ParseAuditLimitError> {
+fn parse_audit_query(query: Option<&str>) -> Result<(NonZeroU64, u64), ParseAuditError> {
     let Some(query) = query else {
         return Ok((default_audit_limit()?, 0));
     };
@@ -3428,53 +3447,63 @@ fn parse_audit_query(query: Option<&str>) -> Result<(NonZeroU64, u64), ParseAudi
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("limit=") {
             if limit.is_some() {
-                return Err(ParseAuditLimitError);
+                return Err(ParseAuditError::Parameter);
             }
             limit = Some(parse_audit_limit_value(value)?);
         } else if let Some(value) = pair.strip_prefix("offset=") {
             if offset.is_some() {
-                return Err(ParseAuditLimitError);
+                return Err(ParseAuditError::Parameter);
             }
             offset = Some(parse_audit_offset_value(value)?);
         } else {
-            return Err(ParseAuditLimitError);
+            return Err(ParseAuditError::Parameter);
         }
     }
     Ok((limit.unwrap_or(default_audit_limit()?), offset.unwrap_or(0)))
 }
 
-fn parse_audit_limit_value(value: &str) -> Result<NonZeroU64, ParseAuditLimitError> {
+fn parse_audit_limit_value(value: &str) -> Result<NonZeroU64, ParseAuditError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Limit);
     }
     let Ok(limit) = value.parse::<u64>() else {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Limit);
     };
     if limit == 0 || limit > AUDIT_QUERY_MAX_LIMIT {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Limit);
     }
-    NonZeroU64::new(limit).ok_or(ParseAuditLimitError)
+    NonZeroU64::new(limit).ok_or(ParseAuditError::Limit)
 }
 
-fn parse_audit_offset_value(value: &str) -> Result<u64, ParseAuditLimitError> {
+fn parse_audit_offset_value(value: &str) -> Result<u64, ParseAuditError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Offset);
     }
     let Ok(offset) = value.parse::<u64>() else {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Offset);
     };
     if offset > AUDIT_QUERY_MAX_OFFSET {
-        return Err(ParseAuditLimitError);
+        return Err(ParseAuditError::Offset);
     }
     Ok(offset)
 }
 
-fn default_audit_limit() -> Result<NonZeroU64, ParseAuditLimitError> {
-    NonZeroU64::new(AUDIT_QUERY_DEFAULT_LIMIT).ok_or(ParseAuditLimitError)
+fn default_audit_limit() -> Result<NonZeroU64, ParseAuditError> {
+    NonZeroU64::new(AUDIT_QUERY_DEFAULT_LIMIT).ok_or(ParseAuditError::Limit)
 }
 
+/// The failure classification of one audit query string (N2): each class
+/// answers with its own error message, so a violation is reported for the
+/// parameter it actually concerns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParseAuditLimitError;
+enum ParseAuditError {
+    /// The `limit` value is unparsable, zero, or over the cap.
+    Limit,
+    /// The `offset` value is unparsable or over the cap.
+    Offset,
+    /// A parameter is duplicated or unknown.
+    Parameter,
+}
 
 fn trust_rejected_response(source: EndpointTrustExpectationError) -> Response {
     json_error_with_status(

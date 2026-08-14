@@ -28,11 +28,23 @@
 //! are recognized, so the checks cannot be fooled by quoting.
 //!
 //! The first-word check alone is not sufficient: a statement may start with
-//! a DDL keyword and still smuggle DML past the carve-out's edge. Two
-//! embedded-DML shapes are therefore checked inside every statement that
-//! passes the first-word gate: the `CREATE ... AS SELECT` shapes — the CTAS
-//! data copy (`CREATE TABLE x AS SELECT`) and the `CREATE VIEW ... AS
-//! SELECT` row query — and DML statements inside a `CREATE TRIGGER` body
+//! a DDL keyword and still smuggle DML past the carve-out's edge. A raw
+//! string may also carry several `;`-separated statements, and only the
+//! first word of the whole string used to be judged — `ALTER TABLE x ADD
+//! COLUMN y; DELETE FROM z` is a `DELETE` the first-keyword scan never saw.
+//! Every `execute_unprepared` string is therefore split into its
+//! `;`-separated statements (SQL comments stripped first, quote-aware —
+//! a `;` inside a quoted identifier or literal, or inside a comment, is
+//! not a terminator — the same strip-then-split shape the `down_order_gate`
+//! uses), and each statement is checked on its own: the whole string's raw
+//! first word still gates the string's own leading position (a leading
+//! comment is not a DDL first word), and every segment must pass the
+//! first-word check and the embedded-DML scan independently.
+//!
+//! Two embedded-DML shapes are checked inside every statement that passes
+//! the first-word gate: the `CREATE ... AS SELECT` shapes — the CTAS data
+//! copy (`CREATE TABLE x AS SELECT`) and the `CREATE VIEW ... AS SELECT`
+//! row query — and DML statements inside a `CREATE TRIGGER` body
 //! (`BEGIN ... INSERT/UPDATE/DELETE/... END`). The trigger's own metadata
 //! words (`AFTER INSERT`, `INSTEAD OF UPDATE`, the `WHEN` clause) appear
 //! before `BEGIN` and are not DML.
@@ -348,6 +360,93 @@ fn strip_sql_comments(statement: &str) -> String {
     stripped
 }
 
+/// Splits a raw SQL string into its `;`-separated statements. A `;` inside
+/// a quoted identifier or string literal does not terminate the statement —
+/// `SQLite` quotes identifiers with double quotes (`"..."`), backticks
+/// (`` `...` ``), and square brackets (`[...]`), and string literals with
+/// single quotes (`'...'`, a doubled `''` being the escaped quote) — so
+/// `DROP TABLE "weird;name"` stays one statement and `DEFAULT 'x;y'` keeps
+/// its `;`. An unterminated quote runs to the end of the string, so a
+/// fragment never splits mid-quote, and empty segments (a trailing
+/// terminator) are dropped.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' | '`' => {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == quote {
+                        if chars.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '[' => {
+                i += 1;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            ';' => {
+                if start < i {
+                    statements.push(&sql[start..i]);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < sql.len() {
+        statements.push(&sql[start..]);
+    }
+    statements
+}
+
+/// The `;`-separated statements of one raw SQL string, trimmed of the
+/// surrounding whitespace: SQL comments are stripped first — a `;` inside a
+/// comment is comment text, not a terminator, and comment content can never
+/// read like a statement — and the split is then quote-aware
+/// ([`split_sql_statements`]). Empty segments (a trailing terminator) are
+/// dropped. The same strip-then-split shape `down_order_gate.rs` uses for
+/// its raw statement scans, so the two gates cannot disagree about what one
+/// statement is.
+fn sql_statements(statement: &str) -> Vec<String> {
+    split_sql_statements(&strip_sql_comments(statement))
+        .into_iter()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Whether `word` is the `AS` keyword, optionally glued to a following `(`
 /// (`AS(SELECT`), which a whitespace split would otherwise hide in one word.
 fn is_as_word(word: &str) -> bool {
@@ -644,6 +743,49 @@ fn scanned_sources(relative_dir: &str) -> Result<Vec<SourceTokens>, Box<dyn Erro
     Ok(sources)
 }
 
+/// Checks one raw SQL string against the `allowed` first words, returning
+/// the violations.
+///
+/// The whole string's first word is judged on the raw text — a leading
+/// comment is not an allowed first word, so a comment-first string still
+/// fails the carve-out — and, when it passes, the string is split into its
+/// `;`-separated statements ([`sql_statements`]) and every segment must
+/// pass the first-word check and the [`ddl_embedded_dml`] scan on its own:
+/// a DML tail after the first statement (`ALTER TABLE x ADD COLUMN y;
+/// DELETE FROM z`) used to ride the first statement's DDL first word past
+/// the gate. A segment that begins with a comment in the raw text passes
+/// the first-word check once the comment is stripped (the boundary is the
+/// string's own leading position, which keeps the strict raw rule).
+fn raw_statement_violations(statement: &str, allowed: &[&str], allowance: &str) -> Vec<String> {
+    let keyword = first_keyword(statement);
+    if !allowed
+        .iter()
+        .any(|allowed| keyword.eq_ignore_ascii_case(allowed))
+    {
+        return vec![format!(
+            "execute_unprepared statement starts with `{keyword}`, {allowance}: {statement}"
+        )];
+    }
+    let mut violations = Vec::new();
+    for segment in sql_statements(statement) {
+        let keyword = first_keyword(&segment);
+        if !allowed
+            .iter()
+            .any(|allowed| keyword.eq_ignore_ascii_case(allowed))
+        {
+            violations.push(format!(
+                "execute_unprepared statement segment starts with `{keyword}`, \
+                 {allowance}: {segment}"
+            ));
+        } else if let Some(reason) = ddl_embedded_dml(&segment) {
+            violations.push(format!(
+                "execute_unprepared statement embeds DML past its first word: {reason}"
+            ));
+        }
+    }
+    violations
+}
+
 /// The migration gate: every `execute_unprepared` statement must start with
 /// a DDL keyword, and no string literal anywhere may start with a DML
 /// keyword (comments and doc examples are not string literals, so they
@@ -673,22 +815,12 @@ fn migration_violations() -> Result<Vec<String>, Box<dyn Error>> {
                 format!("{}: execute_unprepared: {reason}", source.display_path)
             })?;
             for (line, statement) in statements {
-                let keyword = first_keyword(&statement);
-                if !DDL_FIRST_WORDS
-                    .iter()
-                    .any(|allowed| keyword.eq_ignore_ascii_case(allowed))
-                {
-                    violations.push(format!(
-                        "{}:{}: execute_unprepared statement starts with `{keyword}`, \
-                         only CREATE/ALTER/DROP/PRAGMA are allowed: {statement}",
-                        source.display_path, line,
-                    ));
-                } else if let Some(reason) = ddl_embedded_dml(&statement) {
-                    violations.push(format!(
-                        "{}:{}: execute_unprepared statement embeds DML past its \
-                         first word: {reason}",
-                        source.display_path, line,
-                    ));
+                for violation in raw_statement_violations(
+                    &statement,
+                    &DDL_FIRST_WORDS,
+                    "only CREATE/ALTER/DROP/PRAGMA are allowed",
+                ) {
+                    violations.push(format!("{}:{line}: {violation}", source.display_path));
                 }
             }
         }
@@ -708,19 +840,12 @@ fn persistence_violations() -> Result<Vec<String>, Box<dyn Error>> {
                 format!("{}: execute_unprepared: {reason}", source.display_path)
             })?;
             for (line, statement) in statements {
-                let keyword = first_keyword(&statement);
-                if !keyword.eq_ignore_ascii_case("PRAGMA") {
-                    violations.push(format!(
-                        "{}:{}: execute_unprepared statement starts with `{keyword}`, \
-                         only PRAGMA (test-scope exception) is allowed: {statement}",
-                        source.display_path, line,
-                    ));
-                } else if let Some(reason) = ddl_embedded_dml(&statement) {
-                    violations.push(format!(
-                        "{}:{}: execute_unprepared statement embeds DML past its \
-                         first word: {reason}",
-                        source.display_path, line,
-                    ));
+                for violation in raw_statement_violations(
+                    &statement,
+                    &["PRAGMA"],
+                    "only PRAGMA (test-scope exception) is allowed",
+                ) {
+                    violations.push(format!("{}:{line}: {violation}", source.display_path));
                 }
             }
         }
@@ -872,6 +997,84 @@ fn strip_sql_comments_removes_comment_text_and_keeps_literals() {
     assert_eq!(
         strip_sql_comments("CREATE TABLE x AS -- trailing comment (no newline)"),
         "CREATE TABLE x AS  "
+    );
+}
+
+/// The W7-D-6 blind spot: a raw string carrying several `;`-separated
+/// statements used to pass the carve-out on the first statement's first
+/// word — `ALTER TABLE x ADD COLUMN y; DELETE FROM z` is a `DELETE` the
+/// first-keyword scan never saw. Every segment must pass the first-word and
+/// embedded-DML checks on its own, while pure multi-statement DDL passes
+/// and single-statement strings behave exactly as before.
+#[test]
+fn raw_statement_splitting_checks_every_semicolon_separated_segment() {
+    let allowance = "only CREATE/ALTER/DROP/PRAGMA are allowed";
+    // A DML tail after the first statement rides the first statement's DDL
+    // first word past the gate unless every segment is checked on its own.
+    let flagged: &[&str] = &[
+        "ALTER TABLE operations ADD COLUMN batch_id TEXT; DELETE FROM operations",
+        "DROP TABLE parents; SELECT * FROM children",
+        "CREATE INDEX ix ON t (a); UPDATE t SET a = 1",
+        "ALTER TABLE a ADD COLUMN b; INSERT INTO b VALUES (1)",
+        "CREATE TABLE a (id INTEGER); CREATE VIEW v AS SELECT 1",
+        "PRAGMA user_version = 1; VACUUM",
+    ];
+    for statement in flagged {
+        assert!(
+            !raw_statement_violations(statement, &DDL_FIRST_WORDS, allowance).is_empty(),
+            "the DML tail must be flagged: {statement}"
+        );
+    }
+    // The persistence PRAGMA gate flags a DML tail the same way.
+    assert!(
+        !raw_statement_violations(
+            "PRAGMA user_version = 1; DELETE FROM x",
+            &["PRAGMA"],
+            "only PRAGMA (test-scope exception) is allowed",
+        )
+        .is_empty(),
+        "the persistence gate must flag the DML tail"
+    );
+    // Pure multi-statement DDL passes, including quoted `;`s that are part
+    // of identifiers or literals, not terminators.
+    let clean: &[&str] = &[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY)",
+        "ALTER TABLE a ADD COLUMN b TEXT; DROP INDEX ix_a",
+        "DROP TABLE a; PRAGMA user_version = 1",
+        "DROP TABLE \"weird;name\"; CREATE TABLE t (a TEXT DEFAULT 'x;y')",
+        "DROP TABLE a; -- done; next\nDROP TABLE b",
+    ];
+    for statement in clean {
+        assert!(
+            raw_statement_violations(statement, &DDL_FIRST_WORDS, allowance).is_empty(),
+            "pure multi-statement DDL must pass: {statement}"
+        );
+    }
+    // Single-statement strings behave exactly as before, and the documented
+    // comment-first strictness stays: a leading comment is not a DDL first
+    // word on the raw whole string.
+    for statement in [
+        "CREATE TABLE settings (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        "PRAGMA user_version = 12;",
+        "ALTER TABLE users ADD COLUMN role TEXT REFERENCES roles(id)",
+    ] {
+        assert!(
+            raw_statement_violations(statement, &DDL_FIRST_WORDS, allowance).is_empty(),
+            "single DDL statements must pass unchanged: {statement}"
+        );
+    }
+    assert!(
+        !raw_statement_violations(
+            "-- note\nALTER TABLE a ADD COLUMN b",
+            &DDL_FIRST_WORDS,
+            allowance,
+        )
+        .is_empty(),
+        "a comment-first string must still fail the carve-out"
+    );
+    assert!(
+        !raw_statement_violations("DELETE FROM x", &DDL_FIRST_WORDS, allowance).is_empty(),
+        "a plain DML statement must still fail"
     );
 }
 

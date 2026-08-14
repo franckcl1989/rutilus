@@ -1,7 +1,8 @@
 use std::{error::Error, future::Future, pin::Pin};
 
 use rutilus_domain::{
-    BatchOperation, BatchOperationId, FailureKind, Operation, OperationId, OperationState,
+    BatchOperation, BatchOperationId, EndpointId, FailureKind, Operation, OperationId,
+    OperationState,
 };
 use time::OffsetDateTime;
 
@@ -167,6 +168,37 @@ pub trait OperationStore: Send + Sync {
         state: Option<OperationState>,
     ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>>;
 
+    /// Lists operations of one exact state addressed to one endpoint — the
+    /// endpoint-scoped twin of [`Self::list_operations`] (W7-P-1).
+    ///
+    /// The center dispatch's idempotency scan rides this read: the scan
+    /// previously listed every operation of each candidate state (five
+    /// global listings per dispatch) and filtered the endpoint in memory,
+    /// so one site's dispatch listed — and decrypted, one
+    /// `XChaCha20-Poly1305` envelope per row — the whole global operation
+    /// table inside the per-site dispatch gate. The endpoint-scoped read
+    /// keeps the scan to the endpoint's own rows.
+    ///
+    /// The default implementation falls back to the plain listing plus the
+    /// in-memory first-target filter — correct on every store — while the
+    /// production repository overrides it with the endpoint-driven query.
+    fn list_operations_for_endpoint(
+        &self,
+        state: Option<OperationState>,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move {
+            let mut rows = self.list_operations(state).await?;
+            rows.retain(|operation| {
+                operation
+                    .targets()
+                    .first()
+                    .is_some_and(|target| target.endpoint_id() == endpoint_id)
+            });
+            Ok(rows)
+        })
+    }
+
     /// Atomically persists one batch parent and every child operation
     /// (design section 13.7).
     ///
@@ -283,6 +315,14 @@ where
         state: Option<OperationState>,
     ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         Store::list_operations(*self, state)
+    }
+
+    fn list_operations_for_endpoint(
+        &self,
+        state: Option<OperationState>,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Store::list_operations_for_endpoint(*self, state, endpoint_id)
     }
 
     fn create_batch<'a>(

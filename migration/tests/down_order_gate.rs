@@ -264,57 +264,202 @@ fn skip_char_or_lifetime(chars: &[char], start: usize) -> usize {
 /// statement terminator (`;`) removed — a raw string may carry several
 /// statements, so the terminator must never stick to the identifier — and
 /// everything from an opening `(` (a column list like
-/// `batch_operations(id)`) discarded.
+/// `batch_operations(id)`) discarded. The column list is split off before
+/// the quote stripping, so a quoted name with a column list
+/// (`"weird;name"(id)`) loses both its quotes and its list.
 fn sql_identifier(word: &str) -> &str {
-    let word = word
-        .trim()
+    let name = word.split('(').next().unwrap_or(word);
+    name.trim()
         .trim_start_matches(['[', '"', '`'])
         .trim_end_matches([']', '"', '`'])
-        .trim_end_matches(';');
-    word.split('(').next().unwrap_or(word)
+        .trim_end_matches(';')
+}
+
+/// Strips SQL comments from one statement: `--` line comments (to the end
+/// of the line, newline consumed) and `/* ... */` block comments, each
+/// replaced by a single space so the words around it stay separate words.
+///
+/// Single-quoted SQL string literals are preserved verbatim — a `--` or
+/// `/*` inside a literal is literal text, not a comment — with a doubled
+/// `''` recognized as an escaped quote rather than the end of the literal.
+/// (The same implementation `bare_sql_gate.rs` uses, so the two gates
+/// cannot disagree about what a comment is.) A comment between the words of
+/// a raw statement (`DROP /* reason */ TABLE parents`) would otherwise hide
+/// the shape from the word scan, and comment content could read like a
+/// shape. The boundary is the same as `bare_sql_gate`: only single-quoted
+/// literals are preserved, so a comment marker inside a double-quoted
+/// identifier (`DROP TABLE "weird--name"`) is read as a comment — a
+/// registered residue, not expanded.
+fn strip_sql_comments(statement: &str) -> String {
+    let chars: Vec<char> = statement.chars().collect();
+    let mut stripped = String::with_capacity(statement.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+            // A `--` line comment: replaced by one space, consumed through
+            // the terminating newline — a comment glued to its neighbors
+            // (`AS--c\nSELECT`) must still separate them.
+            stripped.push(' ');
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+        } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            stripped.push(' ');
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+        } else if chars[i] == '\'' {
+            stripped.push('\'');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        stripped.push_str("''");
+                        i += 2;
+                        continue;
+                    }
+                    stripped.push('\'');
+                    i += 1;
+                    break;
+                }
+                stripped.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            stripped.push(chars[i]);
+            i += 1;
+        }
+    }
+    stripped
+}
+
+/// Splits a raw SQL string into its `;`-separated statements. A `;` inside
+/// a quoted identifier or string literal does not terminate the statement —
+/// `SQLite` quotes identifiers with double quotes (`"..."`), backticks
+/// (`` `...` ``), and square brackets (`[...]`), and string literals with
+/// single quotes (`'...'`, a doubled `''` being the escaped quote) — so
+/// `DROP TABLE "weird;name"` stays one statement and the quoted name keeps
+/// its `;`. An unterminated quote runs to the end of the string, so a
+/// fragment never splits mid-quote, and empty segments (a trailing
+/// terminator) are dropped.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' | '`' => {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == quote {
+                        if chars.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '[' => {
+                i += 1;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            ';' => {
+                if start < i {
+                    statements.push(&sql[start..i]);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < sql.len() {
+        statements.push(&sql[start..]);
+    }
+    statements
+}
+
+/// The whitespace words of every statement of one raw SQL string: SQL
+/// comments are stripped first — a comment between keywords (`DROP /*
+/// reason */ TABLE parents`) must not hide or fake a shape — and the
+/// statements are then split quote-aware ([`split_sql_statements`]), so a
+/// `;` inside a quoted identifier (`DROP TABLE "weird;name"`) never splits
+/// the name, and a terminator glued to the next keyword (`parents;DROP`)
+/// never hides the second statement.
+fn statement_words(sql: &str) -> Vec<Vec<String>> {
+    let stripped = strip_sql_comments(sql);
+    split_sql_statements(&stripped)
+        .into_iter()
+        .map(|statement| statement.split_whitespace().map(str::to_owned).collect())
+        .collect()
 }
 
 /// The tables a raw SQL string drops, in statement order: every `DROP TABLE`
-/// (optionally `IF EXISTS`) occurrence with the following identifier.
+/// (optionally `IF EXISTS`) occurrence with the following identifier. SQL
+/// comments are stripped and the statements split quote-aware first
+/// ([`statement_words`]), so a comment between the `DROP` and its `TABLE`
+/// can no longer hide the drop from the scan, and a `;` inside a quoted
+/// table name can no longer split it into a fictional drop.
 fn drop_table_names(sql: &str) -> Vec<String> {
-    // A raw string can carry several statements (`"DROP TABLE parents;
-    // DROP TABLE children"`), so every whitespace word is split at the `;`
-    // boundaries first — the statement terminator is not whitespace, and a
-    // terminator glued to the next keyword (`parents;DROP`) must not hide
-    // the second statement. Empty segments from a trailing terminator are
-    // dropped.
-    let words: Vec<&str> = sql
-        .split_whitespace()
-        .flat_map(|word| word.split(';'))
-        .filter(|word| !word.is_empty())
-        .collect();
     let mut drops = Vec::new();
-    let mut i = 0;
-    while i < words.len() {
-        if words[i].eq_ignore_ascii_case("DROP")
-            && words
-                .get(i + 1)
-                .is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
-        {
-            let mut name_index = i + 2;
-            if words
-                .get(name_index)
-                .is_some_and(|w| w.eq_ignore_ascii_case("IF"))
+    for words in statement_words(sql) {
+        let mut i = 0;
+        while i < words.len() {
+            if words[i].eq_ignore_ascii_case("DROP")
+                && words
+                    .get(i + 1)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
             {
-                name_index += 1;
+                let mut name_index = i + 2;
+                if words
+                    .get(name_index)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("IF"))
+                {
+                    name_index += 1;
+                }
+                if words
+                    .get(name_index)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"))
+                {
+                    name_index += 1;
+                }
+                if let Some(name) = words.get(name_index) {
+                    drops.push(sql_identifier(name).to_owned());
+                }
+                i = name_index + 1;
+            } else {
+                i += 1;
             }
-            if words
-                .get(name_index)
-                .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"))
-            {
-                name_index += 1;
-            }
-            if let Some(name) = words.get(name_index) {
-                drops.push(sql_identifier(name).to_owned());
-            }
-            i = name_index + 1;
-        } else {
-            i += 1;
         }
     }
     drops
@@ -656,10 +801,14 @@ fn foreign_key_edges(
 /// `ALTER TABLE <table> ... REFERENCES <other>(...)` statement adds the edge
 /// `<table> → <other>`. This is the only way `SQLite` adds a live foreign
 /// key to an existing table (`m20260805_000011`'s `operations.batch_id`
-/// link, `m20260810_000001`'s `endpoints.site_id`). The rebuild `RENAME TO`
-/// tails never carry a `REFERENCES` clause, so they contribute nothing here;
-/// the edges of the raw `CREATE TABLE` rebuild DDL itself are read by
-/// [`raw_create_table_references`].
+/// link, `m20260810_000001`'s `endpoints.site_id`). The statements are
+/// scanned comment-stripped and one by one ([`statement_words`]), so a
+/// comment or a second `;`-separated statement can neither hide nor fake a
+/// `REFERENCES` clause. The rebuild `RENAME TO` tails never carry a
+/// `REFERENCES` clause, so they contribute nothing here — the edges of the
+/// raw `CREATE TABLE` rebuild DDL itself are read by
+/// [`raw_create_table_references`], and the live-table renames by
+/// [`raw_renames`].
 fn raw_alter_references(
     tokens: &[Token],
     consts: &HashMap<String, (usize, String)>,
@@ -667,28 +816,110 @@ fn raw_alter_references(
     let mut edges = Vec::new();
     for argument in execute_unprepared_arguments(tokens) {
         for (_line, statement) in argument_statements(&argument, consts)? {
-            let words: Vec<&str> = statement.split_whitespace().collect();
-            if !words
-                .first()
-                .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
-            {
-                continue;
-            }
-            let Some(altered) = words.get(2).map(|word| sql_identifier(word)) else {
-                continue;
-            };
-            let Some(position) = words
-                .iter()
-                .position(|word| word.eq_ignore_ascii_case("REFERENCES"))
-            else {
-                continue;
-            };
-            if let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word)) {
-                edges.push((altered.to_owned(), referenced.to_owned()));
+            for words in statement_words(&statement) {
+                if !words
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+                {
+                    continue;
+                }
+                let Some(altered) = words.get(2).map(|word| sql_identifier(word)) else {
+                    continue;
+                };
+                let Some(position) = words
+                    .iter()
+                    .position(|word| word.eq_ignore_ascii_case("REFERENCES"))
+                else {
+                    continue;
+                };
+                if let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word)) {
+                    edges.push((altered.to_owned(), referenced.to_owned()));
+                }
             }
         }
     }
     Ok(edges)
+}
+
+/// Whether `name` is one of the staging patterns the rebuild normalization
+/// already covers (`*_rebuild`, `*_new`, `*_old`): a `RENAME TO` a staging
+/// name is part of a rebuild dance, never a live table being renamed.
+fn is_staging_name(name: &str) -> bool {
+    ["_rebuild", "_new", "_old"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// The live-table renames of one file's raw SQL: every
+/// `ALTER TABLE <x> RENAME TO <y>` statement whose new name is a live table
+/// — not one of the staging patterns ([`is_staging_name`]) the existing
+/// normalization covers. Renaming a live table redirects every reference to
+/// it (`SQLite` rewrites the foreign keys of tables that name the renamed
+/// table), so the FK edge set must follow the rename — the semantic is
+/// rename-means-references-follow. [`apply_renames`] re-points the global
+/// edges from `x` to `y` (an edge that already names `y` merges with the
+/// redirected one). The current tree's `RENAME` statements are all rebuild
+/// tails (`x_rebuild RENAME TO x`, `x_new RENAME TO x`, ...): the raw-rebuild
+/// edges are normalized to the live names already and the builder-staging
+/// edges get normalized by exactly this redirect, so the closure stays
+/// coherent — and the guard on `y` keeps the reverse dance (`RENAME TO
+/// x_new`) a no-op.
+fn raw_renames(
+    tokens: &[Token],
+    consts: &HashMap<String, (usize, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut renames = Vec::new();
+    for argument in execute_unprepared_arguments(tokens) {
+        for (_line, statement) in argument_statements(&argument, consts)? {
+            for words in statement_words(&statement) {
+                let is_rename = words
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+                    && words
+                        .get(1)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+                    && words
+                        .get(3)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("RENAME"))
+                    && words
+                        .get(4)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("TO"));
+                if !is_rename {
+                    continue;
+                }
+                let Some(from) = words.get(2).map(|word| sql_identifier(word)) else {
+                    continue;
+                };
+                let Some(to) = words.get(5).map(|word| sql_identifier(word)) else {
+                    continue;
+                };
+                if is_staging_name(to) {
+                    continue;
+                }
+                renames.push((from.to_owned(), to.to_owned()));
+            }
+        }
+    }
+    Ok(renames)
+}
+
+/// Applies every raw `ALTER TABLE x RENAME TO y` to the FK edge set: an
+/// edge naming the renamed table on either side follows the rename — the
+/// referencing children (`children → x` is the live `children → y` after
+/// the rename) and the renamed table's own outgoing edges (`x → p` is the
+/// live `y → p`). An edge that already names `y` merges with the redirected
+/// one; the callers dedup afterwards.
+fn apply_renames(edges: &mut [(String, String)], renames: &[(String, String)]) {
+    for (from, to) in renames {
+        for edge in edges.iter_mut() {
+            if edge.0 == *from {
+                edge.0.clone_from(to);
+            }
+            if edge.1 == *from {
+                edge.1.clone_from(to);
+            }
+        }
+    }
 }
 
 /// The live table a `*_rebuild` staging name stands for: the `_rebuild`
@@ -724,34 +955,40 @@ fn raw_create_table_references(
     let mut edges = Vec::new();
     for argument in execute_unprepared_arguments(tokens) {
         for (_line, statement) in argument_statements(&argument, consts)? {
-            let words: Vec<&str> = statement.split_whitespace().collect();
-            if !(words
-                .first()
-                .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
-                && words
-                    .get(1)
-                    .is_some_and(|word| word.eq_ignore_ascii_case("TABLE")))
-            {
-                continue;
-            }
-            if words
-                .get(2)
-                .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
-            {
-                continue;
-            }
-            let Some(created) = words.get(2).map(|word| sql_identifier(word)) else {
-                continue;
-            };
-            let created = live_table_name(created).to_owned();
-            for position in words.iter().enumerate().filter_map(|(position, word)| {
-                word.eq_ignore_ascii_case("REFERENCES").then_some(position)
-            }) {
-                let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word))
-                else {
+            // The statements are scanned comment-stripped and one by one,
+            // like [`raw_alter_references`]: a comment between `CREATE` and
+            // `TABLE` — or between the shape's words — must not hide the
+            // statement, and a second `;`-separated statement must be read
+            // on its own.
+            for words in statement_words(&statement) {
+                if !(words
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+                    && words
+                        .get(1)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE")))
+                {
+                    continue;
+                }
+                if words
+                    .get(2)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
+                {
+                    continue;
+                }
+                let Some(created) = words.get(2).map(|word| sql_identifier(word)) else {
                     continue;
                 };
-                edges.push((created.clone(), live_table_name(referenced).to_owned()));
+                let created = live_table_name(created).to_owned();
+                for position in words.iter().enumerate().filter_map(|(position, word)| {
+                    word.eq_ignore_ascii_case("REFERENCES").then_some(position)
+                }) {
+                    let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word))
+                    else {
+                        continue;
+                    };
+                    edges.push((created.clone(), live_table_name(referenced).to_owned()));
+                }
             }
         }
     }
@@ -964,13 +1201,16 @@ fn order_violations_for(
 fn migration_down_order_violations() -> Result<Vec<String>, Box<dyn Error>> {
     let sources = scanned_sources()?;
     let mut edges = Vec::new();
+    let mut renames = Vec::new();
     for source in &sources {
         let enum_tables = enum_table_names(&source.tokens);
         let consts = const_literals(&source.tokens);
         edges.extend(foreign_key_edges(&source.tokens, &enum_tables)?);
         edges.extend(raw_alter_references(&source.tokens, &consts)?);
         edges.extend(raw_create_table_references(&source.tokens, &consts)?);
+        renames.extend(raw_renames(&source.tokens, &consts)?);
     }
+    apply_renames(&mut edges, &renames);
     edges.sort();
     edges.dedup();
     let mut violations = Vec::new();
@@ -1004,6 +1244,8 @@ fn synthetic_edges(tokens: &[Token]) -> Result<Vec<(String, String)>, String> {
     let mut edges = foreign_key_edges(tokens, &enum_tables)?;
     edges.extend(raw_alter_references(tokens, &consts)?);
     edges.extend(raw_create_table_references(tokens, &consts)?);
+    let renames = raw_renames(tokens, &consts)?;
+    apply_renames(&mut edges, &renames);
     edges.sort();
     edges.dedup();
     Ok(edges)
@@ -1290,6 +1532,264 @@ fn gate_checks_multi_statement_raw_drops_separated_by_semicolons() -> Result<(),
     assert!(
         violations.is_empty(),
         "child-first drops inside one semicolon-separated string must pass, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// A two-table migration whose `down` drops both tables through ONE raw
+/// `execute_unprepared` string with a SQL comment between the `DROP` and
+/// the `TABLE` keyword, in the requested order.
+fn comment_drop_source(parent_first: bool, comment: &str) -> String {
+    let order = if parent_first {
+        "parents; DROP TABLE children"
+    } else {
+        "children; DROP TABLE parents"
+    };
+    format!(
+        r#"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {{
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE children ADD COLUMN parent_id UUID NULL REFERENCES parents(id)",
+            )
+            .await
+    }}
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared("DROP {comment} TABLE {order}")
+            .await
+    }}
+}}
+"#
+    )
+}
+
+/// The W7-D-5 blind spot ①: a SQL comment inside a drop statement used to
+/// hide the drop from the word scan — `DROP /* reason */ TABLE parents`
+/// leaves `/*` as the word after `DROP`, the drop vanished from the
+/// sequence, and the parent-first order passed silently. Comments are
+/// stripped before the words are compared, in both the `/* */` and the `--`
+/// spellings, so the hidden drop constrains the order like any other.
+#[test]
+fn gate_checks_sql_comments_cannot_hide_raw_drops() -> Result<(), Box<dyn Error>> {
+    // The `--` comment must end its line (a line comment runs to the
+    // newline), so the block form splits the keywords in place while the
+    // line form splits across the newline — both must surface the drop.
+    for comment in ["/* retired shape */", "-- retired shape\n"] {
+        let source = tokenize(
+            "synthetic_comment_drop.rs",
+            &comment_drop_source(true, comment),
+        );
+        let edges = synthetic_edges(&source.tokens)?;
+        assert!(
+            edges.contains(&("children".to_owned(), "parents".to_owned())),
+            "the raw ALTER REFERENCES clause must yield the edge, got: {edges:?}",
+        );
+        let violations = order_violations_for(&source, &edges)?;
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("parents") && violation.contains("children")),
+            "the comment-hidden parent-first drop must be rejected, got:\n{}",
+            violations.join("\n"),
+        );
+        let source = tokenize(
+            "synthetic_comment_drop.rs",
+            &comment_drop_source(false, comment),
+        );
+        let edges = synthetic_edges(&source.tokens)?;
+        let violations = order_violations_for(&source, &edges)?;
+        assert!(
+            violations.is_empty(),
+            "the child-first order must pass with the comment stripped, got:\n{}",
+            violations.join("\n"),
+        );
+    }
+    Ok(())
+}
+
+/// A two-table migration whose `up` links `children` to `parents` through a
+/// raw `ALTER ... REFERENCES` statement and renames `parents` to
+/// `ancestors`; the `down` drops the tables in the requested order.
+fn rename_source(parent_first: bool) -> String {
+    let drops = if parent_first {
+        r#"connection.execute_unprepared("DROP TABLE ancestors").await?;
+        connection.execute_unprepared("DROP TABLE children").await"#
+    } else {
+        r#"connection.execute_unprepared("DROP TABLE children").await?;
+        connection.execute_unprepared("DROP TABLE ancestors").await"#
+    };
+    format!(
+        r#"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {{
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(
+                "ALTER TABLE children ADD COLUMN parent_id UUID NULL REFERENCES parents(id)",
+            )
+            .await?;
+        connection
+            .execute_unprepared("ALTER TABLE parents RENAME TO ancestors")
+            .await
+    }}
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        {drops}
+    }}
+}}
+"#
+    )
+}
+
+/// The W7-D-5 blind spot ②: `ALTER TABLE x RENAME TO y` on a live table
+/// used to leave the FK edge set pointing at the old name — the edge
+/// extraction read only `REFERENCES` clauses — so a `down` that drops the
+/// renamed table before its referencing children was never constrained.
+/// Rename means references follow (`SQLite` rewrites them on rename): the
+/// edges naming the old table on either side are re-pointed at the new
+/// name, and the parent-first drop of the new name is rejected against the
+/// redirected edge.
+#[test]
+fn gate_redirects_fk_edges_through_live_table_renames() -> Result<(), Box<dyn Error>> {
+    let source = tokenize("synthetic_rename.rs", &rename_source(true));
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "ancestors".to_owned())),
+        "the rename must redirect the edge to the live name, got: {edges:?}",
+    );
+    assert!(
+        !edges.iter().any(|(_, parent)| parent == "parents"),
+        "no edge may keep the pre-rename name, got: {edges:?}",
+    );
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("ancestors") && violation.contains("children")),
+        "dropping the renamed parent before its child must be rejected, got:\n{}",
+        violations.join("\n"),
+    );
+
+    let source = tokenize("synthetic_rename.rs", &rename_source(false));
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations.is_empty(),
+        "the child-first drop must pass with the redirected edge, got:\n{}",
+        violations.join("\n"),
+    );
+
+    // A second edge already naming the new table merges with the redirected
+    // one — the aggregate dedups, so no duplicate constraint is reported.
+    let merged = rename_source(false).replace(
+        "ALTER TABLE parents RENAME TO ancestors",
+        "ALTER TABLE parents RENAME TO ancestors; \
+         ALTER TABLE siblings ADD COLUMN parent_id UUID NULL REFERENCES ancestors(id)",
+    );
+    let source = tokenize("synthetic_rename.rs", &merged);
+    let edges = synthetic_edges(&source.tokens)?;
+    let redirected = edges
+        .iter()
+        .filter(|(_, parent)| parent == "ancestors")
+        .count();
+    assert_eq!(
+        redirected, 2,
+        "the redirected edge must merge with the pre-existing one, got: {edges:?}",
+    );
+
+    // A `RENAME TO` a staging name is a rebuild dance, not a live rename:
+    // the edge set must keep the original name.
+    let staging = rename_source(false).replace(
+        "ALTER TABLE parents RENAME TO ancestors",
+        "ALTER TABLE parents RENAME TO parents_rebuild",
+    );
+    let source = tokenize("synthetic_rename.rs", &staging);
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "parents".to_owned())),
+        "a staging-pattern rename must not redirect, got: {edges:?}",
+    );
+    Ok(())
+}
+
+/// The W7-D-5 blind spot ③: a `;` inside a quoted identifier used to split
+/// the statement — `DROP TABLE "weird;name"` recorded a fictional drop of
+/// `"weird` while the real drop was skipped. The statement split is
+/// quote-aware, so the quoted name stays whole, and an FK edge built
+/// against the quoted name constrains the drop like any other.
+#[test]
+fn gate_keeps_quoted_identifiers_whole_across_statement_splitting() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        drop_table_names(r#"DROP TABLE "weird;name"; DROP TABLE children"#),
+        vec!["weird;name", "children"],
+        "a `;` inside a double-quoted identifier must not split the name",
+    );
+    assert_eq!(
+        drop_table_names("DROP TABLE [weird;name]; DROP TABLE `other;x`"),
+        vec!["weird;name", "other;x"],
+        "bracket- and backtick-quoted names must stay whole too",
+    );
+    // The quoted name participates in the child-first check end to end: an
+    // edge built against `weird;name` constrains a drop that names it. The
+    // SQL strings are written as raw strings so the quotes reach the gate
+    // lexer unescaped (the lexer keeps `\"` verbatim).
+    let source = r##"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"CREATE TABLE children (parent_id UUID NOT NULL REFERENCES "weird;name"(id))"#,
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(r#"DROP TABLE "weird;name""#)
+            .await?;
+        connection.execute_unprepared("DROP TABLE children").await
+    }
+}
+"##;
+    let source = tokenize("synthetic_quoted_name.rs", source);
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "weird;name".to_owned())),
+        "the quoted REFERENCES clause must yield the edge, got: {edges:?}",
+    );
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("weird;name") && violation.contains("children")),
+        "the parent-first drop of the quoted name must be rejected, got:\n{}",
         violations.join("\n"),
     );
     Ok(())

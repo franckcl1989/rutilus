@@ -22,7 +22,10 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage};
@@ -305,6 +308,12 @@ impl Error for CenterSessionRegistryError {}
 struct OnlineSession {
     site: ResolvedSite,
     last_seen: OffsetDateTime,
+    /// The session's registration generation (W7-C-2): a monotonic token
+    /// handed out by [`CenterSessionRegistry::mark_connected`]. Every
+    /// connection-task exit carries the generation it registered with, so
+    /// a stale cleanup can never remove the entry of the site's next
+    /// connection.
+    generation: u64,
     /// The per-session disconnect signal (R6-C-6): the connection task
     /// observes it beside the shared shutdown watch, so a binding
     /// revocation ([`CenterSessionRegistry::disconnect`]) ends the
@@ -331,6 +340,10 @@ struct OnlineSession {
 #[derive(Debug)]
 pub struct CenterSessionRegistry {
     online: Mutex<HashMap<InstanceId, OnlineSession>>,
+    /// The next registration generation (W7-C-2): monotonic across the
+    /// registry, so every site's generations are strictly increasing — a
+    /// stale generation can never collide with a newer session's token.
+    next_generation: AtomicU64,
 }
 
 impl CenterSessionRegistry {
@@ -338,10 +351,14 @@ impl CenterSessionRegistry {
     pub fn new() -> Self {
         Self {
             online: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
         }
     }
 
-    /// Registers one online connection for the resolved site.
+    /// Registers one online connection for the resolved site, returning the
+    /// session's registration generation — the token the connection task's
+    /// cleanup carries, so one generation's exit can never remove the entry
+    /// of the site's next connection (W7-C-2).
     ///
     /// # Errors
     ///
@@ -353,7 +370,7 @@ impl CenterSessionRegistry {
         &self,
         site: ResolvedSite,
         now: OffsetDateTime,
-    ) -> Result<(), CenterSessionRegistryError> {
+    ) -> Result<u64, CenterSessionRegistryError> {
         let mut online = self
             .online
             .lock()
@@ -363,15 +380,20 @@ impl CenterSessionRegistry {
                 site: site.instance_id(),
             });
         }
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         online.insert(
             site.instance_id(),
             OnlineSession {
                 site,
                 last_seen: now,
+                generation,
                 disconnect: Arc::new(tokio::sync::Notify::new()),
             },
         );
-        Ok(())
+        Ok(generation)
     }
 
     /// Returns the disconnect signal of one online site (R6-C-6): the
@@ -392,9 +414,10 @@ impl CenterSessionRegistry {
     /// Ends one site's established session (R6-C-6): the registry entry is
     /// removed and the session's disconnect signal fires, so the connection
     /// task closes the connection — a revoked site must not keep its flush
-    /// and its reply path alive. A site that is not online is a no-op, and
-    /// the later [`Self::mark_disconnected`] of the closing task is
-    /// idempotent.
+    /// and its reply path alive. The removal targets the current session
+    /// whatever its generation (the revocation ends the session that is
+    /// online now), and the later [`Self::mark_disconnected`] of the
+    /// closing task is a generation-guarded no-op for the removed entry.
     pub fn disconnect(&self, site: InstanceId) {
         let Ok(mut online) = self.online.lock() else {
             return;
@@ -417,13 +440,37 @@ impl CenterSessionRegistry {
         }
     }
 
-    /// Removes one site from the online set; a site that is not online is a
-    /// no-op (the disconnect is idempotent).
-    pub fn mark_disconnected(&self, site: InstanceId) {
+    /// Removes one site's entry from the online set when it still belongs
+    /// to the given registration generation (W7-C-2): the cleanup of a
+    /// stale connection — the engine's exit of a session whose entry was
+    /// already removed, or a crashed task's guard — must never remove the
+    /// entry of the site's next connection. A site that is not online, or
+    /// whose current entry belongs to a newer generation, is a no-op.
+    pub fn mark_disconnected(&self, site: InstanceId, generation: u64) {
         let Ok(mut online) = self.online.lock() else {
             return;
         };
-        online.remove(&site);
+        if online
+            .get(&site)
+            .is_some_and(|session| session.generation == generation)
+        {
+            online.remove(&site);
+        }
+    }
+
+    /// Reports whether the registry entry of one site is still the session
+    /// that registered with the given generation (W7-C-2, W7-E-8): the
+    /// frame-level liveness probe of an in-flight flush. A session whose
+    /// entry was removed — a revocation disconnect, or a successor session
+    /// registered under the same site — is no longer current, and the
+    /// flush stops delivering.
+    #[must_use]
+    pub fn is_current(&self, site: InstanceId, generation: u64) -> bool {
+        self.online.lock().is_ok_and(|online| {
+            online
+                .get(&site)
+                .is_some_and(|session| session.generation == generation)
+        })
     }
 
     /// Reports whether one site currently holds an online connection.
@@ -461,24 +508,31 @@ impl CenterSessionRegistry {
 /// [`CenterSessionRegistryError::AlreadyConnected`] forever, silently. The
 /// guard is the crash backstop: its `Drop` runs during the unwind and
 /// removes the site, so the one-connection-per-site rule self-heals on the
-/// next reconnect. The cleanup is idempotent — [`CenterPresence::mark_disconnected`]
-/// is a no-op for a site that is not online — so the guard and the engine's
-/// own cleanup never conflict.
+/// next reconnect. The cleanup is generation-guarded — [`CenterPresence::mark_disconnected`]
+/// is a no-op for a site that is not online, or whose entry belongs to a
+/// newer generation (W7-C-2) — so a stale guard can never remove the entry
+/// of the site's next connection, and the guard and the engine's own
+/// cleanup never conflict.
 #[must_use]
 pub struct DisconnectOnDrop<Presence: CenterPresence> {
     presence: Presence,
     site: InstanceId,
+    generation: u64,
 }
 
 impl<Presence: CenterPresence> DisconnectOnDrop<Presence> {
-    pub const fn new(presence: Presence, site: InstanceId) -> Self {
-        Self { presence, site }
+    pub const fn new(presence: Presence, site: InstanceId, generation: u64) -> Self {
+        Self {
+            presence,
+            site,
+            generation,
+        }
     }
 }
 
 impl<Presence: CenterPresence> Drop for DisconnectOnDrop<Presence> {
     fn drop(&mut self) {
-        self.presence.mark_disconnected(self.site);
+        self.presence.mark_disconnected(self.site, self.generation);
     }
 }
 
@@ -571,8 +625,16 @@ pub trait CenterPresence: Send + Sync {
     /// Advances the liveness stamp of one online site.
     fn touch(&self, site: InstanceId, now: OffsetDateTime);
 
-    /// Removes one site from the online set.
-    fn mark_disconnected(&self, site: InstanceId);
+    /// Removes one site from the online set when the entry still belongs to
+    /// the given registration generation (W7-C-2): a stale connection's
+    /// cleanup must never remove the site's next connection.
+    fn mark_disconnected(&self, site: InstanceId, generation: u64);
+
+    /// Reports whether the registry entry of one site is still the session
+    /// that registered with the given generation (W7-E-8): the frame-level
+    /// liveness probe an in-flight flush consults between frames, so a
+    /// revoked session stops delivering the rest of its batch.
+    fn is_current(&self, site: InstanceId, generation: u64) -> bool;
 }
 
 impl<Presence> CenterPresence for &Presence
@@ -583,8 +645,12 @@ where
         Presence::touch(*self, site, now);
     }
 
-    fn mark_disconnected(&self, site: InstanceId) {
-        Presence::mark_disconnected(*self, site);
+    fn mark_disconnected(&self, site: InstanceId, generation: u64) {
+        Presence::mark_disconnected(*self, site, generation);
+    }
+
+    fn is_current(&self, site: InstanceId, generation: u64) -> bool {
+        Presence::is_current(*self, site, generation)
     }
 }
 
@@ -596,8 +662,12 @@ where
         Presence::touch(self, site, now);
     }
 
-    fn mark_disconnected(&self, site: InstanceId) {
-        Presence::mark_disconnected(self, site);
+    fn mark_disconnected(&self, site: InstanceId, generation: u64) {
+        Presence::mark_disconnected(self, site, generation);
+    }
+
+    fn is_current(&self, site: InstanceId, generation: u64) -> bool {
+        Presence::is_current(self, site, generation)
     }
 }
 
@@ -606,8 +676,12 @@ impl CenterPresence for CenterSessionRegistry {
         CenterSessionRegistry::touch(self, site, now);
     }
 
-    fn mark_disconnected(&self, site: InstanceId) {
-        CenterSessionRegistry::mark_disconnected(self, site);
+    fn mark_disconnected(&self, site: InstanceId, generation: u64) {
+        CenterSessionRegistry::mark_disconnected(self, site, generation);
+    }
+
+    fn is_current(&self, site: InstanceId, generation: u64) -> bool {
+        CenterSessionRegistry::is_current(self, site, generation)
     }
 }
 
@@ -650,6 +724,12 @@ pub struct CenterInboundEngine<Session, Outbox, Consumer, Registry, Time> {
     registry: Registry,
     clock: Time,
     site: ResolvedSite,
+    /// The session's registration generation (W7-C-2, W7-E-8): the engine's
+    /// exit cleanup and its frame-level liveness probe identify this
+    /// connection by the generation it registered with, so a stale exit
+    /// never removes the entry of the site's next connection, and a flush
+    /// stops delivering once this session is no longer the current one.
+    generation: u64,
     options: CenterInboundOptions,
     /// The outbox entries whose undeliverable-state report already fired
     /// on this connection (E3-8): a corrupt row stays pending forever —
@@ -679,6 +759,7 @@ where
         registry: Registry,
         clock: Time,
         site: ResolvedSite,
+        generation: u64,
         options: CenterInboundOptions,
     ) -> Self {
         Self {
@@ -688,6 +769,7 @@ where
             registry,
             clock,
             site,
+            generation,
             options,
             reported_undeliverable: Vec::new(),
         }
@@ -722,7 +804,8 @@ where
         let result = self
             .connected_loop(&mut sent, peer_acked, stop.as_mut())
             .await;
-        self.registry.mark_disconnected(self.site.instance_id());
+        self.registry
+            .mark_disconnected(self.site.instance_id(), self.generation);
         result
     }
 
@@ -820,6 +903,20 @@ where
             .map_err(CenterInboundEngineError::Outbox)?;
         let now = self.clock.now();
         for entry in pending {
+            // W7-E-8: the flush observes the disconnect between frames, not
+            // only at the loop top — a revocation that lands mid-flush must
+            // stop the delivery of the rest of the batch, or the revoked
+            // site would still pull every offer it is owed. The probe is
+            // the registry entry's generation: the entry is gone after a
+            // disconnect, and a successor session's entry never matches
+            // this connection's generation (W7-C-2), so a stale flush also
+            // stops once the site's next connection took over.
+            if !self
+                .registry
+                .is_current(self.site.instance_id(), self.generation)
+            {
+                return Ok(());
+            }
             // An entry already delivered on this connection is not sent
             // again: the acknowledgement retires it, and a dropped
             // connection re-sends it from the pending scan (§15.4).
@@ -1269,7 +1366,7 @@ mod tests {
             site_fingerprint(),
         );
 
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
         assert!(registry.is_online(site.instance_id()));
         assert!(!registry.is_online(other.instance_id()));
 
@@ -1287,10 +1384,11 @@ mod tests {
         registry.touch(site.instance_id(), base + Duration::seconds(2));
         assert_eq!(registry.list_online(), vec![site.clone(), other.clone()]);
 
-        registry.mark_disconnected(site.instance_id());
+        registry.mark_disconnected(site.instance_id(), generation);
         assert!(!registry.is_online(site.instance_id()));
-        // The disconnect is idempotent.
-        registry.mark_disconnected(site.instance_id());
+        // The disconnect is idempotent: the removed entry's generation
+        // matches nothing any more.
+        registry.mark_disconnected(site.instance_id(), generation);
         assert_eq!(registry.list_online(), vec![other]);
         Ok(())
     }
@@ -1306,7 +1404,7 @@ mod tests {
             site_fingerprint(),
         );
         let site_id = site.instance_id();
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
 
         // The connection task crashes after the site was registered (an
         // index out of bounds, standing in for a handler panic). The
@@ -1316,7 +1414,7 @@ mod tests {
         let crashed = std::thread::spawn({
             let registry = Arc::clone(&registry);
             move || {
-                let _guard = DisconnectOnDrop::new(registry, site_id);
+                let _guard = DisconnectOnDrop::new(registry, site_id, generation);
                 let values = Vec::from([0_u8]);
                 let _ = values[1];
             }
@@ -1383,6 +1481,73 @@ mod tests {
         assert!(registry.disconnect_watch(site.instance_id()).is_none());
     }
 
+    #[test]
+    fn a_stale_cleanup_never_removes_the_successor_session() -> Result<(), Box<dyn Error>> {
+        // W7-C-2: the cleanup of one connection generation must never
+        // remove the entry of the site's next connection. Old connection A
+        // blocks in a flush send; the revocation removes A's entry; the
+        // site reconnects and B registers; A then exits — and its engine
+        // cleanup and its crash guard alike must leave B online. Without
+        // the generation check, A's exit would remove B's entry: the site
+        // would look offline, B's disconnect signal would be lost, and the
+        // one-connection-per-site rule would be broken.
+        let registry = CenterSessionRegistry::new();
+        let base = base_time();
+        let site = resolved_site();
+        let site_id = site.instance_id();
+        let generation_a = registry.mark_connected(site.clone(), base)?;
+        // A's entry is removed (the revocation or A's own clean exit).
+        registry.mark_disconnected(site_id, generation_a);
+        assert!(!registry.is_online(site_id));
+        // B registers with the next generation.
+        let generation_b = registry.mark_connected(site.clone(), base + Duration::SECOND)?;
+        assert_ne!(
+            generation_a, generation_b,
+            "every registration has its own generation"
+        );
+
+        // A's late cleanup — the engine's exit and the crash guard alike —
+        // is a generation mismatch and must not touch B's entry.
+        registry.mark_disconnected(site_id, generation_a);
+        let stale_guard = DisconnectOnDrop::new(&registry, site_id, generation_a);
+        drop(stale_guard);
+        assert!(
+            registry.is_online(site_id),
+            "the successor session survives the stale cleanup"
+        );
+        assert!(registry.is_current(site_id, generation_b));
+        assert!(!registry.is_current(site_id, generation_a));
+
+        // B's own cleanup still works, and the revocation still ends the
+        // current session whatever its generation.
+        registry.mark_disconnected(site_id, generation_b);
+        assert!(!registry.is_online(site_id));
+        let generation_c = registry.mark_connected(site, base + Duration::seconds(2))?;
+        registry.disconnect(site_id);
+        assert!(
+            !registry.is_online(site_id),
+            "the revocation removes the current session of any generation"
+        );
+        assert!(!registry.is_current(site_id, generation_c));
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_cleanup_of_a_registered_site_still_removes_its_own_entry()
+    -> Result<(), Box<dyn Error>> {
+        // W7-C-2 at the same-generation boundary: a cleanup carrying the
+        // current entry's own generation still removes it — the normal
+        // single-generation path must not break.
+        let registry = CenterSessionRegistry::new();
+        let site = resolved_site();
+        let generation = registry.mark_connected(site.clone(), base_time())?;
+        assert!(registry.is_current(site.instance_id(), generation));
+        registry.mark_disconnected(site.instance_id(), generation);
+        assert!(!registry.is_online(site.instance_id()));
+        assert!(!registry.is_current(site.instance_id(), generation));
+        Ok(())
+    }
+
     /// A fixed clock for the engine tests.
     #[derive(Clone, Copy)]
     struct FixedClock(OffsetDateTime);
@@ -1428,6 +1593,77 @@ mod tests {
         fn send(&mut self, envelope: Envelope) -> BoundaryFuture<'_, Result<(), Self::Error>> {
             Box::pin(async move {
                 self.outbound.send(envelope).map_err(|_| MockCenterError)?;
+                Ok(())
+            })
+        }
+
+        fn receive(&mut self) -> BoundaryFuture<'_, Result<Option<Envelope>, Self::Error>> {
+            Box::pin(async move { Ok(self.inbound.recv().await) })
+        }
+    }
+
+    /// A channel-backed session whose FIRST send reports its arrival and
+    /// then blocks until released; every later send flows freely. The flush
+    /// test uses the two `Notify`s to hold the engine deterministically
+    /// inside the first send while the test disconnects the site — the
+    /// disconnect strictly precedes the release — so the frame-boundary
+    /// probe of the next iteration observes the disconnect, and a flush
+    /// without the probe would sail on and deliver the whole batch.
+    struct GatedSendSession {
+        outbound: tokio::sync::mpsc::UnboundedSender<Envelope>,
+        inbound: tokio::sync::mpsc::UnboundedReceiver<Envelope>,
+        gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+        delivered: Arc<Mutex<u64>>,
+    }
+
+    /// The channel parts of [`GatedSendSession::channel`]: the session, the
+    /// outbound receiver, the inbound sender, the `reached`/`release`
+    /// signals of the first send, and the delivered-frame counter.
+    type GatedChannel = (
+        GatedSendSession,
+        tokio::sync::mpsc::UnboundedReceiver<Envelope>,
+        tokio::sync::mpsc::UnboundedSender<Envelope>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<u64>>,
+    );
+
+    impl GatedSendSession {
+        fn channel() -> GatedChannel {
+            let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (inbound, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let delivered = Arc::new(Mutex::new(0));
+            (
+                Self {
+                    outbound,
+                    inbound: inbound_rx,
+                    gate: Mutex::new(Some((Arc::clone(&reached), Arc::clone(&release)))),
+                    delivered: Arc::clone(&delivered),
+                },
+                outbound_rx,
+                inbound,
+                reached,
+                release,
+                delivered,
+            )
+        }
+    }
+
+    impl CenterInboundSession for GatedSendSession {
+        type Error = MockCenterError;
+
+        fn send(&mut self, envelope: Envelope) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            let gate = self.gate.lock().ok().and_then(|mut gate| gate.take());
+            let delivered = Arc::clone(&self.delivered);
+            Box::pin(async move {
+                if let Some((reached, release)) = gate {
+                    reached.notify_one();
+                    release.notified().await;
+                }
+                self.outbound.send(envelope).map_err(|_| MockCenterError)?;
+                *delivered.lock().map_err(|_| MockCenterError)? += 1;
                 Ok(())
             })
         }
@@ -1690,7 +1926,7 @@ mod tests {
         );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
         let engine = CenterInboundEngine::new(
             session,
             outbox.clone(),
@@ -1698,6 +1934,7 @@ mod tests {
             Arc::clone(&registry),
             FixedClock(base + Duration::SECOND),
             site.clone(),
+            generation,
             CenterInboundOptions::default(),
         );
         let task = tokio::spawn(engine.run(std::future::pending::<()>()));
@@ -1777,7 +2014,7 @@ mod tests {
         );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
         let engine = CenterInboundEngine::new(
             session,
             outbox.clone(),
@@ -1785,6 +2022,7 @@ mod tests {
             Arc::clone(&registry),
             FixedClock(base + Duration::SECOND),
             site.clone(),
+            generation,
             CenterInboundOptions::default(),
         );
         let task = tokio::spawn(engine.run(std::future::pending::<()>()));
@@ -1825,7 +2063,7 @@ mod tests {
         let outbox = MockOutbox::new();
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
-        registry.mark_connected(site.clone(), base_time())?;
+        let generation = registry.mark_connected(site.clone(), base_time())?;
         let engine = CenterInboundEngine::new(
             session,
             outbox,
@@ -1833,6 +2071,7 @@ mod tests {
             Arc::clone(&registry),
             FixedClock(base_time() + Duration::SECOND),
             site.clone(),
+            generation,
             CenterInboundOptions::default(),
         );
 
@@ -1863,7 +2102,7 @@ mod tests {
         );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
         let engine = CenterInboundEngine::new(
             session,
             outbox.clone(),
@@ -1871,6 +2110,7 @@ mod tests {
             Arc::clone(&registry),
             FixedClock(base + Duration::SECOND),
             site.clone(),
+            generation,
             CenterInboundOptions::default(),
         );
         let task = tokio::spawn(engine.run(std::future::pending::<()>()));
@@ -2001,7 +2241,7 @@ mod tests {
         );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
-        registry.mark_connected(site.clone(), base)?;
+        let generation = registry.mark_connected(site.clone(), base)?;
         let engine = CenterInboundEngine::new(
             session,
             outbox.clone(),
@@ -2009,6 +2249,7 @@ mod tests {
             Arc::clone(&registry),
             FixedClock(base + Duration::SECOND),
             site.clone(),
+            generation,
             CenterInboundOptions::default(),
         );
         let task = tokio::spawn(engine.run(std::future::pending::<()>()));
@@ -2068,6 +2309,75 @@ mod tests {
                 .any(|(_, message)| message.contains(corrupt_id.as_str())),
             "the repeated skip is reported at warn, not error"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_mid_flush_stops_the_remaining_offer_delivery()
+    -> Result<(), Box<dyn Error>> {
+        // W7-E-8: the flush observes the disconnect between frames, not
+        // only at the loop top — a revocation that lands mid-flush must
+        // stop the delivery of the rest of the batch, or the revoked site
+        // would still pull every offer it is owed.
+        let site = resolved_site();
+        let (session, mut outbound_rx, inbound_tx, reached, release, delivered) =
+            GatedSendSession::channel();
+        let outbox = MockOutbox::new();
+        let base = base_time();
+        for sequence in 1..=5_u64 {
+            outbox.seed_offer(
+                sequence,
+                site.instance_id(),
+                base,
+                (base + Duration::minutes(15)).unix_timestamp(),
+            );
+        }
+        let consumer = RecorderConsumer::new();
+        let registry = Arc::new(CenterSessionRegistry::new());
+        let generation = registry.mark_connected(site.clone(), base)?;
+        let engine = CenterInboundEngine::new(
+            session,
+            outbox.clone(),
+            consumer,
+            Arc::clone(&registry),
+            FixedClock(base + Duration::SECOND),
+            site.clone(),
+            generation,
+            CenterInboundOptions::default(),
+        );
+        let task = tokio::spawn(engine.run(std::future::pending::<()>()));
+
+        // The engine's initial flush is now blocked inside the first send,
+        // past the frame-boundary check of the first offer (the `reached`
+        // signal fired exactly when it arrived at that send). The
+        // disconnect lands while the send is still blocked...
+        reached.notified().await;
+        registry.disconnect(site.instance_id());
+        // ...so when the send is released, the next iteration's
+        // frame-boundary probe sees the session is no longer current and
+        // the flush stops: exactly the one in-flight offer is delivered,
+        // and the remaining four stay pending for the next connection.
+        release.notify_one();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .map_err(|_| "the in-flight offer was never delivered")?
+            .ok_or("the in-flight offer was never delivered")?;
+        assert_eq!(first.sequence, 1);
+        // The bounded settle gives a flush without the probe a moment to
+        // keep delivering; with the probe the count stays at exactly one.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            *delivered.lock().map_err(|_| MockCenterError)?,
+            1,
+            "only the in-flight offer is delivered after the disconnect"
+        );
+        assert_eq!(
+            outbox.pending_sequences(site.instance_id()),
+            vec![1, 2, 3, 4, 5],
+            "the undelivered offers stay pending for the next connection"
+        );
+        drop(inbound_tx);
+        task.abort();
         Ok(())
     }
 }

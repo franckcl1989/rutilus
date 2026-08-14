@@ -26,6 +26,8 @@
 #
 # Usage:
 #   scripts/assert-tests-ran.sh <min-passed> [--expect-tests name1,name2,...] [cargo test args...]
+#   (each expected name is a Rust identifier, optionally `::`-qualified:
+#    `foo` matches `module::tests::foo` by suffix, `module::tests::foo` is exact)
 #
 # `cargo test` is implicit: the args are exactly what the gate step used to
 # pass to it (e.g. `--locked -p rutilus-security --test secret_leak_gate`).
@@ -36,8 +38,15 @@
 # lower bound, so deleting a non-gate test file while keeping >= min passing
 # tests passes it; a name that is deleted, #[ignore]d, or cfg-emptied fails
 # regardless of the remaining count. A unit-test name inside a module is
-# matched by its bare fn name (`foo` matches `module::tests::foo`); expected
-# names must be plain identifiers [A-Za-z0-9_].
+# matched by its bare fn name (`foo` matches `module::tests::foo`); when a
+# name is not unique across the workspace's modules, the pin MUST use the
+# fully qualified name (`module::tests::foo`) — the match is a suffix
+# match, so the qualified form is matched exactly and cannot collide. Each
+# expected name is Rust-identifier-shaped: a non-empty `[A-Za-z_]
+# [A-Za-z0-9_]*` per `::` segment (W7-M-1). The ci.yml pin lists keep the
+# bare form today — the 21 registered names are unique workspace-wide
+# (verified in the wave-seven A4 register); switch any of them to the
+# qualified form only if a same-named test appears in a second module.
 #
 # The count is the sum of the `test result: ok. N passed; ...` lines libtest
 # prints per test binary (one per binary; doc-test harnesses included). A
@@ -103,9 +112,33 @@ if [ -n "$expect" ]; then
     missing=""
     IFS=',' read -ra names <<< "$expect"
     for name in "${names[@]}"; do
-        case "$name" in
-            '' | *[!A-Za-z0-9_]*) die "invalid expected test name '$name' — expected names must be plain identifiers [A-Za-z0-9_]" ;;
-        esac
+        # W7-M-1: a name may be fully qualified (`module::tests::foo`) to
+        # disambiguate same-named tests across modules. Every `::` segment
+        # must be a Rust identifier — a non-empty [A-Za-z_][A-Za-z0-9_]*
+        # — so `a::1b`, empty segments, and stray characters are refused.
+        # (The segments are peeled off one at a time instead of IFS-split,
+        # because IFS treats every ':' as a delimiter, which would split
+        # `a::b` into an empty middle segment.)
+        remaining="$name"
+        while :; do
+            case "$remaining" in
+                *::*)
+                    head="${remaining%%::*}"
+                    remaining="${remaining#*::}"
+                    case "$head" in
+                        '' | [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+                            die "invalid expected test name '$name' — every '::' segment must be a Rust identifier [A-Za-z_][A-Za-z0-9_]*" ;;
+                    esac
+                    ;;
+                *)
+                    case "$remaining" in
+                        '' | [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+                            die "invalid expected test name '$name' — every '::' segment must be a Rust identifier [A-Za-z_][A-Za-z0-9_]*" ;;
+                    esac
+                    break
+                    ;;
+            esac
+        done
         if ! printf '%s\n' "$ran" | grep -qx "$name" && ! printf '%s\n' "$ran" | grep -qxE ".*::$name"; then
             missing="$missing $name"
         fi

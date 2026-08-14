@@ -1245,6 +1245,9 @@ strings_catalog! {
     unavailable_credentials: "The credential inventory is temporarily unavailable.", zh: "凭据清单暂时不可用。",
     /// The audit log unavailable message.
     unavailable_audit: "The audit log is temporarily unavailable.", zh: "审计日志暂时不可用。",
+    /// The load-earlier failure message: the older page could not load,
+    /// and the loaded window is kept (L3).
+    error_audit_load_earlier: "Could not load the older audit page; the loaded window is kept.", zh: "无法加载更早的审计页；已载窗口保持不变。",
     /// The event history unavailable message.
     unavailable_events: "The event history is temporarily unavailable.", zh: "事件历史暂时不可用。",
     /// The telemetry history unavailable message.

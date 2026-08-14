@@ -626,6 +626,43 @@ impl StandaloneState {
         }
     }
 
+    /// Mirrors an event that is already persisted but was never mirrored
+    /// (the W7-D-2 committed-but-errored case) into the bounded in-memory
+    /// tail at its time-correct position.
+    ///
+    /// The tail keeps the store listing's order (oldest→newest by
+    /// `occurred_at`, the warm-up order), and such an event sits mid-history
+    /// rather than at the newest end — events after it already committed —
+    /// so it is inserted before the first newer event instead of being
+    /// pushed at the back. The residual: the tail's order is only as strict
+    /// as the warm-up listing plus append order, so the insertion position
+    /// is by `occurred_at`; an event whose neighbors violate that ordering
+    /// is placed as consistently as the cache's invariant allows. A mirror
+    /// failure is warned about, never fatal (V5A-6).
+    fn mirror_persisted_audit_event_to_tail(&self, event: &AuditEvent) {
+        match self.audit_tail.lock() {
+            Ok(mut tail) => {
+                if tail.iter().any(|entry| entry.id() == event.id()) {
+                    return;
+                }
+                if tail.len() == AUDIT_TAIL_EVENTS {
+                    tail.pop_front();
+                }
+                let mut position = tail.len();
+                while position > 0 && tail[position - 1].occurred_at() > event.occurred_at() {
+                    position -= 1;
+                }
+                tail.insert(position, event.clone());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "a persisted audit event could not be mirrored into the in-memory tail; \
+                     the console audit query will serve from the persisted store"
+                );
+            }
+        }
+    }
+
     /// Persists one event and mirrors it into the tail — the shared write
     /// path of the append boundary and the compensation drain.
     async fn persist_and_mirror_audit_event(
@@ -649,7 +686,12 @@ impl StandaloneState {
     /// failure (a store coordination or database condition) leaves the event
     /// queued — bounded by [`AUDIT_COMPENSATION_EVENTS`] — and warned about.
     /// A permanent domain violation (R6-C-4) is dropped with an error log
-    /// naming the event, because retrying it could never succeed.
+    /// naming the event, because retrying it could never succeed — unless
+    /// the event is already persisted (W7-D-2): an append whose write
+    /// committed before the store reported an error leaves the event
+    /// durably stored and unmirrored, and such an event is acknowledged and
+    /// mirrored instead, so the in-memory tail never forks from the
+    /// persisted store over an already-durable fact.
     async fn drain_audit_compensation(&self) {
         let mut consecutive_failures = 0;
         loop {
@@ -668,36 +710,58 @@ impl StandaloneState {
             };
             match self.persist_and_mirror_audit_event(&event).await {
                 Ok(()) => consecutive_failures = 0,
-                Err(source) if source.is_non_retryable() => {
-                    tracing::error!(
-                        event_id = %event.id(),
-                        action = %event.context().action(),
-                        "the queued audit append violates the audit trail and could never \
-                         succeed; the event is dropped instead of being retried: {source}"
-                    );
-                    // A dropped event frees a queue slot: the drain keeps
-                    // going, only store rejections count against the batch
-                    // bound.
-                    consecutive_failures = 0;
-                }
-                Err(source) => {
-                    tracing::warn!(
-                        "the audit compensation retry failed; the event stays queued: {source}"
-                    );
-                    if let Ok(mut queue) = AUDIT_COMPENSATION
-                        .get_or_init(|| Mutex::new(VecDeque::new()))
-                        .lock()
-                    {
-                        if queue.len() == AUDIT_COMPENSATION_EVENTS {
-                            evict_oldest_audit_compensation(&mut queue);
+                Err(source) => match self.store.audit_event_exists(event.id()).await {
+                    // W7-D-2: the rejected append was already committed — the
+                    // event is durable and only its mirror is missing. It is
+                    // acknowledged (never requeued, never duplicated) and
+                    // mirrored at its time position in the tail.
+                    Ok(true) => {
+                        self.mirror_persisted_audit_event_to_tail(&event);
+                        tracing::warn!(
+                            event_id = %event.id(),
+                            action = %event.context().action(),
+                            "the queued audit append was rejected but the event is already \
+                             persisted; it is acknowledged and mirrored without a second \
+                             insert: {source}"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    // The event is genuinely absent and the rejection is a
+                    // permanent domain violation: retrying could never
+                    // succeed, so the event is dropped (R6-C-4). A dropped
+                    // event frees a queue slot: the drain keeps going, only
+                    // store rejections count against the batch bound.
+                    Ok(false) if source.is_non_retryable() => {
+                        tracing::error!(
+                            event_id = %event.id(),
+                            action = %event.context().action(),
+                            "the queued audit append violates the audit trail and could never \
+                             succeed; the event is dropped instead of being retried: {source}"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    // A transient store condition — or an existence check
+                    // that failed alongside the store rejection — leaves the
+                    // event queued for the next pass.
+                    Ok(false) | Err(_) => {
+                        tracing::warn!(
+                            "the audit compensation retry failed; the event stays queued: {source}"
+                        );
+                        if let Ok(mut queue) = AUDIT_COMPENSATION
+                            .get_or_init(|| Mutex::new(VecDeque::new()))
+                            .lock()
+                        {
+                            if queue.len() == AUDIT_COMPENSATION_EVENTS {
+                                evict_oldest_audit_compensation(&mut queue);
+                            }
+                            queue.push_back(event);
                         }
-                        queue.push_back(event);
+                        consecutive_failures += 1;
+                        if consecutive_failures >= AUDIT_COMPENSATION_DRAIN_BATCH_FAILURES {
+                            return;
+                        }
                     }
-                    consecutive_failures += 1;
-                    if consecutive_failures >= AUDIT_COMPENSATION_DRAIN_BATCH_FAILURES {
-                        return;
-                    }
-                }
+                },
             }
         }
     }
@@ -746,7 +810,13 @@ fn evict_oldest_audit_compensation(queue: &mut VecDeque<AuditEvent>) {
 /// Runs the audit compensation drain until the stop watch fires: every
 /// [`AUDIT_COMPENSATION_DRAIN_INTERVAL`] the queued events whose durable
 /// append failed are retried in one bounded batch (V5A-4, R6-C-7).
-async fn run_audit_compensation_drain(mut stop: scheduler::StopWatch, state: Arc<StandaloneState>) {
+///
+/// `pub(crate)` for the center posture: `run_center_services` spawns the
+/// same drain task over the same process-wide queue (W7-C-3).
+pub(crate) async fn run_audit_compensation_drain(
+    mut stop: scheduler::StopWatch,
+    state: Arc<StandaloneState>,
+) {
     let mut interval = tokio::time::interval(AUDIT_COMPENSATION_DRAIN_INTERVAL);
     loop {
         tokio::select! {
@@ -1836,14 +1906,32 @@ impl StandaloneInstance {
             .map_err(StandaloneInstanceError::MasterKeyFile)?;
         let master_key = recover_master_key(&protected, unlock.passphrase())
             .map_err(StandaloneInstanceError::MasterKeyProtection)?;
-        if protected.is_legacy() {
+        if legacy_migration_requested(protected.is_legacy()) {
             // R6-S-11: a legacy RUTMK001 envelope is re-protected under the
             // current format right after a successful unlock — the wrong
             // passphrase above already failed, so this cannot rewrite
             // anything for an unauthenticated operator.
-            migrate_legacy_master_key_envelope(paths, unlock.passphrase(), &protected)
-                .await
-                .map_err(StandaloneInstanceError::MasterKeyMigration)?;
+            //
+            // W7-F-4: a migration failure (a read-only or failing key
+            // directory, a failing re-wrap) must not lock out a correct
+            // passphrase. The key was already recovered and the legacy
+            // envelope stays fully usable — it is the same AEAD-authenticated
+            // format the recovery just accepted — so the failure is warned
+            // about and the instance continues on the old envelope; the next
+            // open retries the migration. Fail-closed here would deny an
+            // authenticated operator for an I/O condition that does not
+            // weaken the unlock guarantee: the open's fail-closed surface
+            // faces unauthenticated operators rewriting the key file, and the
+            // migration itself never touches that surface.
+            if let Err(error) =
+                migrate_legacy_master_key_envelope(paths, unlock.passphrase(), &protected).await
+            {
+                tracing::warn!(
+                    "the legacy master-key envelope could not be migrated to the current \
+                     format; continuing with the legacy envelope (the next open retries the \
+                     migration): {error}"
+                );
+            }
         }
         Self::assemble(paths, runtime_lock, master_key).await
     }
@@ -2360,11 +2448,23 @@ where
             drain_scheduler(&mut scheduler).await;
             drain_listeners(&mut listeners).await;
             drain_sampler(&mut sampler).await;
-            // R6-C-3: the queued audit appends are replayed in a bounded
-            // final drain before the drain task stops, so the stop does not
-            // discard the whole compensation queue.
-            drain_audit_compensation_final(&services).await;
+            // W7-C-4: the audit compensation drain task is joined BEFORE the
+            // final drain. The stop signal cannot interrupt a drain pass
+            // that is already in flight — the task's select only fires
+            // between passes — so an append that fails during the shutdown
+            // is requeued by the in-flight pass. Joining first lets every
+            // such requeue land in the queue, and the final drain below then
+            // applies its bounded budget to the full remaining set; draining
+            // first would let those in-flight requeues bypass the final
+            // drain's budget entirely and be dropped without a replay
+            // attempt. The join still finishes before the store closes (the
+            // close happens after this function returns), so the task never
+            // touches a closed store.
             drain_compensation(&mut compensation).await;
+            // R6-C-3: the queued audit appends are replayed in a bounded
+            // final drain after the drain task has fully stopped, so the
+            // stop does not discard the whole compensation queue.
+            drain_audit_compensation_final(&services).await;
             let _ = scheduler_done_sender.send(());
             result.map_err(StandaloneRunError::Serve)
         }
@@ -2378,15 +2478,25 @@ where
             // The telemetry sampler drains next; its in-flight sweep
             // finishes.
             drain_sampler(&mut sampler).await;
-            // R6-C-3: the queued audit appends are replayed in a bounded
-            // final drain before the drain task stops, so the stop does not
-            // discard the whole compensation queue; the remaining budget is
-            // the honest line between a best-effort replay and an unbounded
-            // shutdown stall.
-            drain_audit_compensation_final(&services).await;
-            // The audit compensation drain stops last; its in-flight retry
-            // finishes.
+            // W7-C-4: the audit compensation drain task is joined BEFORE the
+            // final drain. The stop signal cannot interrupt a drain pass
+            // that is already in flight — the task's select only fires
+            // between passes — so an append that fails during the shutdown
+            // is requeued by the in-flight pass. Joining first lets every
+            // such requeue land in the queue, and the final drain below then
+            // applies its bounded budget to the full remaining set; draining
+            // first would let those in-flight requeues bypass the final
+            // drain's budget entirely and be dropped without a replay
+            // attempt. The join still finishes before the store closes (the
+            // close happens after this function returns), so the task never
+            // touches a closed store.
             drain_compensation(&mut compensation).await;
+            // R6-C-3: the queued audit appends are replayed in a bounded
+            // final drain after the drain task has fully stopped, so the
+            // stop does not discard the whole compensation queue; the
+            // remaining budget is the honest line between a best-effort
+            // replay and an unbounded shutdown stall.
+            drain_audit_compensation_final(&services).await;
             let _ = scheduler_done_sender.send(());
             // The server's shutdown future resolves now; await its drain.
             server.await.map_err(StandaloneRunError::Serve)
@@ -2648,7 +2758,7 @@ async fn run_operation_scheduler(
 /// the queue has no durable home, so the budget is the honest line between
 /// a best-effort replay and an unbounded shutdown stall.
 #[instrument(skip_all)]
-async fn drain_audit_compensation_final(state: &Arc<StandaloneState>) {
+pub(crate) async fn drain_audit_compensation_final(state: &Arc<StandaloneState>) {
     let deadline = std::time::Instant::now() + AUDIT_COMPENSATION_FINAL_DRAIN_TIMEOUT;
     loop {
         state.drain_audit_compensation().await;
@@ -2684,7 +2794,7 @@ async fn drain_audit_compensation_final(state: &Arc<StandaloneState>) {
 /// defect worth surfacing but not a blocker for the `SQLite` close that
 /// follows.
 #[instrument(skip_all)]
-async fn drain_compensation(compensation: &mut tokio::task::JoinHandle<()>) {
+pub(crate) async fn drain_compensation(compensation: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = compensation.await {
         tracing::error!("The audit compensation drain failed: {join_error}");
     }
@@ -2778,11 +2888,35 @@ pub enum StandaloneInstanceError {
     SystemMasterKeyFile(#[source] SystemMasterKeyFileError),
     #[error("failed to recover the system-protected Standalone master key: {0}")]
     SystemMasterKeyProtection(#[source] SystemMasterKeyError<SystemSecretStoreError>),
-    #[error("failed to migrate the legacy Standalone master-key envelope: {0}")]
-    MasterKeyMigration(#[source] MasterKeyMigrationError),
     #[error("failed to open the initialized Standalone database: {0}")]
     OpenStore(#[source] OpenStoreError),
 }
+
+/// Whether the open path should attempt the legacy-envelope migration: a
+/// legacy envelope always triggers it, and the W7-F-4 test injection forces
+/// the attempt (and, through [`LEGACY_MIGRATION_INJECTION`], its failure)
+/// on a current envelope. Production never takes the injected branch, and
+/// the `cfg(test)` split compiles it out of non-test builds.
+fn legacy_migration_requested(protected_is_legacy: bool) -> bool {
+    #[cfg(test)]
+    {
+        protected_is_legacy || LEGACY_MIGRATION_INJECTION.load(Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        protected_is_legacy
+    }
+}
+
+/// Test-only injection for the legacy-envelope migration step (W7-F-4): the
+/// degradation — a migration failure degrades to a warned open instead of
+/// locking out a correct passphrase — cannot be provoked with a genuine
+/// `RUTMK001` envelope from the app crate, because the security crate keeps
+/// the version-one derivation private. The flag forces both the migration
+/// attempt on a current envelope and its failure inside
+/// [`migrate_legacy_master_key_envelope`]. Production never sets it.
+#[cfg(test)]
+static LEGACY_MIGRATION_INJECTION: AtomicBool = AtomicBool::new(false);
 
 /// Re-protects a legacy `RUTMK001` passphrase envelope under the current
 /// format (R6-S-11) and persists the migrated envelope in place. The
@@ -2794,6 +2928,13 @@ pub(crate) async fn migrate_legacy_master_key_envelope(
     passphrase: &SecretString,
     protected: &ProtectedMasterKey,
 ) -> Result<(), MasterKeyMigrationError> {
+    #[cfg(test)]
+    if LEGACY_MIGRATION_INJECTION.load(Ordering::Relaxed) {
+        // W7-F-4: the injected failure stands in for the real failure modes
+        // (a failing re-wrap, a failing file replacement) so the open path's
+        // warn-and-continue degradation is exercised on a current envelope.
+        return Err(MasterKeyMigrationError::UnexpectedRewrap);
+    }
     let rewrapped = rewrap_master_key::<SystemSecretStore>(
         protected,
         passphrase,
@@ -2848,6 +2989,15 @@ pub enum StandaloneExecutionError {
     },
 }
 
+// The compensation-queue test serialization and reset are shared with the
+// center runtime's tests (W7-C-3): its integration test queues into the same
+// process-wide queue, so it must hold the same lock the standalone audit
+// tests hold. The re-export makes the private test module's items nameable
+// as `crate::standalone_runtime::…` in test builds without widening their
+// production visibility.
+#[cfg(test)]
+pub(crate) use tests::{AUDIT_GLOBALS_TEST_LOCK, reset_audit_globals};
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, fmt};
@@ -2858,9 +3008,9 @@ mod tests {
     };
     use rutilus_domain::{
         ARGON2ID_HASH_LENGTH, ARGON2ID_SALT_LENGTH, AuditAction, AuditEventId,
-        AuditOperationContext, AuditOperationId, AuditParameterSummary, AuditRedfishOperation,
-        AuditSequence, AuditTarget, CredentialUsername, EndpointAddress, ProductPermission,
-        TlsTrust,
+        AuditOperationContext, AuditOperationId, AuditParameterSummary, AuditProgress,
+        AuditRedfishOperation, AuditSequence, AuditTarget, CredentialUsername, EndpointAddress,
+        ProductPermission, TlsTrust,
     };
     // The raw-SQL audit tests (R6-4, R6-C-4 transient failures) open a
     // direct sqlx pool on the instance file, bypassing the store's
@@ -2878,12 +3028,17 @@ mod tests {
     /// warm-up flag exactly like the production runtime does, so they
     /// serialize through this lock (the same discipline as the derivation
     /// gate's `GATE_TEST_LOCK`).
-    static AUDIT_GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    ///
+    /// `pub(crate)` for the center runtime's compensation test (W7-C-3):
+    /// it queues into the same process-wide queue, so it must hold the
+    /// same lock the standalone audit tests hold.
+    pub(crate) static AUDIT_GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// The tests share the process-wide audit compensation queue and the
     /// warm-up flag exactly like the production runtime does, so each test
     /// resets them before it runs.
-    fn reset_audit_globals() {
+    pub(crate) fn reset_audit_globals() {
         if let Ok(mut queue) = AUDIT_COMPENSATION
             .get_or_init(|| Mutex::new(VecDeque::new()))
             .lock()
@@ -4287,6 +4442,323 @@ mod tests {
             [succeeded, started],
             "the console view must not show the idempotent re-append twice"
         );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// A test `io::Write` target appending into an in-memory buffer, so the
+    /// open path's diagnostics can be captured without a global subscriber
+    /// (the same pattern as `main.rs`'s JSON subscriber test).
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds a WARN-level capturing subscriber pair for the degradation and
+    /// shutdown assertions: the `Dispatch` to install on the test thread and
+    /// the buffer it appends into.
+    fn capture_warn_diagnostics() -> (tracing::Dispatch, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || CaptureWriter(Arc::clone(&writer_buffer)))
+                .finish(),
+        );
+        (dispatch, buffer)
+    }
+
+    /// The captured diagnostics' text.
+    fn captured_text(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<String, Box<dyn Error>> {
+        String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()).into())
+    }
+
+    /// Waits until the compensation queue holds exactly `event` — the drain
+    /// task has popped everything queued before it and blocked with its
+    /// append in flight (the write gate the test holds).
+    async fn wait_for_in_flight_drain_event(event: &AuditEvent) -> Result<(), Box<dyn Error>> {
+        let mut waits = 0;
+        loop {
+            let in_flight = {
+                let queue = AUDIT_COMPENSATION
+                    .get_or_init(|| Mutex::new(VecDeque::new()))
+                    .lock()
+                    .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+                queue.len() == 1 && queue[0].id() == event.id()
+            };
+            if in_flight {
+                return Ok(());
+            }
+            waits += 1;
+            if waits > 300 {
+                return Err(std::io::Error::other(
+                    "the background drain never took the queued event into flight",
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_legacy_envelope_migration_degrades_to_a_warned_open()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W7-F-4: a legacy-envelope migration failure (a read-only or
+        // failing key directory) must not lock out a correct passphrase.
+        // The migration cannot be provoked with a genuine RUTMK001 envelope
+        // from this crate — the security crate keeps the version-one
+        // derivation private — so the injection flag forces both the
+        // migration attempt and its failure on a current envelope; the open
+        // must degrade to a warn and continue with the existing envelope.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let envelope_before = std::fs::read(paths.master_key_path())?;
+
+        let (dispatch, buffer) = capture_warn_diagnostics();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        LEGACY_MIGRATION_INJECTION.store(true, Ordering::Relaxed);
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+        LEGACY_MIGRATION_INJECTION.store(false, Ordering::Relaxed);
+
+        let captured = captured_text(&buffer)?;
+        assert!(
+            captured.contains("could not be migrated to the current format"),
+            "the open must warn about the failed migration, captured: {captured}"
+        );
+        assert_eq!(
+            std::fs::read(paths.master_key_path())?,
+            envelope_before,
+            "the failed migration must leave the envelope untouched"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_committed_but_errored_append_is_mirrored_by_the_drain_not_dropped()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W7-D-2: an append whose write committed but whose response
+        // reported an error leaves the event durably stored and unmirrored.
+        // When the drain re-issues the non-terminal event, the store rejects
+        // it as non-contiguous — but the drain must recognize the
+        // already-durable event, mirror it at its time position, and
+        // acknowledge it instead of dropping it and forking the tail from
+        // the store.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+        let now = OffsetDateTime::now_utc();
+
+        let context = import_context()?;
+        let started = AuditEvent::started(context.clone(), now);
+        let progressed = AuditEvent::progress(
+            context.clone(),
+            AuditSequence::FIRST.next()?,
+            AuditProgress::RowValidated,
+            now + Duration::from_secs(1),
+        )?;
+        let succeeded = AuditEvent::succeeded(
+            context,
+            AuditSequence::FIRST.next()?.next()?,
+            now + Duration::from_secs(2),
+        )?;
+        instance.state().append_audit_event(&started).await?;
+        // The middle event's write commits through the store while the
+        // state-level append "reports an error" (its mirror never ran) —
+        // exactly the committed-but-errored shape the drain must heal. The
+        // store path bypasses the tail mirror on purpose.
+        instance
+            .state()
+            .store
+            .append_audit_event(&progressed)
+            .await?;
+        instance.state().append_audit_event(&succeeded).await?;
+        assert_eq!(
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?,
+            [succeeded.clone(), started.clone()],
+            "the unmirrored event must be invisible to the console's tail view"
+        );
+        {
+            let mut queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            queue.push_back(progressed.clone());
+        }
+
+        instance.state().drain_audit_compensation().await;
+        {
+            let queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            assert!(
+                queue.is_empty(),
+                "an already-persisted event must be acknowledged, not requeued"
+            );
+        }
+        assert_eq!(
+            instance
+                .state()
+                .store
+                .find_audit_operation(started.context().operation_id())
+                .await?,
+            [started.clone(), progressed.clone(), succeeded.clone()],
+            "the persisted trail must not duplicate the healed event"
+        );
+        assert_eq!(
+            AuditEventQuery::list_recent_events(&*instance.state(), audit_query_limit()?).await?,
+            [succeeded.clone(), progressed.clone(), started.clone()],
+            "the healed event must join the console tail at its time position"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_requeue_from_the_background_drain_reaches_the_final_drain()
+    -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W7-C-4: the shutdown path joins the background compensation drain
+        // BEFORE the bounded final drain. The stop signal cannot interrupt
+        // an in-flight drain pass, so an append that fails during the
+        // shutdown is requeued by that pass; joining first lets every such
+        // requeue land in the queue, and the final drain then applies its
+        // budget to it — under the old order the final drain ran first on
+        // the empty queue and the requeued events bypassed its budget
+        // entirely. The final drain's budget-exhausted warning is the
+        // observable: it fires only when the requeued events actually
+        // reached the final drain.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let passphrase = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &passphrase).await?;
+        let instance = StandaloneInstance::open(&paths, &passphrase).await?;
+
+        let now = OffsetDateTime::now_utc();
+        let first = AuditEvent::started(import_context()?, now);
+        let second = AuditEvent::started(import_context()?, now + Duration::from_secs(1));
+        {
+            let mut queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            queue.push_back(first.clone());
+            queue.push_back(second.clone());
+        }
+
+        // Hold the store's write gate so the drain's first pass blocks with
+        // the first event in flight — the stop signal cannot interrupt it.
+        let state = instance.state();
+        let gate_permit = state.store.acquire_write_gate().await?;
+        let (stop_sender, stop_receiver) = oneshot::channel();
+        let stop = async move {
+            stop_receiver
+                .await
+                .map_err(|_| io::Error::other("the test stop signal was dropped"))
+        };
+        let make_server =
+            move |_policy: AuthPolicy,
+                  mut stop_watch: scheduler::StopWatch,
+                  scheduler_done_receiver: oneshot::Receiver<()>| async move {
+                // The minimal server shape of the real `serve_until` shutdown
+                // future: wait for the stop watch, then for the background
+                // tasks' completion signal, then report success.
+                stop_watch.stopped().await;
+                let _ = scheduler_done_receiver.await;
+                Ok::<(), io::Error>(())
+            };
+        let run_task = tokio::spawn(run_background_services(
+            Arc::clone(&instance.state),
+            Arc::new(RedfishGateway::from_system_roots().await?),
+            TelemetryRetention::default(),
+            DeploymentPosture::Standalone,
+            AuditActor::LocalOperator,
+            make_server,
+            stop,
+        ));
+
+        // Wait deterministically for the drain task to have popped the first
+        // event and blocked on the gate: the queue then holds exactly the
+        // second event.
+        wait_for_in_flight_drain_event(&second).await?;
+
+        // Sabotage the store underneath the in-flight append: every append
+        // now fails with a transient database condition, so the in-flight
+        // pass fails and requeues its events during the shutdown.
+        let writer = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(paths.database_path())
+                .create_if_missing(false),
+        )
+        .await?;
+        sea_orm::sqlx::query("DROP TABLE audit_events")
+            .execute(&writer)
+            .await?;
+        writer.close().await;
+
+        let (dispatch, buffer) = capture_warn_diagnostics();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        stop_sender
+            .send(())
+            .map_err(|()| io::Error::other("the test stop receiver was dropped"))?;
+        drop(gate_permit);
+        drop(state);
+        let result = run_task
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+        assert!(
+            result.is_ok(),
+            "the shutdown run must complete, got: {result:?}"
+        );
+        let captured = captured_text(&buffer)?;
+        assert!(
+            captured.contains("shutdown audit-compensation drain budget is exhausted"),
+            "the requeued events must reach the bounded final drain, captured: {captured}"
+        );
+        // The honest limitation stays: with the store sabotaged, the final
+        // drain spends its budget and the in-memory queue still holds the
+        // events — now explicitly accounted for instead of silently
+        // bypassing the budget.
+        {
+            let queue = AUDIT_COMPENSATION
+                .get_or_init(|| Mutex::new(VecDeque::new()))
+                .lock()
+                .map_err(|_| std::io::Error::other("the compensation queue is poisoned"))?;
+            assert_eq!(queue.len(), 2);
+        }
         instance.close().await?;
         drop(directory);
         Ok(())

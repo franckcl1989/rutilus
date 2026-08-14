@@ -53,7 +53,7 @@ use sea_orm_migration::MigratorTrait;
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use tokio::sync::AcquireError;
+use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::{OpenStoreError, SqliteStore};
 
@@ -156,6 +156,29 @@ impl SqliteStore {
         Err(SnapshotError::CheckpointRacing)
     }
 
+    /// Holds the store's exclusive write gate for the caller's duration —
+    /// the §20.1 "pause new write transactions" primitive
+    /// [`Self::consistent_snapshot`] uses internally.
+    ///
+    /// Holding the returned permit pauses new write transactions and waits
+    /// for the in-flight one to commit; dropping it reopens writes. The
+    /// runtime exposes the permit for coordination seams that must freeze
+    /// writes beyond a snapshot — the shutdown-drain test holds it to keep
+    /// one audit append deterministically in flight while the stop signal
+    /// fires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::Coordinate`] when write coordination is
+    /// unavailable.
+    pub async fn acquire_write_gate(&self) -> Result<OwnedSemaphorePermit, SnapshotError> {
+        self.write_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(SnapshotError::Coordinate)
+    }
+
     /// The number of migrations applied when the store was last opened.
     ///
     /// Recorded in the backup manifest as the schema version, so a restore
@@ -199,17 +222,46 @@ pub enum AppliedMigrationsError {
 /// against the recorded fingerprints, refusing a mixed pair instead of
 /// letting `SQLite` silently discard the mismatched WAL.
 ///
+/// A surviving marker also refuses a re-run of the restore (W7-F-2): a
+/// fresh marker would record the current live pair — possibly the mixed
+/// pair an interrupted first generation left behind — as the pre-restore
+/// state, and the next open would then legitimize that mixed pair as
+/// "untouched". The re-run is refused instead, so the interrupted state can
+/// only be resolved through a store open, which accepts exactly the
+/// recorded snapshot pair (complete) or the recorded pre-restore pair
+/// (untouched) and refuses a mixed pair.
+///
 /// # Errors
 ///
 /// Returns [`RestoreError`] for any failed temporary write, synchronization,
-/// rename, marker, or stale-sidecar removal stage. A failure after the
-/// marker was written leaves the marker in place, so the interrupted state
-/// is detected at the next open.
+/// rename, marker, or stale-sidecar removal stage, and
+/// [`RestoreError::RestoreInterrupted`] when a restore-pending marker
+/// already survives. A failure after the marker was written leaves the
+/// marker in place, so the interrupted state is detected at the next open.
 pub fn restore_database_files(
     database_path: &Path,
     snapshot: &DatabaseSnapshot,
 ) -> Result<(), RestoreError> {
     let marker_path = sidecar_path(database_path, RESTORE_PENDING_SUFFIX);
+    match fs::symlink_metadata(&marker_path) {
+        Ok(_) => {
+            return Err(RestoreError::RestoreInterrupted {
+                path: marker_path,
+                source: io::Error::other(
+                    "the restore-pending marker of an earlier interrupted restore already exists",
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        // Fail closed when the marker's state cannot even be inspected: an
+        // unwritable or unreadable marker path must not be overwritten blind.
+        Err(source) => {
+            return Err(RestoreError::RestoreInterrupted {
+                path: marker_path,
+                source,
+            });
+        }
+    }
     write_restore_marker(database_path, &marker_path, snapshot)?;
     let result = (|| {
         replace_file(database_path, &snapshot.database)?;
@@ -608,6 +660,15 @@ pub enum RestoreError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "an interrupted restore is pending at {path}; refusing to overwrite its marker — \
+         open the instance to verify the live pair, or resolve the marker manually: {source}"
+    )]
+    RestoreInterrupted {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to write the restore-pending marker at {path}: {source}")]
     WriteMarker {
         path: PathBuf,
@@ -822,6 +883,67 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["before-backup"]);
         reopened.close().await?;
+        Ok(())
+    }
+
+    /// W7-F-2: the two-generation restore scenario. The first restore crashes
+    /// after replacing the main database, leaving the snapshot's database
+    /// beside the pre-restore WAL — a mixed pair — under the restore-pending
+    /// marker. A re-run of the restore must refuse to write a fresh marker
+    /// (which would record the mixed pair as the pre-restore state and
+    /// legitimize it as "untouched" at the next open), and the mixed pair
+    /// must stay refused at the open.
+    #[tokio::test]
+    async fn a_rerun_restore_refuses_to_legitimize_a_mixed_pair_from_the_first_generation()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let store = SqliteStore::open(&database_path).await?;
+        insert_credential(&store.database, "before-backup").await?;
+        let snapshot = store.consistent_snapshot().await?;
+        insert_credential(&store.database, "after-backup").await?;
+        // `SQLite` deletes the WAL sidecar on a clean close, so the
+        // pre-restore WAL bytes are captured while the store is still open
+        // and recreated beside the database afterwards — the first
+        // generation's crash left that old WAL in place.
+        let pre_restore_wal = sidecar_path(&database_path, WAL_SIDECAR_SUFFIX);
+        let pre_restore_wal_bytes = std::fs::read(&pre_restore_wal)?;
+        assert_ne!(
+            pre_restore_wal_bytes,
+            snapshot.wal().ok_or("the snapshot must carry a WAL")?,
+            "the pre-restore WAL must differ from the snapshot WAL for the pair to be mixed"
+        );
+        store.close().await?;
+        std::fs::write(&pre_restore_wal, &pre_restore_wal_bytes)?;
+
+        // Generation 1: the marker is written and the main database is
+        // replaced, then the restore "crashes" before the WAL replacement —
+        // the live pair is now the snapshot's database beside the
+        // pre-restore WAL.
+        let marker_path = sidecar_path(&database_path, RESTORE_PENDING_SUFFIX);
+        write_restore_marker(&database_path, &marker_path, &snapshot)?;
+        std::fs::write(&database_path, snapshot.database())?;
+
+        // Generation 2: the operator re-runs the restore. It must refuse to
+        // overwrite the marker, so the interrupted state stays detectable
+        // instead of being re-recorded with the mixed pair as the
+        // pre-restore state.
+        let Err(error) = restore_database_files(&database_path, &snapshot) else {
+            unreachable!("the re-run restore must refuse to overwrite the pending marker")
+        };
+        assert!(
+            matches!(error, RestoreError::RestoreInterrupted { .. }),
+            "the re-run restore must refuse with the interrupted-restore error, got: {error}"
+        );
+
+        // The open still verifies against the marker's original fingerprints:
+        // the live pair matches neither the snapshot pair nor the recorded
+        // pre-restore pair, so the mixed state is refused.
+        let reopened = SqliteStore::open(&database_path).await;
+        assert!(
+            matches!(reopened, Err(OpenStoreError::RestoreInterrupted { .. })),
+            "the mixed pair must stay refused at the next open, got: {reopened:?}"
+        );
         Ok(())
     }
 

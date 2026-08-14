@@ -1396,6 +1396,30 @@ async fn bounds_the_audit_query_limit() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // N2: each violation class answers with its own message — a bad
+    // `offset` must not be reported as a bad `limit`, and a duplicated or
+    // unknown parameter is named as the parameter problem it is.
+    let response = get(&router, "/api/v1/audit?limit=0").await?;
+    assert_eq!(
+        json_body(response).await?["message"],
+        "audit limit must be between 1 and 1000"
+    );
+    let response = get(&router, "/api/v1/audit?offset=10000001").await?;
+    assert_eq!(
+        json_body(response).await?["message"],
+        "audit offset must be between 0 and 10000000"
+    );
+    let response = get(&router, "/api/v1/audit?page=2").await?;
+    assert_eq!(
+        json_body(response).await?["message"],
+        "audit query accepts only the limit and offset parameters, each at most once"
+    );
+    let response = get(&router, "/api/v1/audit?offset=1&offset=2").await?;
+    assert_eq!(
+        json_body(response).await?["message"],
+        "audit query accepts only the limit and offset parameters, each at most once"
+    );
+
     let response = get(&router, "/api/v1/audit?limit=1").await?;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     let body = json_body(response).await?;

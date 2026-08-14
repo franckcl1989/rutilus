@@ -23,7 +23,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::standalone_runtime::{MasterKeyMigrationError, migrate_legacy_master_key_envelope};
+use crate::standalone_runtime::migrate_legacy_master_key_envelope;
 
 const MINIMUM_PASSPHRASE_CHARACTERS: usize = 12;
 const MAXIMUM_PASSPHRASE_BYTES: usize = 1024;
@@ -136,9 +136,23 @@ pub async fn initialize_standalone(
             // R6-S-11: the resumed unlock migrates a legacy RUTMK001
             // envelope to the current format, exactly like the Standalone
             // open path.
-            migrate_legacy_master_key_envelope(paths, unlock.passphrase(), &protected)
-                .await
-                .map_err(InitializationError::MasterKeyMigration)?;
+            //
+            // W7-F-4: a migration failure (a read-only or failing key
+            // directory) must not lock out a correct passphrase — the key
+            // was already recovered and the legacy envelope stays fully
+            // usable (the same AEAD-authenticated format the recovery just
+            // accepted) — so the failure is warned about and initialization
+            // continues on the old envelope; the next open retries the
+            // migration.
+            if let Err(error) =
+                migrate_legacy_master_key_envelope(paths, unlock.passphrase(), &protected).await
+            {
+                tracing::warn!(
+                    "the legacy master-key envelope could not be migrated to the current \
+                     format; continuing with the legacy envelope (the next open retries the \
+                     migration): {error}"
+                );
+            }
         }
         InitializationOutcome::Resumed
     } else {
@@ -295,8 +309,6 @@ pub enum InitializationError {
     MasterKeyProtection(#[source] MasterKeyProtectionError),
     #[error("failed to persist or load the protected instance master key: {0}")]
     MasterKeyFile(#[source] MasterKeyFileError),
-    #[error("failed to migrate the legacy instance master-key envelope: {0}")]
-    MasterKeyMigration(#[source] MasterKeyMigrationError),
     #[error("failed to open and migrate the instance database: {0}")]
     OpenStore(#[source] OpenStoreError),
     #[error("failed to close the initialized instance database: {0}")]

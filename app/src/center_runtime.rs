@@ -75,7 +75,10 @@ use crate::{
     ListenAddress, SiteBinding, SiteRunError, SiteRunOptions, StandaloneInstance,
     StandaloneInstanceCloseError, StandaloneInstanceError, StandaloneUnlock, SystemClock,
     scheduler,
-    standalone_runtime::{GRACEFUL_DRAIN_TIMEOUT, StandaloneState},
+    standalone_runtime::{
+        GRACEFUL_DRAIN_TIMEOUT, StandaloneState, drain_audit_compensation_final,
+        drain_compensation, run_audit_compensation_drain,
+    },
 };
 use rutilus_infra_redfish::RedfishGateway;
 
@@ -427,6 +430,26 @@ impl CenterServices for StandaloneState {
         _now: OffsetDateTime,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
         Box::pin(async move {
+            // W7-F-7a: the revocation runs inside the same per-site gate as
+            // the dispatch critical section (R6-C-1) — the gate is taken
+            // first and the store writes follow, the dispatch's lock order.
+            // A dispatch holds the gate across its binding check, its
+            // operation creation, and its offer enqueue, so the revocation
+            // can never commit between the check and the enqueue: either
+            // the dispatch completes before the revocation (the offer
+            // predates it), or it observes the revoked binding and produces
+            // nothing.
+            let gate = {
+                let mut gates = self
+                    .dispatch_gates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                gates
+                    .entry(site)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let _revoke_guard = gate.lock().await;
             // A site without a binding row has nothing to revoke; the
             // revocation is idempotent exactly like the domain's own
             // already-revoked absorption.
@@ -436,6 +459,8 @@ impl CenterServices for StandaloneState {
                 .await
                 .map_err(CenterServicesError::Binding)?
             else {
+                // The site is not bound; its gate key is garbage.
+                self.drop_dispatch_gate(site);
                 return Ok(());
             };
             match self
@@ -452,6 +477,13 @@ impl CenterServices for StandaloneState {
             // closes instead of keeping its flush and its reply path alive
             // (the V5E-5 retirement premise).
             self.registry.disconnect(site);
+            // W7-P-7: the gate key is reclaimed with the revocation — a
+            // revoke/re-enroll cycle mints a fresh instance id, and the
+            // revoked site's key would otherwise stay in the map forever.
+            // Any in-flight dispatch still holds its `Arc` clone, so the
+            // removal never races a lock holder; a later dispatch simply
+            // re-creates the key.
+            self.drop_dispatch_gate(site);
             Ok(())
         })
     }
@@ -571,6 +603,37 @@ impl CenterServices for StandaloneState {
 const CENTER_VIEW_OFFER_SCAN_LIMIT: u64 = 256;
 
 impl StandaloneState {
+    /// Re-verifies one site's binding after its connection registered
+    /// (W7-C-1): `Ok(true)` when the binding row exists and is in force.
+    ///
+    /// The admission resolves the binding before the connection task is
+    /// even spawned, so a revocation that lands in the registration window
+    /// is invisible to it; this fresh store read is the post-registration
+    /// re-check that closes the window — a revoked site's just-registered
+    /// session is closed instead of staying online with a disconnect
+    /// signal that can never fire.
+    async fn center_binding_still_in_force(
+        &self,
+        site: InstanceId,
+    ) -> Result<bool, CenterBindingRepositoryError> {
+        let Some(binding) = self.store.find_binding_by_site(site).await? else {
+            return Ok(false);
+        };
+        Ok(binding.state() == CenterBindingState::Bound)
+    }
+
+    /// Removes one site's per-site dispatch gate key (W7-P-7). The removal
+    /// is safe under in-flight dispatches: the map only guards the lookup,
+    /// and a dispatch that already holds the gate keeps its `Arc` clone of
+    /// the lock object alive.
+    fn drop_dispatch_gate(&self, site: InstanceId) {
+        let mut gates = self
+            .dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.remove(&site);
+    }
+
     /// The center's §15.6 operation tracking view.
     ///
     /// The operation records carry the stable ids, the typed command, and
@@ -788,6 +851,15 @@ where
         Arc::clone(&state),
         acceptor,
     ));
+    // W7-C-3: the center posture's terminal audit facts enqueue into the
+    // same process-wide compensation queue as the Edge postures, so the
+    // drain task must run here too — without it, a transient store failure
+    // would leave the event queued for the whole center run and the
+    // shutdown would discard the queue wholesale.
+    let mut compensation = tokio::spawn(run_audit_compensation_drain(
+        stop_watch.clone(),
+        Arc::clone(&state),
+    ));
     // The §16.2 first-run lifecycle matches the Edge postures: an
     // unconsumed bootstrap code leaves only the claim surface reachable
     // (the product surface stays closed — S3-2), and the first-run claim
@@ -825,6 +897,12 @@ where
             if let Err(error) = accept_loop.await {
                 tracing::error!("the center accept loop task failed: {error}");
             }
+            // W7-C-3: the queued audit appends are replayed in a bounded
+            // final drain before the drain task stops, so the stop does not
+            // discard the whole compensation queue (the same two-branch
+            // discipline as the Edge postures' `run_background_services`).
+            drain_audit_compensation_final(&state).await;
+            drain_compensation(&mut compensation).await;
             result.map_err(CenterRunError::Serve)
         }
         signal = stop => {
@@ -836,6 +914,9 @@ where
             if let Err(error) = accept_loop.await {
                 tracing::error!("the center accept loop task failed: {error}");
             }
+            // W7-C-3: bounded final drain before the drain task stops.
+            drain_audit_compensation_final(&state).await;
+            drain_compensation(&mut compensation).await;
             server.await.map_err(CenterRunError::Serve)
         }
     }
@@ -1024,30 +1105,71 @@ async fn run_center_connection(
         CenterProjection::new(store, store),
         CenterOperationTracking::new(store, store),
     );
-    if let Err(error) = state
+    // The registration generation (W7-C-2): the engine's exit cleanup and
+    // the crash guard carry it, so one connection's cleanup can never
+    // remove the entry of the site's next connection.
+    let generation = match state
         .registry
         .mark_connected(site.clone(), SystemClock.now())
     {
-        tracing::warn!(
-            "center refused a second connection for site {}: {error}",
-            site.instance_id()
-        );
-        return;
-    }
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::warn!(
+                "center refused a second connection for site {}: {error}",
+                site.instance_id()
+            );
+            return;
+        }
+    };
     // R6-C-6: the registry's per-site disconnect signal lets a binding
     // revocation end this connection. The signal is armed inside
     // `mark_connected`, so a revocation racing this setup still fires: the
     // `Notify` stores the notification for the first `notified()` await.
     let disconnect = state.registry.disconnect_watch(site.instance_id());
+    // W7-C-1: a revocation that landed before the registration — while the
+    // admission answer was on the wire and the connection task was spawned
+    // — was a no-op against an empty registry, so the entry registered
+    // above would carry a disconnect signal that can never fire and keep
+    // the revoked site online and flushing. The fresh store read re-checks
+    // the binding in force; a revoked site's just-registered session is
+    // closed here instead. A revocation that lands after this re-check
+    // removes the entry and fires the signal the task already holds, so
+    // every ordering is covered exactly once. A store failure cannot
+    // verify the binding, so the connection is closed too (fail closed:
+    // a session whose binding state is unknown must not stay online).
+    let binding_in_force = match state
+        .center_binding_still_in_force(site.instance_id())
+        .await
+    {
+        Ok(in_force) => in_force,
+        Err(error) => {
+            tracing::error!(
+                "site {}: could not re-verify the binding after registration, closing the \
+                 connection: {error}",
+                site.instance_id()
+            );
+            false
+        }
+    };
+    if !binding_in_force {
+        tracing::warn!(
+            "site {}: the binding was revoked before the connection registered; closing the \
+             connection",
+            site.instance_id()
+        );
+        state.registry.disconnect(site.instance_id());
+        return;
+    }
     // The crash backstop (N2-4): the engine removes the site on every
     // orderly exit, and this guard guarantees the same cleanup when the
     // task ends abnormally — a panic unwind runs the guard's `Drop`. A
     // crashed task must never leave a zombie online entry, or the site's
     // reconnects would be refused as `AlreadyConnected` forever, silently.
-    // The cleanup is idempotent, so the guard and the engine's own cleanup
-    // never conflict.
+    // The cleanup is generation-guarded, so the guard and the engine's own
+    // cleanup never conflict and a stale guard never removes the site's
+    // next connection (W7-C-2).
     let site_id = site.instance_id();
-    let _disconnect_guard = DisconnectOnDrop::new(Arc::clone(&state.registry), site_id);
+    let _disconnect_guard = DisconnectOnDrop::new(Arc::clone(&state.registry), site_id, generation);
     let engine = CenterInboundEngine::new(
         connection,
         store,
@@ -1055,6 +1177,7 @@ async fn run_center_connection(
         Arc::clone(&state.registry),
         SystemClock,
         site.clone(),
+        generation,
         CenterInboundOptions::default(),
     );
     if let Err(error) = engine
@@ -1110,26 +1233,34 @@ pub enum CenterRunError {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, net::Ipv4Addr, path::PathBuf, sync::Arc};
+    use std::{error::Error, io, net::Ipv4Addr, path::PathBuf, sync::Arc};
 
     use rutilus_application::{
-        CenterProjectionRepository, CenterTrustAnchor, EndpointProjectionWrite, ResolvedSite,
-        ResourceProjectionWrite, SiteCertificateIssuer,
+        AuditEventWriter, CenterProjectionRepository, CenterTrustAnchor, EndpointProjectionWrite,
+        ResolvedSite, ResourceProjectionWrite, SiteCertificateIssuer,
     };
     use rutilus_center_protocol::{EnvelopeMessage, OperationOffer};
     use rutilus_domain::{
-        CenterBinding, CenterBindingId, CertificateFingerprint, EndpointId, InstanceId,
-        InstanceKind, Operation, OperationSource, OperationTarget, OutboxEntry, OutboxEntryId,
-        Principal, PrincipalId, PrincipalName, RedfishCommand, ResetType, ResourceFeature,
-        ResourceODataId, Role, RoleAssignment, SiteInstance, SystemCommand, TargetId,
+        AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
+        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CenterBinding, CenterBindingId,
+        CertificateFingerprint, EndpointId, InstanceId, InstanceKind, Operation, OperationSource,
+        OperationTarget, OutboxEntry, OutboxEntryId, Principal, PrincipalId, PrincipalName,
+        ProductPermission, RedfishCommand, ResetType, ResourceFeature, ResourceODataId, Role,
+        RoleAssignment, SiteInstance, SystemCommand, TargetId,
     };
     use rutilus_persistence::SqliteStore;
     use rutilus_platform::{RuntimeLock, RuntimePaths};
     use rutilus_security::{MasterKey, generate_binding_code};
+    // The W7-C-3 integration test holds the instance database's write lock
+    // through a raw sqlx connection to inject a transient append failure
+    // that heals when the lock is released; sea-orm is the app crate's
+    // dev-dependency.
+    use sea_orm::sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
     use time::{Duration, OffsetDateTime};
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::standalone_runtime::{AUDIT_GLOBALS_TEST_LOCK, reset_audit_globals};
 
     /// Probes one free port on the given host and returns it.
     async fn free_port(host: Ipv4Addr) -> io::Result<u16> {
@@ -1660,6 +1791,314 @@ mod tests {
                 .await?
                 .is_empty(),
             "no operation may be created for a revoked site"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_revocation_landing_before_registration_closes_the_new_connection()
+    -> Result<(), Box<dyn Error>> {
+        // W7-C-1: a revocation that lands between the admission (which
+        // verified the binding) and the connection task's registration is a
+        // no-op against an empty registry, so the entry that registers
+        // afterwards would carry a disconnect signal that can never fire —
+        // the revoked site would stay online and keep flushing. The
+        // post-registration binding re-check closes the window: the
+        // session is closed instead.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, binding_id, _actor, _endpoint_id) = seed_dispatchable_site(&state, now).await?;
+
+        // The revocation lands before the connection task registers: the
+        // store commit happens, and the registry disconnect is a no-op for
+        // a site that is not online yet.
+        state.revoke_center_binding(site.id(), now).await?;
+        assert!(!state.registry.is_online(site.id()));
+
+        // The racer's connection task then registers — the revoked site is
+        // online with a disconnect signal nothing will ever fire.
+        state.registry.mark_connected(
+            ResolvedSite::new(
+                site.id(),
+                binding_id,
+                CertificateFingerprint::from_bytes([0x42; 32]),
+            ),
+            now,
+        )?;
+        assert!(state.registry.is_online(site.id()));
+
+        // The post-registration re-check sees the revoked binding, and the
+        // caller's self-disconnect closes the just-registered session.
+        assert!(!state.center_binding_still_in_force(site.id()).await?);
+        state.registry.disconnect(site.id());
+        assert!(
+            !state.registry.is_online(site.id()),
+            "the revoked site's just-registered session is closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bound_site_passes_the_post_registration_recheck() -> Result<(), Box<dyn Error>> {
+        // W7-C-1, the healthy side: a site whose binding is still in force
+        // passes the post-registration re-check and its session proceeds —
+        // the re-check is a read of the binding, never a fresh admission.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, binding_id, _actor, _endpoint_id) = seed_dispatchable_site(&state, now).await?;
+        let generation = state.registry.mark_connected(
+            ResolvedSite::new(
+                site.id(),
+                binding_id,
+                CertificateFingerprint::from_bytes([0x42; 32]),
+            ),
+            now,
+        )?;
+        assert!(state.center_binding_still_in_force(site.id()).await?);
+        assert!(state.registry.is_online(site.id()));
+        // The session's own cleanup still removes its entry.
+        state.registry.mark_disconnected(site.id(), generation);
+        assert!(!state.registry.is_online(site.id()));
+        Ok(())
+    }
+
+    /// The site keys currently in the per-site dispatch gate map.
+    fn gate_keys(state: &StandaloneState) -> Vec<InstanceId> {
+        state
+            .dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn revoke_and_dispatch_serialize_through_the_site_gate() -> Result<(), Box<dyn Error>> {
+        // W7-F-7a: the revocation and the dispatch of one site run through
+        // the same per-site gate, so a revocation can never commit between
+        // the dispatch's binding check and its operation/offer creation —
+        // the gate makes the two orders total: a revocation that wins the
+        // race leaves the dispatch to observe the revoked binding and
+        // produce nothing.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, _binding_id, actor, endpoint_id) = seed_dispatchable_site(&state, now).await?;
+        let target = ResourceODataId::parse("/redfish/v1/Systems/1")?;
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+
+        // The test holds the gate so both tasks queue behind it; tokio
+        // mutexes are FIFO, so the revoke — queued first — acquires it
+        // first, deterministically.
+        let held_gate = {
+            let mut gates = state
+                .dispatch_gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gates
+                .entry(site.id())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let site_id = site.id();
+        let gate_guard = held_gate.lock().await;
+        let revoke = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.revoke_center_binding(site_id, now).await }
+        });
+        tokio::task::yield_now().await;
+        let dispatch = tokio::spawn({
+            let state = Arc::clone(&state);
+            let target = target.clone();
+            let command = command.clone();
+            async move {
+                state
+                    .dispatch_center_operation(site_id, endpoint_id, &target, &command, actor, now)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(gate_guard);
+
+        revoke.await.map_err(io::Error::other)??;
+        let refused = dispatch.await.map_err(io::Error::other)?;
+        assert!(
+            matches!(refused, Err(CenterOperationRefusal::SiteBindingRevoked)),
+            "the dispatch queued behind the revocation must observe the revoked binding"
+        );
+        assert!(
+            rutilus_operation_engine::OperationStore::list_operations(&state.store, None)
+                .await?
+                .is_empty(),
+            "no operation row may be created after the revocation committed"
+        );
+        assert!(
+            state
+                .store
+                .list_outbox_entries_bounded(site.id(), 256)
+                .await?
+                .is_empty(),
+            "no offer row may be created after the revocation committed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoke_releases_the_sites_dispatch_gate_key() -> Result<(), Box<dyn Error>> {
+        // W7-P-7: the per-site dispatch gate key is reclaimed with the
+        // revocation — a revoke/re-enroll cycle mints a fresh instance id,
+        // and the revoked site's key would otherwise stay in the map
+        // forever.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let (site, _binding_id, actor, endpoint_id) = seed_dispatchable_site(&state, now).await?;
+        let target = ResourceODataId::parse("/redfish/v1/Systems/1")?;
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+
+        // A first dispatch creates the gate key.
+        let dispatched = state
+            .dispatch_center_operation(site.id(), endpoint_id, &target, &command, actor, now)
+            .await;
+        assert!(
+            dispatched.is_ok(),
+            "the first dispatch to the bound site must succeed"
+        );
+        assert!(gate_keys(&state).contains(&site.id()));
+
+        // The revocation removes it.
+        state.revoke_center_binding(site.id(), now).await?;
+        assert!(
+            !gate_keys(&state).contains(&site.id()),
+            "the revoked site's gate key is reclaimed"
+        );
+        Ok(())
+    }
+
+    /// One legal audit context for the center runtime test: a CSV import by
+    /// the local operator — the vocabulary shape every runtime audit helper
+    /// can append.
+    fn audit_context() -> Result<AuditOperationContext, Box<dyn Error>> {
+        Ok(AuditOperationContext::try_new(
+            AuditOperationId::generate(),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuditTarget::Product,
+            AuditParameterSummary::csv_endpoint_import(1)?,
+            ProductPermission::ManageEndpoints,
+            AuditAction::ImportEndpoints,
+            AuditRedfishOperation::None,
+        )?)
+    }
+
+    /// Binds the center console on a free loopback port (the plaintext
+    /// posture — a loopback listen without TLS material), retrying a raced
+    /// probe like the other bind helpers.
+    async fn bind_console(paths: &RuntimePaths) -> Result<SiteBinding, Box<dyn Error>> {
+        loop {
+            let port = free_port(Ipv4Addr::LOCALHOST).await?;
+            let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            let options = SiteRunOptions::new(listen, None, None)?;
+            match SiteBinding::bind(paths, &options).await {
+                Ok(binding) => return Ok(binding),
+                Err(SiteRunError::Bind(inner)) if inner.kind() == io::ErrorKind::AddrInUse => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_center_runtime_retries_queued_audit_appends() -> Result<(), Box<dyn Error>> {
+        let _audit_globals_guard = AUDIT_GLOBALS_TEST_LOCK.lock().await;
+        // W7-C-3: the center posture spawns the audit compensation drain
+        // like the Edge postures — a terminal audit fact whose durable
+        // append failed during the center run is retried by the drain
+        // instead of sitting in the queue until the shutdown discards it.
+        reset_audit_globals();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let binding = bind_console(&paths).await?;
+        let acceptor = bind_acceptor(&paths).await?;
+        let gateway = Arc::new(RedfishGateway::from_system_roots().await?);
+
+        // A terminal fact whose durable append fails transiently: a raw
+        // connection holds the database's write lock, so the store's append
+        // waits out its busy timeout and fails with a database condition —
+        // the transient class the compensation drain must keep retrying.
+        let raw_pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(paths.database_path())
+                .create_if_missing(false),
+        )
+        .await?;
+        let mut raw_connection = raw_pool.acquire().await?;
+        sea_orm::sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *raw_connection)
+            .await?;
+        let event = AuditEvent::started(audit_context()?, OffsetDateTime::now_utc());
+        let append = state.append_audit_event(&event).await;
+        assert!(
+            append.is_err(),
+            "the write lock must fail the append transiently"
+        );
+        // The lock is released: the queued event can now be retried.
+        sea_orm::sqlx::query("ROLLBACK")
+            .execute(&mut *raw_connection)
+            .await?;
+        drop(raw_connection);
+        raw_pool.close().await;
+
+        // The runtime runs with the compensation drain spawned — its first
+        // tick is immediate, so the queued event is retried during the run —
+        // and the stop then exercises the shutdown final drain.
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = stop_receiver.await;
+            Ok::<(), io::Error>(())
+        };
+        let runtime = tokio::spawn(run_center_services(
+            Arc::clone(&state),
+            binding,
+            acceptor,
+            gateway,
+            stop,
+        ));
+        // Wait for the drain's retry to land the event durably.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !state
+                    .store
+                    .find_audit_operation(event.context().operation_id())
+                    .await?
+                    .is_empty()
+                {
+                    return Ok::<(), Box<dyn Error>>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "the compensation drain never retried the queued event")??;
+        stop_sender
+            .send(())
+            .map_err(|()| io::Error::other("the center runtime already stopped"))?;
+        runtime.await.map_err(io::Error::other)??;
+
+        assert_eq!(
+            state
+                .store
+                .find_audit_operation(event.context().operation_id())
+                .await?,
+            [event],
+            "the queued terminal fact is durably persisted by the center drain"
         );
         Ok(())
     }

@@ -1085,7 +1085,12 @@ impl AuthState {
 /// [`BucketMap`] therefore sweeps the whole map once
 /// [`BUCKET_PRUNE_THRESHOLD`] new keys have been inserted since the last
 /// sweep, reclaiming every bucket whose entries have all expired — the
-/// dormant keys the per-access pruning never reaches.
+/// dormant keys the per-access pruning never reaches. [`Self::reserve`]
+/// sweeps both maps after the reservation settles, and the `me` limiter's
+/// address-only path sweeps its own map the same way (P6), so every map
+/// the limiter instances maintain is bounded — the instances the sign-in,
+/// password-change, and bootstrap paths share the sweep of [`Self::reserve`],
+/// while the dedicated `me_limiter` instance carries its own.
 #[derive(Clone, Debug)]
 struct LoginRateLimiter {
     by_username: Arc<Mutex<BucketMap>>,
@@ -1227,7 +1232,16 @@ impl LoginRateLimiter {
     /// minted by the same map, so their refund semantics — never used on
     /// this path — would be exact all the same.
     fn reserve_ip(&self, ip: &str, now: Instant, limit: usize) -> bool {
-        Self::reserve_ip_key(&self.by_ip, ip, now, limit).is_some()
+        let granted = Self::reserve_ip_key(&self.by_ip, ip, now, limit).is_some();
+        // P6: the full sweep runs on this path too. The `me` limiter's
+        // by_ip map is this method's only entry point, so without the
+        // sweep it would accumulate every distinct presenting address for
+        // the process lifetime — contradicting the N3 memory bound the
+        // reserve path enforces for both maps. The sweep only reclaims
+        // buckets whose entries all left the window, so it never changes a
+        // limit verdict here, exactly as on the sign-in path.
+        Self::sweep_if_due(&self.by_ip, now);
+        granted
     }
 
     /// Consumes one budget slot of the per-username key; `None` (and no
@@ -4715,6 +4729,59 @@ mod tests {
         assert_eq!(
             ip_buckets.buckets.get("192.0.2.10").map(VecDeque::len),
             Some(IP_FAILURE_LIMIT)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn me_limiter_reserve_ip_prunes_expired_ip_buckets_to_a_bounded_size()
+    -> Result<(), Box<dyn Error>> {
+        // P6: the `me` query throttle's address-only path must enforce the
+        // N3 memory bound on its own map — `reserve_ip` never went through
+        // the reserve path's sweep, so every distinct presenting address
+        // accumulated for the process lifetime. Fill the map with a full
+        // threshold of addresses, slide the window, then fill another
+        // threshold: the last insert trips the sweep, which must reclaim
+        // the expired fill and land the map back at exactly the fresh
+        // working set.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        for index in 0..BUCKET_PRUNE_THRESHOLD {
+            assert!(
+                limiter.reserve_ip(&format!("192.0.2.{index}"), now, ME_IP_QUERY_LIMIT),
+                "a fresh address must open a budget"
+            );
+        }
+        let after = now + RATE_WINDOW + StdDuration::from_secs(1);
+        for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
+            assert!(
+                limiter.reserve_ip(&format!("192.0.2.{index}"), after, ME_IP_QUERY_LIMIT),
+                "a fresh address must open a budget after the window"
+            );
+        }
+
+        let buckets = limiter
+            .by_ip
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert_eq!(
+            buckets.buckets.len(),
+            BUCKET_PRUNE_THRESHOLD,
+            "the sweep must reclaim the expired fill, leaving only the fresh working set"
+        );
+        assert!(
+            !buckets.buckets.contains_key("192.0.2.0"),
+            "an address bucket from the expired fill must be gone"
+        );
+        assert!(
+            buckets
+                .buckets
+                .contains_key(&format!("192.0.2.{BUCKET_PRUNE_THRESHOLD}")),
+            "an address bucket from the fresh fill must survive"
+        );
+        assert_eq!(
+            buckets.inserts_since_prune, 0,
+            "the sweep must reset the insert counter so the bound recurs"
         );
         Ok(())
     }
