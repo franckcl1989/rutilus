@@ -289,6 +289,20 @@ jobs:
         if: matrix.is_default
         run: cargo machete
 
+      # W11-T-1 (2026-08-14): cross-document anchor gate — the docs carry
+      # hundreds of `file:line` references into the code tree, and ten
+      # adversarial-audit rounds showed that manual re-anchor passes miss
+      # a class of references every time (the wave-six ci.yml shift drifted
+      # ~+98 anchors that went five rounds unnoticed). The gate fails when
+      # a referenced range falls outside its file (hard tier) and lists
+      # fingerprint misses for review; bare `:NNN` continuation refs
+      # inherit the nearest path mention on their line (W11-T-2). Blind
+      # spots (token-sharing drift, wrong-path inheritance) are registered
+      # in the script header.
+      - name: Doc anchor gate
+        if: matrix.is_default
+        run: bash scripts/check-doc-anchors.sh docs
+
       # §10 / §16.3 secret-leak gate — the repository-level half of the
       # security review's §4.3 follow-up (独立 Secret 泄漏扫描): a token-wise
       # scan of every workspace src/ and tests/ .rs file (crate directories
