@@ -203,6 +203,24 @@ rutilus backup restore [--portable] PATH
 
 恢复出的 Site 与 Center 重连时必须验证实例身份，避免同一实例的备份被同时启动两次（§20.2）。
 
+### 6.5 恢复中断（混合对）处置
+
+恢复流程先写数据库文件、再写 WAL 文件，两步之间崩溃（进程被杀、断电）会留下**混合对**：主库已是快照、WAL 仍是恢复前的那份（或反之）。恢复前写入的 `-restore-pending` 标记记录了快照对与恢复前对的指纹，下次打开（open）会校验现场对，拒绝混合对——SQLite 若打开混合对会**静默丢弃不匹配的 WAL**。
+
+**识别**（两种症状）：
+
+- `rutilus backup restore` 报 `RestoreInterrupted`：「an interrupted restore is pending at …」——标记尚在，重跑被拒；
+- `rutilus run` / 服务启动报 `RestoreInterrupted`：「the live database pair matches neither the recorded snapshot nor the recorded pre-restore state」——现场对既非完整快照对也非完整恢复前对，即混合对。
+
+**正确恢复步骤**：
+
+1. 找到恢复前副本：失败的恢复会把完整的数据目录副本保留在数据目录同级（`rutilus-restore-pre-*` 目录，错误信息会报告其位置；进程崩溃时它同样留在磁盘上）；
+2. 用副本把数据库与 WAL 拷回原位，形成**完整对**（恢复前对）；
+3. 启动实例一次：open 校验「untouched」（或「complete」）接受并清除标记；
+4. 停止实例，重新执行 `rutilus backup restore`。
+
+**删标记的后果（警告）**：绝不要在混合对状态下手工删除 `-restore-pending` 标记。重跑 restore 会把**混合对**记为新的恢复前状态，open 校验判定「untouched」接受——SQLite 静默丢弃不匹配的 WAL，混合对就此被洗白为合法状态，恢复前数据的最后一致性不再可证明。先构成完整对、再让 open 校验清除标记，是唯一正确路径。
+
 ## 七、产品升级
 
 升级流程（§20.3）：

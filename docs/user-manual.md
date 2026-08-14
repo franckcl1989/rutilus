@@ -419,6 +419,22 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 | 中心连接断开 | 站点本地继续完整运行；中心恢复后从最后确认序号继续同步（§15.4） |
 | 部分厂商 OEM 数据不可见 | 见支持矩阵与已知限制文档（`docs/support-matrix.md`、`docs/known-limitations.md`） |
 
+### 10.1 Unknown 终态与 409 unknown_outcome_pending 对账
+
+**触发场景**：在中心控制台向站点端点派发操作时，若该 (站点, 端点, 命令, 目标) 键上已存在**终态 Unknown** 操作（响应丢失、结果无法证明，§13.5），派发被拒绝：HTTP 409 Conflict、稳定码 `unknown_outcome_pending`，消息形如 `operation <id> is pending an unknown outcome; the retry is refused`。拒绝本身会写入审计（结局 Refused）。产品拒绝盲重试是**设计行为**——同一操作的重复执行可能造成双重效果。
+
+**operation_id 含义**：消息中的操作 id 是既有 Unknown 操作的操作 id，可在中心「Operations」视图查询其命令、目标、actor 与时间；它**可能是他站操作**——端点重新归属（re-home）后，确认读会跨实例核对，命中的 offer 可能来自原绑定站点实例的队列，被拒的不一定是当前站点的操作。
+
+**对账步骤**：
+
+1. 在中心操作视图按返回的 operation_id 定位该操作，确认命令与目标；
+2. 人工核验 BMC 实际状态（如更新是否已生效）：
+   - **效果已发生** → Unknown 是如实记录，无需重试；409 拒绝是正确行为；
+   - **效果未发生** → 见下方已知边界；
+3. 确认无安全风险后，按业务判断结束对账——Unknown 是终态，产品不自动重派发。
+
+**已知边界（需人工介入）**：终态 Unknown 没有解锁/清除 API——操作终态吸收后续回执、站点侧跳过终态事件、中心无 reaper 与清除路径，且 409 拒绝响应本身不携带结构化 operation_id（仅嵌在消息文本中）。效果未发生场景下，同键重新派发在控制台上不可行；该冻结与重派发限制已登记为已知限制（`docs/known-limitations.md` §九第七波块 W7-E-6「中心侧无 Running/WaitingRemote 超时与 reaper」、W7-E-7b「409 拒绝响应无结构化 operation_id」），未来引入操作超时/reaper 或解锁路径时处理。
+
 ## 附：CLI 命令一览
 
 | 命令 | 用途 |

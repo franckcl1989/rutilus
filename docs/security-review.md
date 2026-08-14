@@ -79,7 +79,8 @@
 > 发现（2026-08-13 对抗第一波）→ 全部修复（d3b966a，1787 测试绿）→ wave-three 1 HIGH 降级
 > （e768473）→ wave-four 1 HIGH 修复（3a23b9b）→ wave-five 5 HIGH 修复（e85560a，1913 测试绿）→
 > wave-six 2 HIGH 发现（2026-08-14）→ 全部修复（fcf7257，1963 测试绿）→ wave-seven 3 HIGH
-> 发现（2026-08-14）→ 全部修复（a0b2bc0，1997 测试绿）。
+> 发现（2026-08-14）→ 全部修复（a0b2bc0，1997 测试绿）→ wave-eight 1 HIGH 发现
+> （2026-08-14）→ 已修复（6d5e90e，2013 测试绿）。
 
 | 级别 | 编号 | 问题 | 推理链 / 复现路径 |
 |---|---|---|---|
@@ -130,6 +131,9 @@
 | HIGH | W7-S-1 | 中心侧制品流完全无 2 GiB 封顶——**已修复**（wave-seven，a0b2bc0） | 原状：R6-W-6 的 `ARTIFACT_MAX_SIZE_BYTES = 2 GiB` 只加在站点侧 Web 上传面，中心侧经 center-protocol 接收制品的整条链路（decode_manifest→declare_center_artifact→consume_artifact_chunk→write_chunk_at）无任何累计约束且 Uploading/Failed 文件永久留盘——任一已绑定站点（合法 mTLS 证书）可无限填满中心磁盘（中心 SQLite 与制品同盘时连带数据库写失败风险）。**修复（commit a0b2bc0）**：`decode_manifest` 对超 cap 声明拒绝，走既有 decode 失败吸收惯例（warn + 光标推进，行不创建、文件不落盘）；声明被 cap 界住后 chunk 累计由既有 `end <= size_bytes` 检查界住（与站点侧两层语义一致）。测试 `an_over_cap_manifest_is_absorbed_without_a_row`、`an_exactly_cap_manifest_is_accepted`。登记见 `known-limitations.md` §九（第七波块）；聚合配额/删除 API 见 W7-S-2 登记行。 |
 | MEDIUM | W7-P-6 | me_limiter 的 by_ip 桶永不剪枝——**已修复**（wave-seven，a0b2bc0） | 原状：`/api/v1/auth/me` 是 Public 端点（无会话），其 per-IP 限速只走 `reserve_ip` 路径，该路径从不触发全表剪枝（剪枝只挂在登录双桶路径上）——by_ip 键进程生命周期只增不减，与 N3「内存有界」登记直接矛盾（公网 botnet 多源可达百 MB 级常驻）。**修复（commit a0b2bc0）**：`reserve_ip` 在 IP 桶 inserts 达 `BUCKET_PRUNE_THRESHOLD` 时触发全表清扫（与 reserve 双桶路径同机制），判定语义不变；N3 注释补 me_limiter 说明。测试 `me_limiter_reserve_ip_prunes_expired_ip_buckets_to_a_bounded_size`（`web/src/auth.rs:4737`）。登记见 `known-limitations.md` §九（第七波块）。 |
 | NOTE | W7-S-4 | secret-gate [R3] 宏集外输出面（Term::stderr / io::Write） | `console::Term::stderr()`（`app/src/main.rs:338, 359, 423, 440, 541, 709`）与 `std::io::Write` 直写不在 [R3] 宏集内——当前全部调用点为 prompt_secret（口令输入不回显）与非机密文案，无实弹；未来经 Term/io::Write 输出机密名变量时门禁不拦截。盲区如实登记于 `known-limitations.md` §九（第七波块），与既有 const/static 链盲区（S-6）同款登记纪律。 |
+| HIGH | W8-E-2 | 未决路径 re-home 双执行（W7-E-3 的孪生漏洞）——**已修复**（wave-eight，6d5e90e） | 原状：W7-E-3 只把 R6-E-01 的 Unknown 确认读换成跨实例查询，未决路径（单候选修复读与 resolve_candidate 定向读）仍 per-site——endpoint re-home 后非终态操作被判「从未入队」，同 id 重投（多候选铸新 id），同一物理 BMC 写被执行两次且全程 200 无 409。**修复（commit 6d5e90e）**：两处定向读全部换用跨实例读——命中他站 offer = 已在飞 → 返回既有 operation id 不重投不铸新 id；顺带修复跨站异目标复用旧 id 的潜伏怪癖。测试 4 个（dispatch.rs:4576/4636/4699/4754）。登记见 `known-limitations.md` §九（第八波块）。 |
+| MEDIUM | W8-F-2 | target 裸字符串比对可被拼写变体绕过双执行闸门——**已修复**（wave-eight，6d5e90e） | 原状：未决/Unknown 两闸门的 target 比对无规范化——同站对仍 Queued 的操作用大小写/尾斜杠/%xx 变体重试即双执行（Redfish URI 大小写不敏感，DSP0266）。**修复（commit 6d5e90e）**：共享 `canonical_target_key`（百分号解码→ASCII 小写→去尾斜杠），两处比对双方同函数；offer 写入侧保持原样字符串（向后兼容论证：写入侧归一化会使修复前遗留行漏闸）。测试 2 个（dispatch.rs:4894/4977）。登记见 `known-limitations.md` §九（第八波块）。 |
+| LOW | W8-S-2 | bare_sql 门禁注释剥离器引号标识符漏报——**已修复**（wave-eight，6d5e90e） | 原状：`strip_sql_comments` 只保护单引号——`CREATE TABLE "a--b" AS SELECT * FROM src`（合法标识符 + 真实执行的 CTAS）与 `DROP TABLE "a--b"; DELETE FROM operations`（DML 尾段被行注释吞掉）均零违规，门禁对「raw-SQL 数据拷贝」纪律的漏报方向。**修复（commit 6d5e90e）**：两门禁 strip 补四引号态（单/双/反引号/方括号），与 split 侧对齐；自检 bare_sql 6→7、down_order 16→17。登记见 `known-limitations.md` §九（第八波块）。 |
 
 ## 四、审查结论（0.9.0 启动项达成情况）
 
@@ -192,7 +196,7 @@ V5E-1/2，审计可问责/中心协议面）已修复（见第三节头部时间
 
 | 项 | 说明 | 依据 |
 |---|---|---|
-| 独立 Secret 泄漏扫描 | ✅ 仓库级已落地（迭代三，E3b）：`security/tests/secret_leak_gate.rs`（3 规则 R1/R2/R3、**10 测试（V4I-3 重测）**、`ALLOWED_CONSTANT_HITS` 白名单 2 处、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体豁免 `:575, 1038-1043, 1521`、wave-one（73d480d）补间接赋值盲区 `:836`、wave-two（e59b14a）补跨字面量 PEM 片段盲区 `:886`、全 workspace 扫描全绿），**CI 独立步骤**（`ci.yml:285` Secret leak gate：`bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前，W6-1 ran-断言 floor 10）；**运行时复核未做**：内存转储检查、API 响应抓包/日志复核仍为 1.0.0 发布评审建议项。milestone-status §7.1「Secret 泄漏检查」已转 ✅ 结构性 | `docs/milestone-status.md:459` |
+| 独立 Secret 泄漏扫描 | ✅ 仓库级已落地（迭代三，E3b）：`security/tests/secret_leak_gate.rs`（3 规则 R1/R2/R3、**10 测试（V4I-3 重测）**、`ALLOWED_CONSTANT_HITS` 白名单 2 处、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体豁免 `:575, 1038-1043, 1521`、wave-one（73d480d）补间接赋值盲区 `:836`、wave-two（e59b14a）补跨字面量 PEM 片段盲区 `:886`、全 workspace 扫描全绿），**CI 独立步骤**（`ci.yml:307-309` Secret leak gate：`bash scripts/assert-tests-ran.sh 10 --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前，W6-1 ran-断言 floor 10）；**运行时复核未做**：内存转储检查、API 响应抓包/日志复核仍为 1.0.0 发布评审建议项。milestone-status §7.1「Secret 泄漏检查」已转 ✅ 结构性 | `docs/milestone-status.md:533` |
 | M1 时间侧信道处置 | ✅ 已处置：未知用户名路径已补哑 Argon2id 验证（commit 72eccb5，`web/src/auth.rs:1626, 1766`），验证方式 = 调用计数对称断言（`web/src/lib.rs:11292, 11356`）；残留面（disabled / credential-missing 分支）已于深度审查批次**证反并关闭**（B4，commit 8147bc9：`web/src/auth.rs:1771-1794` 补同款哑验证），见 §三 M1 行 | 本文档 M1 |
 | 深度审查遗留项（LOW/NOTE） | ✅ 8 项已全部落地/处置（迭代七，2026-08-12，master 61b9cc5）：限流器桶键淘汰（T-D e7aef53，N3 关闭）/ i18n fragment 纯函数测试（T-H c4dd335）/ decode_failures 贯通测试（T-G 8482d85）/ AMI/HPE 真网关 E2E（T-I 044bae2）/ restore 预恢复副本（T-E 02459dc）/ free_port TOCTOU（T-F 83ff07f）/ 入网首刷绕端点门（T-B 4897b22）/ 快照 ETag 接线（决策 c，不实施）；另第 9 个提交 61b9cc5（secret-gate 白名单行号对齐 backup.rs 88/89，门禁漂移检测触发-修复闭环）；三批五维审计 APPROVE 记录见 `milestone-status.md` §7.5 | `docs/known-limitations.md` §九 |
 | Pin 模式验证器外部评估（N6） | 设计内行为，但「跳过链验证」属于需要安全专家确认的权衡面 | 本文档 N6 |
