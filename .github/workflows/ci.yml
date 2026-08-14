@@ -152,9 +152,9 @@ jobs:
       # count at HEAD e85560a (`cargo test --locked --workspace -- --list`:
       # lib/integration 1912 + doc 1 = 1913, matching the 2026-08-14 门禁复跑
       # in release-readiness.md §五; re-measured locally on the same commit).
-      # W9-CI-2 re-sync (2026-08-14): the master-measured count is now 2029
+      # W9-CI-2 re-sync (2026-08-14): the master-measured count is now 2036
       # (`cargo test --locked --workspace -- --list`, measured after the
-      # wave-nine test additions; wave-seven/eight had pushed it to 2013;
+      # wave-ten test additions; wave-nine had pushed it to 2029;
       # 2016 was a mid-landing intermediate, superseded at integration).
       # The pin stays at 1913 on purpose: floor semantics, not an exact
       # count — the step fails only when the total dips below the pin, and
@@ -304,9 +304,10 @@ jobs:
       # the step unless the number of tests that actually ran and passed
       # is >= 10. The pin is the master-measured count (2026-08-13 gate
       # re-run: `cargo test --locked -p rutilus-security --test
-      # secret_leak_gate` reports 10 passed — the 4 workspace-scan tests
-      # plus the 6 rule-matrix tests of
-      # security/tests/secret_leak_gate.rs). Floor semantics, not exact
+      # secret_leak_gate` reports 15 passed — the 4 workspace-scan tests
+      # plus the 11 rule-matrix/hardening tests of
+      # security/tests/secret_leak_gate.rs; wave-six added the five
+      # tokenizer/PEM hardening tests). Floor semantics, not exact
       # count: the step fails only when the count dips below the pin —
       # deleting the file, #[ignore]-ing its tests, or cfg-emptying them
       # drops it to 0 and fails, while a partial reduction that still

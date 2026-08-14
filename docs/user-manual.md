@@ -86,7 +86,7 @@ rutilus run [--portable] [--no-open]
 ```
 
 - Standalone 前台运行：绑定 IPv4 回环地址的随机端口，默认自动打开系统浏览器（`app/src/standalone_runtime.rs`）；
-- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs:9911` `BootstrapView` 组件，渲染于 `:11964`；`web/src/auth.rs`）；
+- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs:10022` `BootstrapView` 组件，渲染于 `:12075`；`web/src/auth.rs`）；
 - 认领完成后进入登录页，用管理员账户登录。
 
 ### 2.3 登录与安全基线
@@ -189,24 +189,24 @@ Edge 控制台视图（`ui/src/lib.rs` 的 `ConsoleView`，共 17 个视图，�
 | Users / Sessions | 用户与会话管理（仅 Administrator） |
 | Center sites / Center operations / Center bindings | 中心姿态视图（仅 Center 控制台显示） |
 
-中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs:10335` `CenterSitesView`、
-`:10526` `CenterOperationsView`、`:11338` `CenterBindingsView`，渲染于 `:12581-12583`）。
+中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs:10446` `CenterSitesView`、
+`ui/src/lib.rs:10637` `CenterOperationsView`、`:11449` `CenterBindingsView`，渲染于 `:12692-12694`）。
 界面文案经 i18n 目录解析（`ui/src/lib.rs` 的 `ConsoleView::label()` 返回 `L().nav_*` 目录键，
 `lib.rs:2922-2940`；运行时语言选择 En/Zh，`ui/src/i18n.rs`），与设计文档 §12.1 的一级导航对应关系为：
 总览 = Overview（多服务器清单视图，见 §4.2）；分组 = Groups；操作任务 = Operations；事件 = Events；
 更新制品 = Artifacts；凭据 = Credentials；用户与权限 = Users/Sessions；中心连接 = Center bindings；
 审计 = Audit。设计文档中的"服务器/管理端点/设置"在实现中不以独立导航视图存在——
 服务器与管理端点统一由 Overview 清单呈现（每张端点卡片显示 Systems/Chassis/Managers 资源计数与核心资源列表，
-`ui/src/lib.rs:12589` `EndpointCard`，"No resource counts are published until a complete refresh succeeds."
-提示 `:12666`），"设置"尚无对应视图（如实标注）。
+`ui/src/lib.rs:12700` `EndpointCard`，"No resource counts are published until a complete refresh succeeds."
+提示 `:12777`），"设置"尚无对应视图（如实标注）。
 
 ### 4.2 多服务器首页（Overview）
 
 Overview 视图即多服务器首页（"Inventory"）：上方为 §14.2 聚合仪表盘（一次 `GET /api/v1/overview`
 服务端聚合，`web/src/lib.rs` 的 overview 路由），下方为端点清单——每张端点卡片显示统一健康徽标
 （Unified endpoint health）、信任徽标、快照状态标签
-（"No resource counts are published until a complete refresh succeeds."，`ui/src/lib.rs:12666`）、
-Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs:12589` `EndpointCard` 起，资源计数 `:12597-12599`）。
+（"No resource counts are published until a complete refresh succeeds."，`ui/src/lib.rs:12777`）、
+Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs:12700` `EndpointCard` 起，资源计数 `:12708-12710`）。
 
 聚合仪表盘（§14.2"首页显示"列表）展示：
 
@@ -308,7 +308,7 @@ HTTP 返回 200/201/202/204 都不直接等于业务成功——写操作后必�
 
 Telemetry 家族的专用表单**尚未实现**（"The telemetry write form is a later milestone"），
 Log（清空日志）与 Control（控制更新）家族同样没有专用表单——表单选择器会明确拒绝而不是伪造
-（`ui/src/lib.rs:6290, 6362, 6438` 返回 `OperationFormError::FamilyRequired`，变体定义 `:6530`，wave-two 后重核）。
+（`ui/src/lib.rs:6394, 6466, 6542` 返回 `OperationFormError::FamilyRequired`，变体定义 `:6634`，wave-two 后重核）。
 已持久化的这些家族命令仍会在操作卡片中正确渲染摘要（`wire_command_summary`）。
 
 ### 5.3 批量操作
