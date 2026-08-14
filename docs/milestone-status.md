@@ -225,6 +225,32 @@
 > 其余不变）；迁移文件 25→27（新增 m20260813_000003_audit_failure_vocabulary /
 > m20260813_000004_audit_operation_vocabulary）、迁移测试文件 23→25；逐项登记见
 > `docs/known-limitations.md` §九（第五波块）与 §7.6。
+> **迭代二十已落地（2026-08-14，HEAD = 7c6ac9d，2 个提交）——wave-six 对抗修复批次**：
+> 第六波对抗审查（6 透镜：并发 / 安全 / 数据迁移 / 中心协议 / web+UI+CI / 测试质量与文档）
+> 并行攻击 wave-five 状态，58 条发现 → 跨透镜去重 54 条交独立怀疑者核验 → **48 confirmed +
+> 3 partial + 3 refuted**；48 项确认发现全部修复（`fcf7257`，52 文件 +5659/-830）+ 3 项链式
+> 发现与 A1 新拒绝码接线（`7c6ac9d`，11 文件 +841/-101）：**2 HIGH（R6-C-1 并发双派发铸双
+> id 双执行——per-site dispatch 闸门临界区、R6-E-01 Unknown 后重派发逃过 inbox 去重——
+> `UnknownOutcomePending` 类型化拒绝）+ 1 MEDIUM 组（R6-C-2 rebind TOCTOU、R6-C-3 停机排空
+> 补偿队列、R6-E-02 吊销站可派发、R6-E-03 re-home 回执仲裁、R6-E-04 outbox 剪枝 + 定向查询
+> （`m20260814_000001`）、R6-S-1 会话撤销 fail-open、R6-S-3 secret-gate 标识符集、R6-D-1
+> down_order_gate 分号、R6-W-1/2 wasm 门禁 known-red 真修复、R6-W-3 伪造 center 归因 400、
+> R6-W-6 制品 2 GiB 封顶、R6-E-11 审计偏移分页、R6-A1 拒绝码 409 接线）** + LOW/NOTE 组
+> （补偿队列批次、认证/限速面 8 项、secret-gate 5 项含 RUTMK002 master-key rewrap、CI 三步
+> ran-断言 + `--expect-tests` 名字断言、数据面 6 项、协议面 3 项、run_standalone 死代码）；
+> **1963 测试 0 失败**（2026-08-14 实测，`cargo test --workspace -- --list` 口径：lib/集成
+> 1962 + doc 1 = 1963；增量 1913→1963（+50）——提交消息声称的 1958/45 为 fcf7257 时的中间
+> 计数，链式提交 7c6ac9d 另 +5；per-crate 实测：rutilus 167→175 / api 85 / application
+> 361→371 / center-protocol 30 / domain 212 / infra-redfish 295 / migration 57→59 /
+> operation-engine 34 / persistence 219→228 / platform 32→33 / security 53→59（含
+> secret_leak_gate 15） / test-support 54+1 / ui 141→142 / web 172→185），fmt / clippy
+> `-D warnings` 干净；wasm 产物再生成（A6，
+> 1.97.1 工具链 + 已登记 remaps）；新迁移 `m20260814_000001_center_outbox_operation_ids`
+> （迁移文件 27→28、迁移测试文件 25→26；旧静态备份 pin——backup_applied 28 / supported 27，
+> 原 `backup_snapshot.rs:646-647`——由 R6-D-2 改为动态派生 `Migrator::migrations().len()`，
+> 现 `:943-944, 983-985`，各文档对该 pin 的引用按新事实同步）；逐项登记见
+> `known-limitations.md` §九（第六波块）与 `docs/r6-findings/`（A1-A6 + A8 区域登记）；
+> refuted 3 条含 R6-W-3 inbox 污染半边（验证：回执走 offer 定向查询与既有查重）。
 > 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-13 复核，wave-one
@@ -460,7 +486,7 @@
 | 权限测试 | ✅ 已完成 | `role_masks_are_enforced_on_guarded_routes`（`web/src/lib.rs:12284`）、中心角色站点作用域（`web/src/lib.rs:13754` `the_center_views_apply_the_d3_site_scope_of_the_role_assignment`、`:13857` `the_center_mutation_routes_enforce_the_role_and_the_site_scope`）、登录限速预算（`web/src/auth.rs:3877` rate_limiter_enforces_per_username_and_per_ip_budgets，wave-one 后重核）、BMC 写权限拒绝（`redfish_gateway.rs:29142` `rejects_the_write_when_permission_is_denied`） |
 | 安全审查 | 🟡 已启动 | 启动交付物 `docs/security-review.md`（8 个审查范围 + §7.7 扫描全完成，无 BLOCKER）；MINOR-1（登录时间侧信道）已于迭代二修复（commit 72eccb5：未知用户名路径哑 Argon2id 验证，`web/src/auth.rs:1626`，未知用户名分支调用 `:1766`）；N5 已于迭代三关闭（E3c 编译期 const assert，`web/src/lib.rs:1511`）；独立泄漏扫描门禁已落地（E3b）；**深度审查批次（2026-08-12）**：认证边界硬化（commit 8147bc9）——B1 密码策略 12 字符以 API 为执行边界（`web/src/auth.rs:113, 1680`，登录入口 enforce `:1711`）、B2 429 限速拒绝不写审计（`:1733-1740`）、B3 改密后撤销失败不再静默——显式 500 + 审计失败记录（`:2297-2310`）、B4 disabled/credential-missing 分支补哑 Argon2id 验证（`:1771-1794`，M1 残留面「需先已知用户名」理由已证反并关闭）；**迭代七**：N3 限速器桶键淘汰已实现（T-D e7aef53，见 §7.5），§九 其余 7 项已全部落地（见 §7.5），行号按当前 master 重核；**迭代十五（wave-one，2026-08-13）**：对抗审查发现 **2 HIGH（S3-1 操作历史 API 回声明文 BMC 口令、S3-2 首启未认领窗口 GuardedOnly 整面开放）均已修复**（d3b966a，见 §7.6），S3-3 限速原子化、S3-4 管理员设口令端点（5cd75ae）、S3-5 cookie 前缀早退均已处置；**迭代十七~十九（wave-three/four/five）**：W3S-1..4 / V4R-2/3/5/7 / V4S-2/3/5 / V5C-1/2/4/5/6 等安全面发现全部修复（见 `security-review.md` §三新增行）；外部评估仍待做（见 7.2-A「安全审查（启动）」行与 §7.4） |
 | Migration 回归 | ✅ 已完成 | `migration/tests/` 25 个测试文件（initial_storage/operations/batch_operations/telemetry/events/groups_tags/center_tables/center_data_sites/center_role_sites/product_users/remote_tasks/artifacts/operation_failure_kinds/nvidia_families/nvidia_power_families/lenovo_families/bare_sql_gate/audit_action_shapes/audit_execute_operation/resource_feature_lists/audit_center_actions/down_order_gate/endpoint_health_checks/audit_failure_vocabulary/audit_operation_vocabulary）；迁移总数 27（21 基线 + `m20260812_000001` + `m20260812_000002` + `m20260813_000001` + `m20260813_000002` + `m20260813_000003` + `m20260813_000004`）；迁移前自动备份（`persistence/src/lib.rs:510` backs_up_a_closed_database_before_applying_pending_migrations）；CI 独立 Migration Test 门禁（`ci.yml:547`，W6-1 ran-断言 floor 50，V4I-4 重测后同步）；**down 先子后父纪律**（深度审查批次，commit 1711329：先删引用子表再删父表，如 `m20260805_000005_operations.rs:131-138` 先 `OperationTarget` 后 `Operation`；机械门禁 `down_order_gate.rs` 迭代十落地后 wave-one 再补 raw `CREATE TABLE REFERENCES` 与递归扫描盲区，现 12 测试） |
-| 备份恢复演练 | 🟡 部分 | 自动化往返覆盖完整（`app/src/backup.rs` 测试区 10 个）：`:1068`（往返保数据）、`:1112`（拒绝他实例包）、`:1138`（跨机恢复需源信封）、`:1225`（源口令对全新信封）、`:1257`（需停止实例）、`:1283`（拒绝未初始化目录）、`:1294`（拒绝不同产品版本）；**迭代七 T-E（commit 02459dc）补恢复前预快照三态**：`:1324`（失败恢复保留预恢复数据供回滚）、`:1401`（成功恢复清除预快照）、`:1421`（预快照拷贝失败不动源目录）——恢复流程见 `app/src/backup.rs:246-341`；CLI `rutilus backup`/`restore`（`app/src/main.rs:97, 144`）；备份快照计数钉死（`persistence/src/backup_snapshot.rs:646-647`：backup_applied 28 / supported 27，wave-four/five 新增两个迁移后重测）；**schema 版本断言已改为派生**（深度审查批次，commit 0984fd4：`app/src/backup.rs:1068-1072` 从 `rutilus_persistence::migration_counts` 读取 applied+pending 派生，加迁移不会再留陈旧断言）；0.9.0 验收「三平台安装、升级、备份、恢复通过」的演练未执行；Windows 侧进程级演练套件已落地（scripts/drills，2026-08-12，drill-backup-restore-cycle 覆盖 §20.1/§20.2 备份恢复进程级形态，见 7.2-B） |
+| 备份恢复演练 | 🟡 部分 | 自动化往返覆盖完整（`app/src/backup.rs` 测试区 10 个）：`:1068`（往返保数据）、`:1112`（拒绝他实例包）、`:1138`（跨机恢复需源信封）、`:1225`（源口令对全新信封）、`:1257`（需停止实例）、`:1283`（拒绝未初始化目录）、`:1294`（拒绝不同产品版本）；**迭代七 T-E（commit 02459dc）补恢复前预快照三态**：`:1324`（失败恢复保留预恢复数据供回滚）、`:1401`（成功恢复清除预快照）、`:1421`（预快照拷贝失败不动源目录）——恢复流程见 `app/src/backup.rs:246-341`；CLI `rutilus backup`/`restore`（`app/src/main.rs:97, 144`）；备份快照 NewerSchema 计数断言已改动态派生（R6-D-2，wave-six：`Migrator::migrations().len() + 1` / `.len()`，`persistence/src/backup_snapshot.rs:943-944, 983-985`，取代旧静态 pin backup_applied 28 / supported 27，加迁移不会再留陈旧断言）；**schema 版本断言已改为派生**（深度审查批次，commit 0984fd4：`app/src/backup.rs:1068-1072` 从 `rutilus_persistence::migration_counts` 读取 applied+pending 派生，加迁移不会再留陈旧断言）；0.9.0 验收「三平台安装、升级、备份、恢复通过」的演练未执行；Windows 侧进程级演练套件已落地（scripts/drills，2026-08-12，drill-backup-restore-cycle 覆盖 §20.1/§20.2 备份恢复进程级形态，见 7.2-B） |
 | 签名构建 | 🟡 代码侧完成（证书未到位） | `scripts/` 签名脚本 3 份（sign-windows.ps1 / sign-macos.sh / sign-linux.sh）+ ci.yml `release-artifacts` job 的签名步骤已合入（commit 34503ea + d77d54e；步骤仅在对应 secret 配置时执行，未配置则 "signing skipped: certificate not configured"（`ci.yml:748, 773, 805` 守卫、`:837` 单行标记））；Windows Authenticode、macOS 签名与公证、Linux minisign 独立签名在证书到位前保持跳过；首次实跑未做（6 项首跑确认点见 `release-readiness.md` 条件 17） | §5.4 发布配置；`release-readiness.md` 条件 17 |
 | SBOM | 🟡 代码侧完成（首跑未做） | cargo-cyclonedx@0.5.9 钉版 + 每 crate BOM 收集步骤已入 `release-artifacts` job（`ci.yml:867-882`，commit d77d54e；wave-two e59b14a 补 `cargo metadata --locked` 锁定图断言）；首次实跑生成并随包发布未做（证书到位后随发布演练） | §5.4 发布配置；`release-readiness.md` 条件 17 |
 | 用户手册 | ✅ 已完成 | `docs/user-manual.md`（436 行，条目后标注来源文件；`rutilus version` 输出已更新为三行，含 Git Commit） |
@@ -504,7 +530,7 @@ T-H c4dd335 / T-G 8482d85 / T-B 4897b22 / T-D e7aef53 / T-E 02459dc / T-F 83ff07
 | UI 本地化 | ✅ 已完整落地（H5，commit d3f7769 + 0f91c17 + c4dd335）：`strings_catalog!` 目录扩至 **827 键 En/Zh 双语**（宏 `i18n.rs:43-160`，目录体 `i18n.rs:163-1858`；单一来源：字段声明 + En/Zh 构造器 + 完整性测试表）；`Lang::{En, Zh}` 与 `Lang::strings`（`i18n.rs:1860-1881`）、`thread_local!` 运行时语言选择（`i18n.rs:1938-1942`，测试线程各持己态）、`L()` 按当前语言解析 `'static` 目录（`i18n.rs:1968-1973`）、`format_catalog` 运行时槽位填充（`i18n.rs:1984-2006`）；lib.rs `LanguageSelector` 组件（`lib.rs:11647`）+ **URL fragment 持久化**（fragment 是当前 web-sys feature 面唯一可用的浏览器存储，切换经 reload 全量重挂载；**迭代七 T-H c4dd335 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`（host 可测）+ `stored_lang_code`/`persist_language`/`apply_language` `lib.rs:11614-11636`（wasm `browser` 模块薄封装，运行时行为不变）；启动恢复 `start()` `lib.rs:11668`）；深度翻译完成（facts/健康词汇/`OEM_UNSUPPORTED_NOTICE` 等均入目录，`i18n.rs:825-829, 867`）；i18n 15 个测试（既有 11 个：完整性/占位符/双语同键/切换/格式化，`i18n.rs:2009-2185`；T-H 新增 fragment 纯函数 4 个：`i18n.rs:2192-2259`），ui **141 测试全过**、clippy/fmt 干净；J2 审计 3 处 zh 译法微修已合入（`type_nvidia_profile_file`/`fact_power_load_percent`/`fact_metric_values`，`i18n.rs:444, 597, 733`）。**后续触点**：localStorage 持久化（需扩展 web-sys feature）与更多语言 | `ui/src/i18n.rs`；`ui/src/lib.rs:11614-11668`；`web/assets/`；`known-limitations.md` §七 |
 | 发布管道（签名 + SBOM + 校验清单，代码侧） | ✅ 代码侧完成（H4，commit 34503ea + d77d54e，证书到位即启用）：`scripts/` 5 脚本（sign-windows.ps1 / sign-macos.sh / sign-linux.sh / checksums.sh / checksums.ps1）；ci.yml `release-artifacts` job（`ci.yml:609-911`）——`v*` tag push 与 `workflow_dispatch` 触发（`ci.yml:48-60`）、`needs: ci` 门禁先行（`ci.yml:613`）、签名步骤仅在 secret 配置时执行（`ci.yml:748, 773, 805`，未配置走 "signing skipped" 单行标记 `:837`）、base64 物化（`ci.yml:748-757, 773-781, 805-808`）、Windows thumbprint-only 模式（`ci.yml:759-765`）、cargo-cyclonedx@0.5.9 钉版 SBOM（`ci.yml:867-882`）、SHA-256 清单（`ci.yml:898`）、artifact 上传（`ci.yml:901-911`）；H4 审计处置已内嵌（musl-tools 补齐 `ci.yml:692`、单行 if 判定 `ci.yml:837` 等）；**首跑确认点 6 项**（证书到位后核验：musl-tools 安装 / cargo-cyclonedx@0.5.9 钉版 / base64 物化 / env `&&`·`||` 表达式 / thumbprint-only 模式 / 上传权限，详见 `release-readiness.md` 条件 17） | `scripts/`；`.github/workflows/ci.yml`；`release-readiness.md` 条件 17 |
 | 安全审查（启动） | ✅ 已交付：`docs/security-review.md`（8 个审查范围 + §7.7 扫描全完成，无 BLOCKER）；**M1 已修复**（MINOR-1 登录时间侧信道，commit 72eccb5：`web/src/auth.rs:1626` 哑 Argon2id 验证 + `:1766` 未知用户名分支调用），验证方式 = 调用计数对称断言而非墙钟计时（`web/src/lib.rs:9798` 计数、`:11292` 与 `:11356` 两分支各 1 次/失败、限速拒绝 0 次）；**N5 已关闭**（E3c：`web/src/lib.rs:1511` 编译期 const assert 钉死常量正性）；**独立 Secret 泄漏扫描门禁已落地**（E3b：`security/tests/secret_leak_gate.rs` 3 规则、10 测试；CI 独立步骤 `ci.yml:285` Secret leak gate）；**深度审查批次**：认证边界硬化（commit 8147bc9，B1-B4，详见 §7.1「安全审查」行与 §7.4）；**迭代七**：§九 8 项遗留全部落地/处置（N3 即 T-D e7aef53，详见 §7.5）；**迭代十五（wave-one）**：S3-1/S3-2 两 HIGH 已修复（d3b966a，见 §7.6）；**迭代十七~十九（wave-three/four/five）**：安全面发现（W3S-1..4、V4R-2/3/5/7、V4S-2/3/5、V5C-1/2/4/5/6 等）全部修复（见 `security-review.md` §三新增行）；剩余：运行时抓包/日志复核与外部评估（1.0.0 发布评审建议项） | `docs/security-review.md`；设计文档 §0.9.0 |
-| 约束修复（E4） | ✅ 已落地（commit 76af80f + bfb001e）：`migration/src/m20260812_000002_resource_feature_lists.rs` 重建 `resources`/`resource_decode_failures` 两表，`ck_resources_feature`/`ck_resource_decode_failures_feature` 允许域 = 领域枚举全部 47 码（此前 resources 37 / resource_decode_failures 36 且互相不一致）；`down` 对称恢复 37/36；防回归机械测试 `migration/tests/resource_feature_lists.rs`（`:248` 单测试，域码与约束逐字符双向钉死，不触库）；备份快照计数钉死 `persistence/src/backup_snapshot.rs:646-647`（backup_applied 28 / supported 27，wave-four/five 新增两个迁移后重测） | `migration/src/m20260812_000002`；`migration/tests/resource_feature_lists.rs` |
+| 约束修复（E4） | ✅ 已落地（commit 76af80f + bfb001e）：`migration/src/m20260812_000002_resource_feature_lists.rs` 重建 `resources`/`resource_decode_failures` 两表，`ck_resources_feature`/`ck_resource_decode_failures_feature` 允许域 = 领域枚举全部 47 码（此前 resources 37 / resource_decode_failures 36 且互相不一致）；`down` 对称恢复 37/36；防回归机械测试 `migration/tests/resource_feature_lists.rs`（`:248` 单测试，域码与约束逐字符双向钉死，不触库）；备份快照 NewerSchema 计数断言已改动态派生（R6-D-2，wave-six：`Migrator::migrations().len()`，`persistence/src/backup_snapshot.rs:943-944, 983-985`，取代旧静态 pin） | `migration/src/m20260812_000002`；`migration/tests/resource_feature_lists.rs` |
 | 发布构建矩阵补齐（剩余部分） | aarch64 musl（cargo-zigbuild）与 macOS Universal 2（lipo）已入 CI（`ci.yml:328-332, 351-376`）；Windows ARM64 明确不入 CI——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库（`ci.yml:334-341` 注释），需原生 ARM64 Windows runner 或本地验证后另行处理 | `ci.yml` |
 | 认证边界硬化（B1-B4） | ✅ 已落地（commit 8147bc9，深度审查批次）：**B1 密码策略 12 字符**——`password_satisfies_policy`（Unicode 标量计数 ≥ `MIN_PASSWORD_CHARS`，`web/src/auth.rs:113, 1680`），登录入口在限速/查找/验证之前执行（`:1711`：不占限速预算、不写审计——策略违规不是登录尝试）；**B2 429 拒绝不写审计**——限速拒绝无审计事件，429 本身即记录（`:1733-1740`：防审计表无界增长 + 写门饥饿）；**B3 撤销信号非可选**——改密后 `revoke_sessions_for_principal` 失败不再静默：显式 500 + 审计失败 outcome（`:2297-2310`）；**B4 disabled/credential-missing 分支哑验证**——两分支补同款哑 Argon2id（`:1771-1794`），M1「需先已知用户名」残留面已证反并关闭（security-review §三 M1 行更新）；行号在迭代十五（wave-one，auth.rs 重写 +1119 行）与迭代十七~十九（wave-three/four/five，auth.rs 再扩展）后按当前 master 重核 | `web/src/auth.rs`；`docs/security-review.md` §三 |
 | ETag 携带 + 412 专用路径 | ✅ 已落地（commit 6128a17，深度审查批次）：每个类型化 `update` 写携带**本次执行读取时**的目标文档 ETag——文档带 `@odata.etag` 时发送 `If-Match: <etag>`，BMC 以 `412 Precondition Failed` 拒绝即证明写未执行，gateway 报告 `CommandExecutionError::PreconditionFailed`（先重读目标，并发变更不被覆盖）；无 ETag 的文档保持传输层存在性 `If-Match: *`（§13.4 第二段）；action/create/delete 家族在类型化 API 中无 If-Match 通道，从不发送（`redfish_gateway.rs:598-611` 模块文档、`:12653-12690` 错误变体、`:14002-14062` 412 分类器、测试 `:25432, 27314-27420`）；**快照 ETag 接线已处置（决策 c，2026-08-12，T-C，见 §7.5 与 known-limitations §九该行）**——快照已持久化 ETag（`domain/src/resource_snapshot.rs:606-655, 790`、`persistence/src/resource_snapshot_repository.rs:402, 553-554, 605-608`），operation-executor 无消费方是登记过的决策而非遗留（执行时读取恒为分派时刻最新 ETag，快照 ETag 恒更旧、无独立写路径价值，接线不实施） | `infra-redfish/src/redfish_gateway.rs`；`known-limitations.md` §九 |
@@ -679,9 +705,30 @@ known-limitations §八 events 存储增长（§14.4 展示有界/存储无界�
 > 门禁与计数：security 门禁 8→9→10（V4I-3 重测）、down_order_gate 8→11→12、bare_sql_gate
 > 4→5（W3F-3 括号/CTE 拼写补入既有测试，测试数不变）、migration 38→48→50→57、迁移文件
 > 25→27、迁移测试文件 23→25、备份 pin 26/25→28/27（wave-four/five 各 +1 迁移后重测，
-> `persistence/src/backup_snapshot.rs:646-647` 断言现为 backup_applied 28 / supported 27）、
+> `persistence/src/backup_snapshot.rs:646-647` 断言现为 backup_applied 28 / supported 27；
+> wave-six R6-D-2 起改动态派生，见下 wave-six 段）、
 > workspace 测试 1837→1913（`cargo test --workspace -- --list` 口径，2026-08-14 实测，见头注）。
 
 > 本节标题已从「迭代十五：wave-one 对抗修复」改为「迭代十五~十九：wave-one 至 wave-five」，
 > 段落编号 §7.6 不变（既有跨文档引用按节号有效）；wave-three/four/five 的逐项登记以
 > `docs/known-limitations.md` §九（第三/四/五波块）为准。
+> **第六波对抗审查（wave-six，2026-08-14，HEAD = 7c6ac9d，2 个提交）**：6 透镜（并发 /
+> 安全 / 数据迁移 / 中心协议 / web+UI+CI / 测试质量与文档）并行攻击 wave-five 状态，58 条
+> 发现 → 跨透镜去重 54 条交独立怀疑者核验 → **48 confirmed + 3 partial + 3 refuted**；48 项
+> 确认发现全部修复（fcf7257）+ 3 项链式发现与 A1 拒绝码接线（7c6ac9d）——含 **2 HIGH
+> （R6-C-1 并发双派发铸双 id 双执行、R6-E-01 Unknown 后重派发逃过 inbox 去重）**与 MEDIUM 组
+> （R6-C-2/R6-C-3/R6-E-02/R6-E-03/R6-E-04/R6-S-1/R6-S-3/R6-D-1/R6-W-1/2/R6-W-3/R6-W-6/
+> R6-E-11/R6-A1 接线），逐项状态见 `docs/known-limitations.md` §九（第六波块，全部转 ✅）；
+> 区域修复登记见 `docs/r6-findings/`（A1-A6 + A8）；refuted 3 条含 R6-W-3 inbox 污染半边。
+> **门禁与计数（2026-08-14 实测）**：fmt 干净、clippy `-D warnings` 全 workspace 零警告、
+> **1963 测试 0 失败**（`cargo test --workspace -- --list` 口径：lib/集成 1962 + doc 1 =
+> 1963；增量 1913→1963（+50）——提交消息声称的 1958/45 为 fcf7257 中间计数，链式提交
+> 7c6ac9d 另 +5）；per-crate：rutilus 167→175 / api 85 / application 361→371 /
+> center-protocol 30 / domain 212 / infra-redfish 295 / migration 57→59 / operation-engine
+> 34 / persistence 219→228 / platform 32→33 / security 53→59（含 secret_leak_gate 15） /
+> test-support 54+1 / ui 141→142 / web 172→185；新迁移 `m20260814_000001_center_outbox_
+> operation_ids`（迁移文件 27→28、迁移测试文件 25→26）；旧静态备份 pin（backup_applied 28 /
+> supported 27，原 `backup_snapshot.rs:646-647`）由 R6-D-2 改动态派生
+> （`Migrator::migrations().len()`，现 `:943-944, 983-985`），加迁移不再留陈旧断言。
+> 本节标题保持「迭代十五~十九」（wave-one 至 wave-five）——wave-six 的逐项登记以
+> `docs/known-limitations.md` §九（第六波块）与 `docs/r6-findings/` 为准。

@@ -218,7 +218,7 @@ rutilus backup restore [--portable] PATH
 ```
 
 - 不实现自动后台自更新（§20.3）；
-- 当前数据库 Schema 版本：27 个 Migration（`migration/src/`，2026-08-05 至 2026-08-13 的 27 个文件：`m20260805_*` 11 + `m20260807_*` 8 + `m20260810_*` 2 + `m20260812_*` 2 + `m20260813_*` 4〔`_000001_audit_center_actions` / `_000002_endpoint_health_checks` / `_000003_audit_failure_vocabulary` / `_000004_audit_operation_vocabulary`〕）；备份快照的已应用/支持计数由测试钉死（`persistence/src/backup_snapshot.rs:646-647`：backup_applied 28 / supported 27，备份含未来迁移时恢复拒绝）；
+- 当前数据库 Schema 版本：28 个 Migration（`migration/src/`，2026-08-05 至 2026-08-14 的 28 个文件：`m20260805_*` 11 + `m20260807_*` 8 + `m20260810_*` 2 + `m20260812_*` 2 + `m20260813_*` 4〔`_000001_audit_center_actions` / `_000002_endpoint_health_checks` / `_000003_audit_failure_vocabulary` / `_000004_audit_operation_vocabulary`〕+ `m20260814_000001_center_outbox_operation_ids`）；备份快照的已应用/支持计数断言已改动态派生（R6-D-2，wave-six：`Migrator::migrations().len()`，`persistence/src/backup_snapshot.rs:943-944, 983-985`，取代旧静态 pin backup_applied 28 / supported 27，备份含未来迁移时恢复拒绝语义不变）；
 - 迁移前恢复备份保留最近 3 份（`persistence/src/migration_backup.rs` `PRE_MIGRATION_BACKUP_RETENTION`）：每次成功提交新备份后按名称（`pre-migration-<uuid v7>` 时间序）裁剪更旧的完整备份并移除未完成目录（创建失败意味着本次打开未迁移，复制状态仍是活数据库）；裁剪尽力而为，失败只多留副本、不阻断打开；
 - Migration 只允许 DDL（`CREATE`/`ALTER`/`DROP`/`PRAGMA` 开头），数据搬迁通过 SeaQuery 表达，
   该边界由 `migration/tests/bare_sql_gate.rs` 机械检查（§7.3）；

@@ -12,7 +12,7 @@
 > 状态标记沿用仓库文档：✅ 达成（结构或实测，表中注明性质）；🟡 部分（有结构证据，演练/
 > 评估/发布级验证未做）；⏳ 待做（无代码或文档证据）。
 >
-> 修订说明：本版为 **迭代十九（wave-five 对抗修复）后复核版**（HEAD = e85560a，2026-08-14）。
+> 修订说明：本版为 **迭代二十（wave-six 对抗修复）后复核版**（HEAD = 7c6ac9d，2026-08-14）。
 > 迭代六（H4/H5）已合入：
 > **UI 本地化完整落地**（H5 d3f7769：`strings_catalog!` 目录扩至 827 键 En/Zh 双语、
 > `Lang::{En, Zh}` 运行时语言选择器、URL fragment 持久化（`#lang=`，纯函数 `ui/src/i18n.rs:1915-1936`
@@ -166,6 +166,27 @@
 > redfish_gateway.rs:28807→29253（`classifies_a_dropped_connection_during_the_write_*`）。
 > 历史点-时登记（迭代十五/十六头注、§五 门禁复跑记录、release-readiness §六 自检记录、
 > known-limitations §九 T-H/T-G/T-E/T-F 等点-时行）按惯例保留原文。
+> **迭代二十已落地（2026-08-14，HEAD = 7c6ac9d，2 个提交）——wave-six 对抗修复批次**：
+> 第六波对抗审查（6 透镜：并发 / 安全 / 数据迁移 / 中心协议 / web+UI+CI / 测试质量与文档）
+> 并行攻击 wave-five 状态，58 条发现 → 跨透镜去重 54 条交独立怀疑者核验 → **48 confirmed +
+> 3 partial + 3 refuted**；48 项确认发现全部修复（`fcf7257`，52 文件 +5659/-830）+ 3 项链式
+> 发现与 A1 新拒绝码接线（`7c6ac9d`，11 文件 +841/-101）：**2 HIGH（R6-C-1 并发双派发铸双
+> id 双执行——per-site dispatch 闸门临界区、R6-E-01 Unknown 后重派发逃过 inbox 去重——
+> `UnknownOutcomePending` 类型化拒绝 + 409 稳定码）** + MEDIUM 组（R6-C-2 rebind TOCTOU、
+> R6-C-3 停机排空补偿队列、R6-E-02 吊销站可派发、R6-E-03 re-home 回执仲裁、R6-E-04 outbox
+> 剪枝 + 定向查询（`m20260814_000001`）、R6-S-1 会话撤销 fail-open、R6-S-3 secret-gate
+> 标识符集、R6-D-1 down_order_gate 分号、R6-W-1/2 wasm 门禁 known-red 真修复、R6-W-3 伪造
+> center 归因 400、R6-W-6 制品 2 GiB 封顶、R6-E-11 审计偏移分页）+ LOW/NOTE 组；**测试计数
+> 复核（2026-08-14，`cargo test --workspace -- --list` 实测）：总数 1963（lib/集成 1962 +
+> doc 1）**，增量 1913→1963（+50）——提交消息的 1958/45 为 fcf7257 中间计数，链式提交
+> 7c6ac9d 另 +5；per-crate 实测：rutilus 167→175 / api 85 / application 361→371 /
+> center-protocol 30 / domain 212 / infra-redfish 295 / migration 57→59 / operation-engine
+> 34 / persistence 219→228 / platform 32→33 / security 53→59（含 secret_leak_gate 15） /
+> test-support 54+1 / ui 141→142 / web 172→185；迁移文件 27→28、迁移测试文件 25→26；旧
+> 静态备份 pin（backup_applied 28 / supported 27，原 `backup_snapshot.rs:646-647`）由
+> R6-D-2 改动态派生（现 `:943-944, 983-985`），本文件 §一/§五 对该 pin 的引用已按新事实
+> 同步；逐项登记见 `known-limitations.md` §九（第六波块）与 `docs/r6-findings/`
+> （A1-A6 + A8 区域登记）。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
 
