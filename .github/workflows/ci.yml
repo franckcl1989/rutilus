@@ -535,46 +535,49 @@ jobs:
             # this gate in its remap form found no diagnostics artifact to
             # diff against, so the mismatch itself must be self-describing —
             # sizes and sha256s of all four comparison files plus the first
-            # differing bytes of each pair. The bytes around a path-class
-            # diff read as the embedded string; a toolchain-class diff reads
-            # as version numbers.
+            # differing bytes of each pair. Bash-only (cmp/od/dd) on
+            # purpose: the earlier python3 heredoc died on stdin-indent
+            # rules inside the nested YAML block.
             for f in target/wasm-compare/generated-rutilus_ui.js target/wasm-compare/committed-rutilus_ui.js \
                      target/wasm-compare/generated-rutilus_ui_bg.wasm target/wasm-compare/committed-rutilus_ui_bg.wasm; do
               echo "$f: $(wc -c < "$f") bytes, sha256=$(sha256sum "$f" | cut -d' ' -f1)"
             done
-            python3 - <<'PYEOF'
-            for name, a, b in [("js", "target/wasm-compare/generated-rutilus_ui.js", "target/wasm-compare/committed-rutilus_ui.js"),
-                              ("wasm", "target/wasm-compare/generated-rutilus_ui_bg.wasm", "target/wasm-compare/committed-rutilus_ui_bg.wasm")]:
-                da = open(a, 'rb').read(); db = open(b, 'rb').read()
-                n = min(len(da), len(db))
-                for i in range(n):
-                    if da[i] != db[i]:
-                        lo, hi = max(0, i - 32), min(n, i + 96)
-                        print(f"{name}: first diff at offset {i}:")
-                        print(f"  generated: {da[lo:hi]!r}")
-                        print(f"  committed: {db[lo:hi]!r}")
-                        break
-                else:
-                    print(f"{name}: common prefix equal, lengths differ: {len(da)} vs {len(db)}")
-          PYEOF
-            echo "wasm-mismatch=true" >> "$GITHUB_OUTPUT"
+            for pair in "js target/wasm-compare/generated-rutilus_ui.js target/wasm-compare/committed-rutilus_ui.js" \
+                        "wasm target/wasm-compare/generated-rutilus_ui_bg.wasm target/wasm-compare/committed-rutilus_ui_bg.wasm"; do
+              set -- $pair; name="$1"; a="$2"; b="$3"
+              echo "$name first differing bytes (offset byte-a byte-b, octal):"
+              cmp -l "$a" "$b" 2>/dev/null | head -6 || echo "  (no common prefix)"
+              off=$(cmp "$a" "$b" 2>&1 | sed -n 's/.*differ: byte \([0-9][0-9]*\).*/\1/p')
+              if [ -n "$off" ]; then
+                start=$((off > 32 ? off - 32 : 1))
+                echo "  generated @byte $start: $(dd if="$a" bs=1 skip=$((start - 1)) count=96 2>/dev/null | tr -c '[:print:]' '.')"
+                echo "  committed @byte $start: $(dd if="$b" bs=1 skip=$((start - 1)) count=96 2>/dev/null | tr -c '[:print:]' '.')"
+              fi
+            done
+            # Marker file for the upload step: a step OUTPUT does not
+            # survive the failing exit on this runner, so the upload
+            # gates on the marker's existence instead (hashFiles).
+            touch target/wasm-compare/mismatch.marker
             exit 1
           fi
 
       # Diagnostics half of the wasm gate (2026-08-13): on mismatch the
       # CI-generated js+wasm are uploaded so the failure can be diffed
-      # against the checked-in files. The step runs only when the build step
-      # above wrote the wasm-mismatch flag (its output survives the step's
-      # failing exit), never on unrelated earlier failures.
+      # against the checked-in files. Gating (2026-08-15): the build step's
+      # output did NOT survive its failing exit on this runner (the upload
+      # stayed skipped), so the build step now touches a marker file and
+      # this step gates on the marker via hashFiles — a step that never
+      # reached the mismatch branch leaves no marker and stays skipped.
       - name: Upload CI-generated wasm assets (diagnostics)
-        if: ${{ steps.build-wasm32-ui.outputs.wasm-mismatch == 'true' }}
+        if: ${{ always() && hashFiles('target/wasm-compare/mismatch.marker') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
         with:
           name: wasm-assets-ci-generated-${{ github.run_id }}
           path: |
+            target/wasm-compare/mismatch.marker
             target/wasm-assets/rutilus_ui.js
             target/wasm-assets/rutilus_ui_bg.wasm
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       # §5.4: Release build — static musl binary. The Linux release target in
       # the §5.2 platform matrix is x86_64-unknown-linux-musl (static link per
