@@ -139,7 +139,16 @@ if [ -n "$expect" ]; then
                     ;;
             esac
         done
-        if ! printf '%s\n' "$ran" | grep -qx "$name" && ! printf '%s\n' "$ran" | grep -qxE ".*::$name"; then
+        # Here-strings, not pipelines: under `set -o pipefail` a
+        # `printf | grep -q` whose grep exits early (first match) sends
+        # SIGPIPE to a still-writing printf, pipefail turns the pipeline
+        # into a failure, and `!` flips a successful match into a false
+        # "did not run". The workspace run hit this on ubuntu on the first
+        # real execution (run 31795473166): names matching early in the
+        # ~60 KB ran list failed, names matching late passed — position
+        # dependent, never deterministic. A here-string's exit status is
+        # grep's alone.
+        if ! grep -qx "$name" <<<"$ran" && ! grep -qxE ".*::$name" <<<"$ran"; then
             missing="$missing $name"
         fi
     done
