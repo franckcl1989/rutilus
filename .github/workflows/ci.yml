@@ -354,10 +354,10 @@ jobs:
             --toolchain "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           curl -L --fail \
             https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-x86_64-unknown-linux-musl.tar.gz \
-            -o target/wasm-bindgen.tgz
-          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  target/wasm-bindgen.tgz" | sha256sum -c -
+            -o /tmp/wasm-bindgen.tgz
+          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  /tmp/wasm-bindgen.tgz" | sha256sum -c -
           mkdir -p target/rutilus-tools
-          tar -xzf target/wasm-bindgen.tgz -C target/rutilus-tools --strip-components=1
+          tar -xzf /tmp/wasm-bindgen.tgz -C target/rutilus-tools --strip-components=1
           RUSTFLAGS="--remap-path-prefix=$HOME=.cargo-home --remap-path-prefix=$PWD=." \
             cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
           target/rutilus-tools/wasm-bindgen --target web --no-typescript \
@@ -930,10 +930,10 @@ jobs:
             --toolchain "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           curl -L --fail \
             https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-x86_64-unknown-linux-musl.tar.gz \
-            -o target/wasm-bindgen.tgz
-          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  target/wasm-bindgen.tgz" | sha256sum -c -
+            -o /tmp/wasm-bindgen.tgz
+          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  /tmp/wasm-bindgen.tgz" | sha256sum -c -
           mkdir -p target/rutilus-tools
-          tar -xzf target/wasm-bindgen.tgz -C target/rutilus-tools --strip-components=1
+          tar -xzf /tmp/wasm-bindgen.tgz -C target/rutilus-tools --strip-components=1
           RUSTFLAGS="--remap-path-prefix=$HOME=.cargo-home --remap-path-prefix=$PWD=." \
             cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
           target/rutilus-tools/wasm-bindgen --target web --no-typescript \
