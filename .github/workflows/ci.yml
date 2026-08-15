@@ -531,6 +531,32 @@ jobs:
             echo "wasm UI artifacts match the checked-in files"
           else
             echo "wasm UI artifacts DIFFER from the checked-in files; the CI-generated files are uploaded as a diagnostics artifact"
+            # Log-level forensics (2026-08-15): the first real executions of
+            # this gate in its remap form found no diagnostics artifact to
+            # diff against, so the mismatch itself must be self-describing —
+            # sizes and sha256s of all four comparison files plus the first
+            # differing bytes of each pair. The bytes around a path-class
+            # diff read as the embedded string; a toolchain-class diff reads
+            # as version numbers.
+            for f in target/wasm-compare/generated-rutilus_ui.js target/wasm-compare/committed-rutilus_ui.js \
+                     target/wasm-compare/generated-rutilus_ui_bg.wasm target/wasm-compare/committed-rutilus_ui_bg.wasm; do
+              echo "$f: $(wc -c < "$f") bytes, sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            python3 - <<'PYEOF'
+            for name, a, b in [("js", "target/wasm-compare/generated-rutilus_ui.js", "target/wasm-compare/committed-rutilus_ui.js"),
+                              ("wasm", "target/wasm-compare/generated-rutilus_ui_bg.wasm", "target/wasm-compare/committed-rutilus_ui_bg.wasm")]:
+                da = open(a, 'rb').read(); db = open(b, 'rb').read()
+                n = min(len(da), len(db))
+                for i in range(n):
+                    if da[i] != db[i]:
+                        lo, hi = max(0, i - 32), min(n, i + 96)
+                        print(f"{name}: first diff at offset {i}:")
+                        print(f"  generated: {da[lo:hi]!r}")
+                        print(f"  committed: {db[lo:hi]!r}")
+                        break
+                else:
+                    print(f"{name}: common prefix equal, lengths differ: {len(da)} vs {len(db)}")
+            PYEOF
             echo "wasm-mismatch=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
