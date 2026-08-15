@@ -556,7 +556,7 @@ jobs:
                         break
                 else:
                     print(f"{name}: common prefix equal, lengths differ: {len(da)} vs {len(db)}")
-            PYEOF
+          PYEOF
             echo "wasm-mismatch=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
