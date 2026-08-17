@@ -432,7 +432,7 @@ jobs:
       # upload gates on a marker file the mismatch branch touches.
       - name: Upload CI-generated wasm assets (diagnostics)
         if: ${{ always() && hashFiles('target/wasm-compare/mismatch.marker') != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # tag v7.0.1
         with:
           name: wasm-assets-ci-generated-${{ github.run_id }}
           path: |
@@ -909,7 +909,7 @@ jobs:
         run: bash scripts/checksums.sh -o release/SHA256SUMS release/*
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # tag v7.0.1
         with:
           name: rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
           path: release/
@@ -919,7 +919,7 @@ jobs:
       # artifact so they are not buried in the linux-x86_64 bundle.
       - name: Upload SBOM
         if: matrix.sbom
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # tag v7.0.1
         with:
           name: rutilus-${{ github.ref_name }}-sbom
           path: release/rutilus-${{ github.ref_name }}-sbom-*.json
@@ -1014,7 +1014,7 @@ jobs:
       # Same marker contract as the in-job upload step.
       - name: Upload CI-generated wasm assets (diagnostics)
         if: ${{ always() && hashFiles('target/wasm-compare/mismatch.marker') != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # tag v7.0.1
         with:
           name: wasm-assets-ci-generated-${{ github.run_id }}
           path: |
