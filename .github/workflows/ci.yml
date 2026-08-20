@@ -130,7 +130,7 @@ jobs:
       # list and per-tool pins unchanged.
       - name: Install gate tools
         if: matrix.is_default
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20  # tag v2 (2.85.12)
         with:
           tool: cargo-nextest@0.9.140,cargo-llvm-cov@0.8.7,cargo-machete@0.9.2,cargo-audit@0.22.2,cargo-zigbuild@0.22.3
 
@@ -682,7 +682,7 @@ jobs:
       # below; neither tool is assumed to exist on the runner image.
       - name: Install cargo-zigbuild (aarch64)
         if: matrix.zigbuild
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20  # tag v2 (2.85.12)
         with:
           tool: cargo-zigbuild@0.22.3
 
@@ -877,7 +877,7 @@ jobs:
       # manifest); revisit the flag set when cargo-cyclonedx is upgraded.
       - name: Install cargo-cyclonedx
         if: matrix.sbom
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20  # tag v2 (2.85.12)
         with:
           # `tool` (singular) — `tools` is not a declared install-action
           # input and is silently ignored (see the ci job's Install gate
